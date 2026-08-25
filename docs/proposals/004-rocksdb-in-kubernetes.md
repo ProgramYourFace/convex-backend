@@ -3,6 +3,7 @@
 **Status:** operational analysis; one code change (memtable memory ceiling), no migration tooling yet
 **Date:** 2026-08-25
 **Follows:** [002-storage-engine.md](./002-storage-engine.md) (the backend), [003-beyond-the-storage-layer.md](./003-beyond-the-storage-layer.md) (the measurements)
+**Followed by:** [005-backup-and-restore.md](./005-backup-and-restore.md), the design for §6's gap
 **Reference topology:** a per-cell `StatefulSet` with `replicas: 1`, a native Postgres
 sidecar on pod-localhost, a Convex backend and a relay, with `pg-data` and `convex-data`
 PVCs.
@@ -22,7 +23,7 @@ items below are correctness issues rather than tuning:
 | §3 | Memory is one budget and the default split was wrong | **bug** | fixed here |
 | §4 | Crash recovery stops being unbounded | win | no action |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
-| §6 | No backup or point-in-time restore | **gap** | not implemented — the RocksDB APIs exist and are already in-crate; read this before adopting |
+| §6 | No backup or point-in-time restore | **gap** | designed in [005](./005-backup-and-restore.md), not implemented — read before adopting |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |
 
 ---
@@ -281,17 +282,32 @@ to the safe one:
 | `sync=<interval>` | `manual_wal_flush(true)` plus a background thread flushing on a timer | bounded by the interval |
 | `sync=never` | OS buffers only | unbounded |
 
-This backend has the two ends — `ROCKSDB_SYNC_WRITES=true` and `false` — and not the
-middle. The safe end is equivalent work by a different route: rather than an explicit
-coordinator, `WriteOptions::set_sync(true)` lets RocksDB's own write groups coalesce
-concurrent writers and fsync the shared WAL once, which suits a committer that already
-batches. SurrealDB needs the explicit coordinator because each of its optimistic
-transactions commits on its own thread.
+This backend now has all three. The safe end is equivalent work by a different route:
+rather than an explicit coordinator, `WriteOptions::set_sync(true)` lets RocksDB's own
+write groups coalesce concurrent writers and fsync the shared WAL once, which suits a
+committer that already batches. SurrealDB needs the explicit coordinator because each of
+its optimistic transactions commits on its own thread.
 
-The middle mode is the interesting gap. `ROCKSDB_SYNC_WRITES=false` today is unbounded
-loss; a timed flush would make the window a number an operator can reason about. It does
-**not** rescue §2 — a bounded window is still a window, and the relay's checkpoint can
-still be ahead of it — but it would be a better-shaped knob than the one that exists.
+`ROCKSDB_SYNC_INTERVAL_MS` adds the middle: `manual_wal_flush` plus a background thread
+calling `flush_wal(true)` on the interval, which turns an unbounded loss window into a
+number.
+
+**What it is worth, measured.** The answer is "it depends on the commit rate, and for
+this deployment's shape, not much" — see the crate README for the table. At one commit
+per event it is +25 %; at 64 events per commit it is within noise, because 25 fsyncs a
+second against a 0.17 ms fsync is not a cost. The reference cell batches ingest events
+into large mutations, so it sits at the far end of that curve. The one consistent effect
+at that end is tail latency — commit p99 came down 15–20 % across three runs — but
+throughput did not move.
+
+**It does not rescue §2, and the tempting argument that it might is worth refuting.** One
+could reason: if Convex's interval (say 100 ms) is shorter than the relay's Postgres
+`wal_writer_delay` (200 ms by default under `synchronous_commit=off`), the checkpoint
+rolls back *further* than the data, so the skew runs in the safe direction and the bus
+replays the difference. That is true on average and worthless as a guarantee — there is
+no ordering relationship between two independent timers fsyncing two independent files,
+and a host loss does not respect either. Narrowing a window is not the same as closing
+it. `ROCKSDB_SYNC_WRITES=true` stays the rule while the checkpoint lives elsewhere.
 
 ---
 

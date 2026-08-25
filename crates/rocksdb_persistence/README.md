@@ -82,6 +82,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | Knob | Default | Meaning |
 |---|---|---|
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
+| `ROCKSDB_SYNC_INTERVAL_MS` | `0` (off) | flush and fsync the WAL on a timer instead of per write; overrides `ROCKSDB_SYNC_WRITES` |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
 | `ROCKSDB_BLOCK_CACHE_BYTES` | 512 MiB | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
 | `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
@@ -90,6 +91,38 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
+
+### The three sync modes
+
+| Mode | Set with | On process crash | On host loss |
+|---|---|---|---|
+| every | `ROCKSDB_SYNC_WRITES=true` (default) | nothing | nothing |
+| interval | `ROCKSDB_SYNC_INTERVAL_MS=100` | up to one interval | up to one interval |
+| never | `ROCKSDB_SYNC_WRITES=false` | nothing | unbounded |
+
+Interval mode opens the database with `manual_wal_flush`, so a write leaves its records
+in RocksDB's own buffer and a background thread moves them with `flush_wal(true)` on the
+interval. It is the only mode that can lose a write the *process* never handed to the
+kernel — `never` still writes through to the page cache and only loses data if the
+machine goes down, but with no bound on how much.
+
+What it buys depends entirely on the commit rate, because RocksDB already coalesces
+concurrent writers into one write group and fsyncs once for the group. Measured on the
+device-location workload (`crates/persistence_bench`, fsync p50 0.17 ms on the test VM):
+
+| events per commit | commits/s | every | interval=100ms | gain |
+|--:|--:|--:|--:|--:|
+| 1 | 494 | 494 ev/s | 618 ev/s | **+25 %** |
+| 4 | 225 | 901 ev/s | 1047 ev/s | **+16 %** |
+| 16 | 79 | 1271 ev/s | 1464 ev/s | **+15 %** |
+| 64 | 25 | 1574 ev/s | 1669 ev/s | +6 %, within noise |
+
+Interval mode captures essentially all of what `never` offers while keeping the loss
+window bounded, so there is no reason to prefer `never` over a short interval. But the
+gain is a function of how many commits per second reach the disk: batch writes into
+larger transactions and the fsync stops mattering, which is the cheaper fix. Note that
+these ratios are a floor for slower storage — on a network-attached volume where an
+fsync costs milliseconds rather than 0.17 ms, the same commit rate pays more for it.
 
 `ROCKSDB_SYNC_WRITES=false` is the analogue of Postgres's
 `synchronous_commit=off`: it trades a bounded window of recent writes on host

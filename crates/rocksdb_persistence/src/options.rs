@@ -27,10 +27,67 @@ use crate::keys::{
 ///
 /// On by default: Convex's contract is that a returned write is durable, and a
 /// Postgres backend at its default `synchronous_commit` behaves the same way.
-/// Turning it off trades a bounded window of recent writes on host loss for
-/// throughput, and is only safe where an upstream log can replay into
-/// idempotent appliers.
+/// Turning it off trades recent writes on host loss for throughput, and is only
+/// safe where an upstream log can replay into idempotent appliers.
+///
+/// Ignored when [`SYNC_INTERVAL`] is set — see [`SyncMode`].
 pub static SYNC_WRITES: LazyLock<bool> = LazyLock::new(|| env_config("ROCKSDB_SYNC_WRITES", true));
+
+/// Flush and fsync the write-ahead log on this interval instead of on every
+/// write. Zero, the default, disables it.
+pub static SYNC_INTERVAL: LazyLock<Option<Duration>> =
+    LazyLock::new(|| match env_config("ROCKSDB_SYNC_INTERVAL_MS", 0u64) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    });
+
+/// How the write-ahead log reaches disk.
+///
+/// The three modes are a durability/throughput curve, not three ways of
+/// spelling the same thing. What each one loses is different in kind, so the
+/// choice belongs to whoever knows what is upstream of the database:
+///
+/// | Mode | On process crash | On host loss |
+/// |---|---|---|
+/// | [`Every`](SyncMode::Every) | nothing | nothing |
+/// | [`Interval`](SyncMode::Interval) | up to one interval | up to one interval |
+/// | [`Never`](SyncMode::Never) | nothing | unbounded — whatever the OS had not written |
+///
+/// `Interval` is the only mode that can lose a write the *process* never got a
+/// chance to hand to the kernel: it turns on RocksDB's manual WAL flush, so
+/// records sit in RocksDB's own buffer until the flusher thread moves them.
+/// `Never` still writes through to the page cache on every write, so it
+/// survives a crash of this process and only loses data if the machine goes
+/// down — but with no bound on how much.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    /// fsync before `write` returns. RocksDB coalesces concurrent writers into
+    /// one write group and syncs the shared WAL once for the group.
+    Every,
+    /// Flush and fsync the WAL on a timer, on a background thread.
+    Interval(Duration),
+    /// Leave it to the operating system.
+    Never,
+}
+
+impl SyncMode {
+    /// Resolved from the environment once, at first use.
+    pub fn current() -> Self {
+        // An explicit interval wins: asking for a timed flush and a per-write
+        // fsync at once is contradictory, and the interval is the more
+        // specific request.
+        match (*SYNC_INTERVAL, *SYNC_WRITES) {
+            (Some(interval), _) => Self::Interval(interval),
+            (None, true) => Self::Every,
+            (None, false) => Self::Never,
+        }
+    }
+
+    /// Whether `WriteOptions::set_sync` should be on for this mode.
+    pub fn sync_each_write(&self) -> bool {
+        matches!(self, Self::Every)
+    }
+}
 
 /// Whether `ConflictStrategy::Error` is enforced on every write.
 ///
@@ -106,7 +163,7 @@ pub struct RocksOptions {
 }
 
 /// Build the database-wide options and the objects they reference.
-pub fn build(create_if_missing: bool) -> RocksOptions {
+pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     let cache = Cache::new_lru_cache(*BLOCK_CACHE_BYTES);
     let write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
         *WRITE_BUFFER_BYTES,
@@ -130,6 +187,22 @@ pub fn build(create_if_missing: bool) -> RocksOptions {
     // Smooth writeback rather than dumping whole files at the page cache.
     db.set_bytes_per_sync(1 << 20);
     db.set_wal_bytes_per_sync(1 << 20);
+    match sync {
+        SyncMode::Interval(interval) => {
+            // Hold WAL records in RocksDB's buffer and let the flusher thread
+            // move them, so a run of writes costs one fsync rather than one
+            // each.
+            db.set_manual_wal_flush(true);
+            tracing::info!(
+                "rocksdb WAL sync: every {}ms on a background thread",
+                interval.as_millis(),
+            );
+        },
+        SyncMode::Every => tracing::info!("rocksdb WAL sync: on every write"),
+        SyncMode::Never => {
+            tracing::info!("rocksdb WAL sync: left to the operating system")
+        },
+    }
     db.set_max_total_wal_size(1 << 30);
     db.set_keep_log_file_num(8);
     db.set_max_open_files(-1);

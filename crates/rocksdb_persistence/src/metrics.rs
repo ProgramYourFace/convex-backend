@@ -18,6 +18,18 @@ pub fn write_timer() -> Timer<VMHistogram> {
 }
 
 register_convex_histogram!(
+    ROCKSDB_WAL_FLUSH_SECONDS,
+    "Time for one interval-mode WAL flush and fsync",
+    &STATUS_LABEL
+);
+/// The interval flusher's own latency. A gap here — ticks that stop arriving,
+/// or arrive slower than the configured interval — is how a persistently
+/// failing flush becomes visible, since the writes themselves keep succeeding.
+pub fn wal_flush_timer() -> StatusTimer {
+    StatusTimer::new(&ROCKSDB_WAL_FLUSH_SECONDS)
+}
+
+register_convex_histogram!(
     ROCKSDB_CONFLICT_CHECK_SECONDS,
     "Time spent enforcing ConflictStrategy::Error before a write"
 );

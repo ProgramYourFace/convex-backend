@@ -105,6 +105,7 @@ pub mod keys;
 mod metrics;
 pub mod options;
 mod reader;
+mod wal_flush;
 
 #[cfg(test)]
 mod tests;
@@ -136,12 +137,28 @@ pub(crate) struct Inner {
     /// memtable budget outlive the column families that reference them.
     _cache: rocksdb::Cache,
     _write_buffer_manager: rocksdb::WriteBufferManager,
+    /// Resolved once when the database is opened, rather than read from the
+    /// environment per write, so a single process can hold databases in
+    /// different modes — which is what makes the mode testable.
+    sync: options::SyncMode,
+    /// Present only in [`options::SyncMode::Interval`]. Populated after the
+    /// `Arc<Inner>` exists, because the thread needs a `Weak` back to it.
+    wal_flusher: std::sync::OnceLock<wal_flush::WalFlusher>,
 }
 
 impl RocksDbPersistence {
-    /// Open (or create) a database at `path`.
+    /// Open (or create) a database at `path`, in the [`options::SyncMode`] the
+    /// environment asks for.
     pub fn new(path: &Path) -> anyhow::Result<Self> {
-        Self::open(path, true)
+        Self::open(path, true, options::SyncMode::current())
+    }
+
+    /// Open (or create) a database in an explicit [`options::SyncMode`],
+    /// ignoring the environment. The mode is a durability contract, so it is
+    /// worth being able to state it in code rather than hope a variable was
+    /// set.
+    pub fn new_with_sync_mode(path: &Path, sync: options::SyncMode) -> anyhow::Result<Self> {
+        Self::open(path, true, sync)
     }
 
     /// Open a read-only view of a database another process has open for
@@ -162,7 +179,7 @@ impl RocksDbPersistence {
             path.display(),
         );
         std::fs::create_dir_all(secondary_path)?;
-        let shared = options::build(false);
+        let shared = options::build(false, options::SyncMode::Every);
         let cfs: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, options::column_family(name, &shared)))
@@ -178,11 +195,14 @@ impl RocksDbPersistence {
                 path: path.to_path_buf(),
                 _cache: shared.cache,
                 _write_buffer_manager: shared.write_buffer_manager,
+                // A secondary instance never writes, so it has no WAL to flush.
+                sync: options::SyncMode::Every,
+                wal_flusher: std::sync::OnceLock::new(),
             }),
         })
     }
 
-    fn open(path: &Path, create_if_missing: bool) -> anyhow::Result<Self> {
+    fn open(path: &Path, create_if_missing: bool, sync: options::SyncMode) -> anyhow::Result<Self> {
         // RocksDB writes a CURRENT file as the last step of creating a
         // database, so its absence is the reliable "nothing here yet" signal —
         // more so than the directory existing, which a mount or a failed
@@ -192,7 +212,7 @@ impl RocksDbPersistence {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
 
-        let shared = options::build(create_if_missing);
+        let shared = options::build(create_if_missing, sync);
         let cfs: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, options::column_family(name, &shared)))
@@ -207,16 +227,23 @@ impl RocksDbPersistence {
             if newly_created { "fresh" } else { "existing" },
         );
 
-        Ok(Self {
-            inner: Arc::new(Inner {
-                db,
-                newly_created,
-                secondary: false,
-                path: path.to_path_buf(),
-                _cache: shared.cache,
-                _write_buffer_manager: shared.write_buffer_manager,
-            }),
-        })
+        let inner = Arc::new(Inner {
+            db,
+            newly_created,
+            secondary: false,
+            path: path.to_path_buf(),
+            _cache: shared.cache,
+            _write_buffer_manager: shared.write_buffer_manager,
+            sync,
+            wal_flusher: std::sync::OnceLock::new(),
+        });
+
+        if let options::SyncMode::Interval(interval) = sync {
+            let flusher = wal_flush::WalFlusher::spawn(Arc::downgrade(&inner), interval)?;
+            let _ = inner.wal_flusher.set(flusher);
+        }
+
+        Ok(Self { inner })
     }
 }
 
@@ -242,7 +269,7 @@ impl Inner {
         // write group and syncs the shared WAL once for all of them — which is
         // exactly the shape of Convex's committer, which issues up to
         // `COMMITTER_MAX_CONCURRENT_WRITE_BATCHES` writes at a time.
-        opts.set_sync(*options::SYNC_WRITES);
+        opts.set_sync(self.sync.sync_each_write());
         opts
     }
 }
@@ -596,6 +623,12 @@ impl Persistence for RocksDbPersistence {
     async fn shutdown(&self) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_shutdown", move || -> anyhow::Result<()> {
+            // Stop the interval flusher before touching the database, so a
+            // timed flush cannot land in the middle of the close below. The
+            // `flush_wal` that follows covers whatever it had not yet written.
+            if let Some(flusher) = inner.wal_flusher.get() {
+                flusher.stop();
+            }
             inner.db.flush_wal(true)?;
             for name in ALL_COLUMN_FAMILIES {
                 inner.db.flush_cf(&inner.cf(name)?)?;

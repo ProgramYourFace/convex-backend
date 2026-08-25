@@ -9,6 +9,7 @@
 use std::{
     collections::BTreeSet,
     sync::Arc,
+    time::Duration,
 };
 
 use common::{
@@ -55,6 +56,7 @@ use value::{
 
 use crate::{
     keys,
+    options::SyncMode,
     RocksDbPersistence,
 };
 
@@ -954,6 +956,90 @@ async fn writes_survive_a_reopen_without_a_clean_shutdown() -> anyhow::Result<()
         "the index entry and its document must both recover"
     );
     Ok(())
+}
+
+/// In interval mode a write returns before the record has reached the kernel,
+/// so the flusher thread is the only thing that makes it durable. Wait past one
+/// interval, then drop without `shutdown` — recovery has to come from what the
+/// flusher wrote.
+#[tokio::test]
+async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new_with_sync_mode(
+            &path,
+            SyncMode::Interval(Duration::from_millis(50)),
+        )?;
+        let id = doc_id(1, 1);
+        persistence
+            .write(
+                &[entry(1, 1, 10, "flushed", None)?],
+                &[index_entry(1, b"k", 10, Some(id))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        // Several intervals, so this does not turn into a timing flake on a
+        // loaded machine.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
+    let entries: Vec<_> = reopened
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(
+        entries.len(),
+        1,
+        "the flusher must have made the write durable"
+    );
+    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"flushed\"");
+    Ok(())
+}
+
+/// `shutdown` flushes whatever the last tick did not, so a clean stop never
+/// depends on the interval having elapsed.
+#[tokio::test]
+async fn interval_sync_shutdown_flushes_the_tail() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new_with_sync_mode(
+            &path,
+            // Long enough that no tick can fire during the test.
+            SyncMode::Interval(Duration::from_secs(600)),
+        )?;
+        let id = doc_id(1, 1);
+        persistence
+            .write(
+                &[entry(1, 1, 10, "tail", None)?],
+                &[index_entry(1, b"k", 10, Some(id))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.shutdown().await?;
+    }
+
+    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
+    let entries: Vec<_> = reopened
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 1, "shutdown must flush the WAL buffer");
+    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"tail\"");
+    Ok(())
+}
+
+/// The environment resolves to exactly one mode, and an explicit interval wins
+/// over `ROCKSDB_SYNC_WRITES` rather than the two silently fighting.
+#[test]
+fn sync_mode_sync_each_write_only_in_every() {
+    assert!(SyncMode::Every.sync_each_write());
+    assert!(!SyncMode::Interval(Duration::from_millis(100)).sync_each_write());
+    assert!(!SyncMode::Never.sync_each_write());
 }
 
 #[tokio::test]
