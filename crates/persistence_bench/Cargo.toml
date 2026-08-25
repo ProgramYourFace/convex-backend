@@ -16,6 +16,7 @@ common = { workspace = true }
 database = { workspace = true }
 governor = { workspace = true }
 indexing = { workspace = true }
+keybroker = { workspace = true }
 model = { workspace = true }
 rocksdb_persistence = { workspace = true }
 runtime = { workspace = true }

@@ -7335,6 +7335,7 @@ dependencies = [
  "database",
  "governor",
  "indexing",
+ "keybroker",
  "model",
  "rocksdb_persistence",
  "runtime",

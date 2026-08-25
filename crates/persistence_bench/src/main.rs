@@ -30,7 +30,6 @@ use std::{
 };
 
 use common::{
-    identity::Identity,
     knobs::{
         DOCUMENT_RETENTION_RATE_LIMIT,
         INDEX_CACHE_SIZE,
@@ -41,9 +40,10 @@ use common::{
 };
 use database::{
     Database,
-    TestFacingModel,
+    UserFacingModel,
 };
 use governor::Quota;
+use keybroker::Identity;
 use indexing::index_cache::IndexCache;
 use model::virtual_system_mapping;
 use runtime::prod::ProdRuntime;
@@ -56,6 +56,7 @@ use value::{
     ConvexValue,
     FieldName,
     TableName,
+    TableNamespace,
 };
 
 struct Config {
@@ -186,8 +187,8 @@ async fn run_backend(
         let started = Instant::now();
         let mut tx = database.begin(Identity::system()).await?;
         for i in 0..this_batch {
-            let id = TestFacingModel::new(&mut tx)
-                .insert(&table, document(written + i, cfg.fields)?)
+            let id = UserFacingModel::new(&mut tx, TableNamespace::Global)
+                .insert(table.clone(), document(written + i, cfg.fields)?)
                 .await?;
             // Keep a spread of ids so the read phase is not confined to the
             // most recently written pages.
@@ -211,7 +212,11 @@ async fn run_backend(
     for chunk in ids.chunks(64.max(1)) {
         let mut tx = database.begin(Identity::system()).await?;
         for id in chunk {
-            if tx.get(*id).await?.is_some() {
+            if UserFacingModel::new(&mut tx, TableNamespace::Global)
+                .get_with_ts(*id, None)
+                .await?
+                .is_some()
+            {
                 read_count += 1;
             }
         }
@@ -243,24 +248,23 @@ fn parse_config() -> anyhow::Result<Config> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].clone();
-        let mut next = || -> anyhow::Result<String> {
-            i += 1;
-            args.get(i)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
-        };
-        match args[i].as_str() {
-            "--docs" => cfg.docs = next()?.parse()?,
-            "--batch" => cfg.batch = next()?.parse::<usize>()?.max(1),
-            "--fields" => cfg.fields = next()?.parse::<usize>()?.max(2),
-            "--reads" => cfg.reads = next()?.parse()?,
-            "--dir" => cfg.dir = PathBuf::from(next()?),
+        if flag == "--help" || flag == "-h" {
+            println!("{HELP}");
+            std::process::exit(0);
+        }
+        i += 1;
+        let value = args
+            .get(i)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--docs" => cfg.docs = value.parse()?,
+            "--batch" => cfg.batch = value.parse::<usize>()?.max(1),
+            "--fields" => cfg.fields = value.parse::<usize>()?.max(2),
+            "--reads" => cfg.reads = value.parse()?,
+            "--dir" => cfg.dir = PathBuf::from(value),
             "--backends" => {
-                cfg.backends = next()?.split(',').map(|s| s.trim().to_string()).collect()
-            },
-            "--help" | "-h" => {
-                println!("{HELP}");
-                std::process::exit(0);
+                cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect()
             },
             other => anyhow::bail!("unknown flag {other}"),
         }
