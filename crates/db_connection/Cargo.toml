@@ -15,6 +15,7 @@ clusters = { workspace = true }
 common = { workspace = true }
 mysql = { workspace = true }
 postgres = { workspace = true }
+rocksdb_persistence = { workspace = true }
 sqlite = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }

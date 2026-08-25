@@ -180,6 +180,10 @@ ref-cast = "1.0.20"
 regex = "1"
 reqwest = { version = "0.12.7", features = [ "json", "stream", "gzip", "native-tls-alpn", "native-tls-vendored" ] }
 reqwest-middleware = "0.4.1"
+# Pinned to the version `crates/vector` already links: only one package in the
+# graph may provide the native `rocksdb` library.
+rocksdb = { version = "0.22.0", default-features = false, features = [ "lz4", "zstd" ] }
+rocksdb_persistence = { path = "crates/rocksdb_persistence" }
 roles = { path = "crates/roles" }
 rsa = "0.9.6"
 runtime = { path = "crates/runtime" }

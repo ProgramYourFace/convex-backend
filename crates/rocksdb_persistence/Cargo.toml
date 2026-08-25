@@ -1,0 +1,34 @@
+[package]
+name = "rocksdb_persistence"
+version = "0.1.0"
+authors = ["Convex, Inc. <no-reply@convex.dev>"]
+edition = "2024"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+cmd_util = { workspace = true }
+common = { workspace = true }
+futures = { workspace = true }
+futures-async-stream = { workspace = true }
+metrics = { workspace = true }
+prometheus = { workspace = true }
+rocksdb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+value = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true, features = ["testing"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+value = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

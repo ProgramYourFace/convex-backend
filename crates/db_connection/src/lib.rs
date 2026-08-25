@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -28,6 +29,7 @@ use postgres::{
     PostgresPersistence,
     PostgresReaderOptions,
 };
+use rocksdb_persistence::RocksDbPersistence;
 use sqlite::SqlitePersistence;
 use tokio_postgres::config::TargetSessionAttrs;
 
@@ -41,6 +43,9 @@ pub struct ConnectPersistenceFlags {
 pub enum PersistenceSeed<RT: Runtime> {
     Sqlite {
         db_spec: String,
+    },
+    RocksDb {
+        path: PathBuf,
     },
     Postgres {
         config: tokio_postgres::Config,
@@ -63,6 +68,11 @@ pub fn persistence_seed<RT: Runtime>(
     match db {
         DbDriverTag::Sqlite => Ok(PersistenceSeed::Sqlite {
             db_spec: db_spec.to_owned(),
+        }),
+        // An embedded store is addressed by a filesystem path, so there is no
+        // cluster URL to parse and no lease to acquire.
+        DbDriverTag::RocksDb => Ok(PersistenceSeed::RocksDb {
+            path: PathBuf::from(db_spec),
         }),
         DbDriverTag::Postgres(version)
         | DbDriverTag::MySql(version)
@@ -148,6 +158,11 @@ pub async fn connect_persistence<RT: Runtime>(
             tracing::info!("Connected to SQLite at {db_spec}");
             Ok(persistence as Arc<dyn Persistence>)
         },
+        PersistenceSeed::RocksDb { path } => {
+            let persistence = Arc::new(RocksDbPersistence::new(&path)?);
+            tracing::info!("Opened RocksDB at {}", path.display());
+            Ok(persistence as Arc<dyn Persistence>)
+        },
         PersistenceSeed::Postgres {
             mut config,
             options,
@@ -193,6 +208,12 @@ pub async fn connect_persistence_reader<RT: Runtime>(
     )? {
         PersistenceSeed::Sqlite { db_spec } => {
             Ok(Arc::new(SqlitePersistence::new(&db_spec)?) as Arc<dyn PersistenceReader>)
+        },
+        PersistenceSeed::RocksDb { path } => {
+            // A RocksDB directory has one writer, so a standalone reader opens
+            // a secondary instance beside it rather than the primary itself.
+            let secondary = path.with_extension("secondary");
+            Ok(RocksDbPersistence::new_secondary(&path, &secondary)?.reader())
         },
         PersistenceSeed::Postgres { config, options } => {
             let options = PostgresReaderOptions {

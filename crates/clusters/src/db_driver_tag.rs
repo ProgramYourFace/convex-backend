@@ -5,6 +5,8 @@ use common::types::PersistenceVersion;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DbDriverTag {
     Sqlite,
+    /// An embedded RocksDB store, addressed by a filesystem path.
+    RocksDb,
     Postgres(PersistenceVersion),
     MySql(PersistenceVersion),
     MySqlMultitenant(PersistenceVersion),
@@ -14,6 +16,7 @@ impl clap::ValueEnum for DbDriverTag {
     fn value_variants<'a>() -> &'a [Self] {
         &[
             DbDriverTag::Sqlite,
+            DbDriverTag::RocksDb,
             DbDriverTag::MySql(PersistenceVersion::V5),
             DbDriverTag::MySqlMultitenant(PersistenceVersion::V5),
             DbDriverTag::Postgres(PersistenceVersion::V5),
@@ -31,6 +34,9 @@ impl DbDriverTag {
             Self::Postgres(version) | Self::MySql(version) | Self::MySqlMultitenant(version) => {
                 Ok(*version)
             },
+            // The embedded backend writes the same index key encoding the
+            // relational backends do at V5.
+            Self::RocksDb => Ok(PersistenceVersion::V5),
             Self::Sqlite => {
                 anyhow::bail!("sqlite has no persistence version")
             },
@@ -40,6 +46,7 @@ impl DbDriverTag {
     pub fn as_str(&self) -> &'static str {
         match self {
             DbDriverTag::Sqlite => "sqlite",
+            DbDriverTag::RocksDb => "rocksdb",
             DbDriverTag::Postgres(PersistenceVersion::V5) => "postgres-v5",
             DbDriverTag::MySql(PersistenceVersion::V5) => "mysql-v5",
             DbDriverTag::MySqlMultitenant(PersistenceVersion::V5) => "mysql-v5-multitenant",
@@ -53,6 +60,7 @@ impl FromStr for DbDriverTag {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "sqlite" => Ok(Self::Sqlite),
+            "rocksdb" => Ok(Self::RocksDb),
             "postgres-v5" => Ok(DbDriverTag::Postgres(PersistenceVersion::V5)),
             "mysql-v5" => Ok(DbDriverTag::MySql(PersistenceVersion::V5)),
             "mysql-v5-multitenant" => Ok(DbDriverTag::MySqlMultitenant(PersistenceVersion::V5)),

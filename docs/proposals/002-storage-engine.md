@@ -1,6 +1,6 @@
 # Replacing the storage engine without touching the Convex API
 
-**Status:** proposal
+**Status:** phases 1–2 implemented — see `crates/rocksdb_persistence/`
 **Date:** 2026-08-25
 **Supersedes:** Layer 3 of [001-fast-write-path.md](./001-fast-write-path.md) (ephemeral tables), withdrawn — it changed developer-visible semantics
 **Constraint:** zero change to the Convex developer API. No new `defineTable` options, no
@@ -394,13 +394,44 @@ defaults.
 
 ## 7. Phasing
 
+**Phases 1 and 2 are built.** `crates/rocksdb_persistence/` implements both traits
+over the five column families described in §4, and `--db rocksdb` selects it. What
+changed outside the new crate is one `DbDriverTag` variant threaded through its match
+arms in `crates/clusters/` and `crates/db_connection/`, plus one workspace dependency
+entry. The committer, index cache, retention, subscriptions, streaming export, search
+and vector indexes are untouched, and the Convex developer API is identical.
+
+Three things are worth recording about what the implementation turned up.
+
+**RocksDB was already in the tree.** `crates/vector` links it for its qdrant segments,
+and only one package in a Cargo graph may provide a native library — so this backend is
+pinned to the same `rocksdb 0.22` rather than introducing a second copy. That removes
+the "new C++ dependency" objection from §8 entirely: the dependency was already there
+and already shipped.
+
+**Index keys needed escaping.** `idx` concatenates a variable-length index key with a
+fixed-length timestamp, and naive concatenation is not order-preserving: `[1,2] ‖ !ts`
+sorts *after* `[1,2,3] ‖ !ts`, because `0xFF… > 0x03`. Convex index keys are not
+prefix-free, so the variable-length component is escaped into a self-terminating form
+first. `keys.rs` proves the property with a proptest, and there is an integration test
+that fails without it.
+
+**Descending scans cost the same as ascending.** §5.2 predicted a reverse scan would
+have to read every retained version of a key. It does not: resolving a key is a forward
+seek to `key ‖ !read_ts` in either direction, and only the traversal between keys
+differs — `seek(successor(prefix))` ascending, `seek_for_prev(prefix)` descending. The
+per-key cost is one seek each way. What remains true is that a key with many versions
+inside the retention window has more of them to skip past.
+
+### Remaining phases
+
 | Phase | Work | Exit criterion |
 |---|---|---|
-| 0 | Run `kvbench` on cell hardware, both durability modes | A measured ratio against the SQLite control on *your* disk. On the reference VM it was 2.7–3.2× on writes and ~19× on scans (§6.1), against a control that is already faster than the real Postgres. If your hardware shows materially less, stop — the bottleneck is elsewhere (see 001 §2) |
-| 1 | `crates/kv_persistence/`: the five keyspaces, both traits, batch deletes, existing retention worker unchanged | Convex's own persistence test suite green against the new backend |
-| 2 | Wire-up: one `DbDriverTag` variant (`crates/clusters/src/db_driver_tag.rs` — the enum plus its `value_variants`, `as_str`, `from_str` and `persistence_version` arms) and one arm each in `persistence_seed`, `connect_persistence`, `connect_persistence_reader` | A cell boots on it and passes the aa-app integration suite |
-| 3 | Shadow-write: run both backends, compare reads, alert on divergence | A week clean under production ingest |
-| 4 | Retention via compaction filter (§5.3), behind a flag | Correctness tests covering never-updated keys |
+| 0 ✅ | Run `kvbench` on cell hardware, both durability modes | A measured ratio against the SQLite control on *your* disk. On the reference VM it was 2.7–3.2× on writes and ~19× on scans (§6.1), against a control that is already faster than the real Postgres. If your hardware shows materially less, stop — the bottleneck is elsewhere (see 001 §2) |
+| 1 ✅ | `crates/rocksdb_persistence/`: the five column families, both traits, batch deletes, existing retention worker unchanged | Behavioural suite green: multi-version reads, tombstones, interval bounds and ordering, paging in both directions, `previous_revisions`, conflict detection, all three retention deletes, globals, `max_ts`, durability across a reopen |
+| 2 ✅ | Wire-up: one `DbDriverTag` variant (`crates/clusters/src/db_driver_tag.rs`) and one arm each in `persistence_seed`, `connect_persistence`, `connect_persistence_reader` | `--db rocksdb <path>` selects the backend |
+| 3 | Shadow-write: run both backends, compare reads, alert on divergence | A week clean under production ingest. **Not started** — do this before it holds anything you cannot lose |
+| 4 | Retention via compaction filter (§5.3), behind a flag | Correctness tests covering never-updated keys. **Not started** — deliberately, see the crate README |
 
 Phases 1 and 2 are the whole surface-level footprint: **one new crate, plus one enum
 variant threaded through two existing files** (`crates/clusters/src/db_driver_tag.rs` and

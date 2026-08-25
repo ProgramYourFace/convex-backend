@@ -103,7 +103,10 @@ pub fn persistence_args_from_cluster_url(
                 require_leader,
             })
         },
+        // The embedded backends are addressed by a filesystem path, so they
+        // never reach the cluster-url parser.
         DbDriverTag::Sqlite => anyhow::bail!("no url for sqlite"),
+        DbDriverTag::RocksDb => anyhow::bail!("no url for rocksdb"),
     }
 }
 

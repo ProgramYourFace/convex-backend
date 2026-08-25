@@ -3030,6 +3030,7 @@ dependencies = [
  "common",
  "mysql",
  "postgres",
+ "rocksdb_persistence",
  "sqlite",
  "tokio-postgres",
  "tracing",
@@ -5789,6 +5790,8 @@ dependencies = [
  "glob",
  "libc",
  "libz-sys",
+ "lz4-sys",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -6124,6 +6127,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 dependencies = [
  "hashbrown 0.17.0",
+]
+
+[[package]]
+name = "lz4-sys"
+version = "1.11.1+lz4-1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -8443,6 +8456,28 @@ checksum = "6bd13e55d6d7b8cd0ea569161127567cd587676c99f4472f779a0279aa60a7a7"
 dependencies = [
  "libc",
  "librocksdb-sys",
+]
+
+[[package]]
+name = "rocksdb_persistence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cmd_util",
+ "common",
+ "futures",
+ "futures-async-stream",
+ "metrics",
+ "prometheus",
+ "proptest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "value",
 ]
 
 [[package]]

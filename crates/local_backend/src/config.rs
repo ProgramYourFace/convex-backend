@@ -26,7 +26,8 @@ use url::Url;
 #[derive(Parser, Clone)]
 #[clap(version = &**SERVER_VERSION_STR, author = "Convex, Inc. <no-reply@convex.dev>", group(clap::ArgGroup::new("storage").multiple(false)))]
 pub struct LocalConfig {
-    /// File path for SQLite, the file path; for postgres, a server URL.
+    /// A filesystem path for the embedded drivers (`sqlite`, `rocksdb`); a
+    /// server URL for `postgres-v5` and `mysql-v5`.
     #[clap(default_value = "convex_local_backend.sqlite3")]
     pub db_spec: String,
 
@@ -248,5 +249,4 @@ impl LocalConfig {
             }
         }
     }
-
 }

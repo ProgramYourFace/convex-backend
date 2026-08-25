@@ -1,0 +1,923 @@
+//! Behavioural tests for the RocksDB persistence layer.
+//!
+//! These exercise the [`Persistence`] and [`PersistenceReader`] contract the
+//! way the database itself uses it: multi-version documents read at explicit
+//! timestamps, index scans that must resolve to the newest version at or before
+//! a snapshot, retention deletes, and durability across a reopen. The key
+//! encodings have their own unit and property tests in [`crate::keys`].
+
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+};
+
+use common::{
+    document::{
+        CreationTime,
+        ResolvedDocument,
+    },
+    index::IndexKeyBytes,
+    interval::{
+        End,
+        Interval,
+        StartIncluded,
+    },
+    obj,
+    persistence::{
+        ConflictStrategy,
+        DocumentLogEntry,
+        DocumentPrevTsQuery,
+        NoopRetentionValidator,
+        Persistence,
+        PersistenceGlobalKey,
+        PersistenceIndexEntry,
+        PersistenceReader,
+        RetentionValidator,
+        TimestampRange,
+    },
+    query::Order,
+    types::{
+        IndexId,
+        Timestamp,
+    },
+    value::{
+        InternalDocumentId,
+        ResolvedDocumentId,
+        TabletId,
+    },
+};
+use futures::TryStreamExt;
+use value::{
+    DeveloperDocumentId,
+    InternalId,
+    TableNumber,
+};
+
+use crate::{
+    keys,
+    RocksDbPersistence,
+};
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const TABLE_NUMBER: u32 = 7;
+
+fn tablet(n: u8) -> TabletId {
+    TabletId(InternalId([n; keys::ID_LEN]))
+}
+
+fn internal_id(n: u32) -> InternalId {
+    let mut bytes = [0u8; keys::ID_LEN];
+    bytes[..4].copy_from_slice(&n.to_be_bytes());
+    InternalId(bytes)
+}
+
+fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
+    InternalDocumentId::new(tablet(tablet_n), internal_id(n))
+}
+
+fn index_id(n: u8) -> IndexId {
+    IndexId(InternalId([0xA0 | n; keys::ID_LEN]))
+}
+
+fn ts(n: u64) -> Timestamp {
+    Timestamp::try_from(n).unwrap()
+}
+
+fn document(tablet_n: u8, n: u32, body: &str) -> anyhow::Result<ResolvedDocument> {
+    let id = ResolvedDocumentId {
+        tablet_id: tablet(tablet_n),
+        developer_id: DeveloperDocumentId::new(
+            TableNumber::try_from(TABLE_NUMBER)?,
+            internal_id(n),
+        ),
+    };
+    Ok(ResolvedDocument::new(
+        id,
+        CreationTime::try_from(1.0)?,
+        obj!("body" => body)?,
+    )?)
+}
+
+fn entry(
+    tablet_n: u8,
+    n: u32,
+    at: u64,
+    body: &str,
+    prev_ts: Option<u64>,
+) -> anyhow::Result<DocumentLogEntry> {
+    Ok(DocumentLogEntry {
+        ts: ts(at),
+        id: doc_id(tablet_n, n),
+        value: Some(document(tablet_n, n, body)?),
+        prev_ts: prev_ts.map(ts),
+    })
+}
+
+fn tombstone(tablet_n: u8, n: u32, at: u64, prev_ts: Option<u64>) -> DocumentLogEntry {
+    DocumentLogEntry {
+        ts: ts(at),
+        id: doc_id(tablet_n, n),
+        value: None,
+        prev_ts: prev_ts.map(ts),
+    }
+}
+
+fn index_entry(
+    idx: u8,
+    key: &[u8],
+    at: u64,
+    value: Option<InternalDocumentId>,
+) -> PersistenceIndexEntry {
+    PersistenceIndexEntry {
+        ts: ts(at),
+        index_id: index_id(idx),
+        key: IndexKeyBytes(key.to_vec()),
+        value,
+    }
+}
+
+fn body_of(doc: &ResolvedDocument) -> String {
+    doc.value()
+        .get::<str>("body")
+        .expect("document has no body field")
+        .to_string()
+}
+
+fn validator() -> Arc<dyn RetentionValidator> {
+    Arc::new(NoopRetentionValidator)
+}
+
+fn interval(start: &[u8], end: Option<&[u8]>) -> Interval {
+    Interval {
+        start: StartIncluded(start.to_vec().into()),
+        end: match end {
+            Some(end) => End::Excluded(end.to_vec().into()),
+            None => End::Unbounded,
+        },
+    }
+}
+
+struct Fixture {
+    persistence: RocksDbPersistence,
+    _dir: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new() -> anyhow::Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        Ok(Self {
+            persistence,
+            _dir: dir,
+        })
+    }
+
+    fn reader(&self) -> Arc<dyn PersistenceReader> {
+        self.persistence.reader()
+    }
+
+    async fn write(
+        &self,
+        documents: &[DocumentLogEntry],
+        indexes: &[PersistenceIndexEntry],
+    ) -> anyhow::Result<()> {
+        self.persistence
+            .write(documents, indexes, ConflictStrategy::Error)
+            .await
+    }
+
+    async fn scan(
+        &self,
+        idx: u8,
+        tablet_n: u8,
+        read_ts: u64,
+        interval: Interval,
+        order: Order,
+    ) -> anyhow::Result<Vec<(Vec<u8>, String)>> {
+        let rows: Vec<_> = self
+            .reader()
+            .index_scan(
+                index_id(idx),
+                tablet(tablet_n),
+                ts(read_ts),
+                &interval,
+                order,
+                8,
+                validator(),
+            )
+            .try_collect()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, doc)| (key.0, body_of(&doc.value)))
+            .collect())
+    }
+
+    async fn log(
+        &self,
+        range: TimestampRange,
+        order: Order,
+    ) -> anyhow::Result<Vec<(u64, InternalDocumentId)>> {
+        let entries: Vec<_> = self
+            .reader()
+            .load_documents(range, order, 2, validator())
+            .try_collect()
+            .await?;
+        Ok(entries.into_iter().map(|e| (e.ts.into(), e.id)).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn documents_round_trip_through_the_log() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "first", None)?,
+            entry(1, 2, 10, "second", None)?,
+            entry(1, 1, 20, "updated", Some(10))?,
+        ],
+        &[],
+    )
+    .await?;
+
+    let entries: Vec<_> = f
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 3);
+    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"first\"");
+    assert_eq!(entries[2].ts, ts(20));
+    assert_eq!(entries[2].prev_ts, Some(ts(10)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn tombstones_survive_the_round_trip() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "alive", None)?,
+            tombstone(1, 1, 20, Some(10)),
+        ],
+        &[],
+    )
+    .await?;
+
+    let entries: Vec<_> = f
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 2);
+    assert!(entries[1].value.is_none());
+    assert_eq!(entries[1].prev_ts, Some(ts(10)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_log_respects_range_order_and_paging() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let mut writes = Vec::new();
+    for i in 0..7u64 {
+        writes.push(entry(1, i as u32, 10 + i, "x", None)?);
+    }
+    f.write(&writes, &[]).await?;
+
+    // Page size is 2 in `Fixture::log`, so this crosses several page boundaries.
+    let asc = f.log(TimestampRange::all(), Order::Asc).await?;
+    assert_eq!(
+        asc.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![10, 11, 12, 13, 14, 15, 16]
+    );
+
+    let desc = f.log(TimestampRange::all(), Order::Desc).await?;
+    assert_eq!(
+        desc.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![16, 15, 14, 13, 12, 11, 10]
+    );
+
+    let windowed = f
+        .log(TimestampRange::new(ts(12)..ts(15)), Order::Asc)
+        .await?;
+    assert_eq!(
+        windowed.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![12, 13, 14]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_log_can_be_restricted_to_one_tablet() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "t1", None)?,
+            entry(2, 1, 11, "t2", None)?,
+            entry(1, 2, 12, "t1 again", None)?,
+        ],
+        &[],
+    )
+    .await?;
+
+    let entries: Vec<_> = f
+        .reader()
+        .load_documents_from_table(tablet(1), TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.id.table() == tablet(1)));
+    assert_eq!(entries[0].ts, ts(10));
+    assert_eq!(entries[1].ts, ts(12));
+    // Bodies come from a second lookup on this path, so check they arrived.
+    assert_eq!(body_of(entries[1].value.as_ref().unwrap()), "\"t1 again\"");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Index scans
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn index_scan_returns_the_newest_version_at_or_before_the_snapshot() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+            entry(1, 1, 30, "v3", Some(20))?,
+        ],
+        &[
+            index_entry(1, b"k", 10, Some(id)),
+            index_entry(1, b"k", 20, Some(id)),
+            index_entry(1, b"k", 30, Some(id)),
+        ],
+    )
+    .await?;
+
+    for (read_ts, expected) in [
+        (10, "\"v1\""),
+        (15, "\"v1\""),
+        (20, "\"v2\""),
+        (99, "\"v3\""),
+    ] {
+        let rows = f
+            .scan(1, 1, read_ts, interval(b"", None), Order::Asc)
+            .await?;
+        assert_eq!(
+            rows,
+            vec![(b"k".to_vec(), expected.to_string())],
+            "at {read_ts}"
+        );
+    }
+
+    // Before any version exists, the key is simply absent.
+    let rows = f.scan(1, 1, 5, interval(b"", None), Order::Asc).await?;
+    assert!(rows.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn index_scan_skips_keys_whose_newest_version_is_a_tombstone() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.write(
+        &[entry(1, 1, 10, "v1", None)?],
+        &[
+            index_entry(1, b"k", 10, Some(id)),
+            index_entry(1, b"k", 20, None),
+        ],
+    )
+    .await?;
+
+    // Visible before the delete, gone after it.
+    assert_eq!(
+        f.scan(1, 1, 10, interval(b"", None), Order::Asc)
+            .await?
+            .len(),
+        1
+    );
+    assert!(f
+        .scan(1, 1, 20, interval(b"", None), Order::Asc)
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn index_scan_honours_interval_bounds_and_order() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let mut documents = Vec::new();
+    let mut indexes = Vec::new();
+    for (i, key) in [b"a".as_slice(), b"b", b"c", b"d"].iter().enumerate() {
+        documents.push(entry(1, i as u32, 10, "x", None)?);
+        indexes.push(index_entry(1, key, 10, Some(doc_id(1, i as u32))));
+    }
+    f.write(&documents, &indexes).await?;
+
+    let asc = f
+        .scan(1, 1, 10, interval(b"b", Some(b"d")), Order::Asc)
+        .await?;
+    assert_eq!(
+        asc.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"b".to_vec(), b"c".to_vec()]
+    );
+
+    let desc = f
+        .scan(1, 1, 10, interval(b"b", Some(b"d")), Order::Desc)
+        .await?;
+    assert_eq!(
+        desc.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"c".to_vec(), b"b".to_vec()]
+    );
+
+    let unbounded = f.scan(1, 1, 10, interval(b"c", None), Order::Asc).await?;
+    assert_eq!(
+        unbounded.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"c".to_vec(), b"d".to_vec()]
+    );
+    Ok(())
+}
+
+/// The case the key escaping exists for: one index key a proper prefix of
+/// another. Without escaping these sort the wrong way round once a timestamp is
+/// concatenated on, and the scan silently returns the wrong rows.
+#[tokio::test]
+async fn index_scan_orders_prefix_keys_correctly() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let keys: [&[u8]; 5] = [b"", b"a", b"a\x00", b"ab", b"b"];
+    let mut documents = Vec::new();
+    let mut indexes = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        documents.push(entry(1, i as u32, 10, "x", None)?);
+        indexes.push(index_entry(1, key, 10, Some(doc_id(1, i as u32))));
+    }
+    f.write(&documents, &indexes).await?;
+
+    let rows = f.scan(1, 1, 10, interval(b"", None), Order::Asc).await?;
+    let mut expected: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+    expected.sort();
+    assert_eq!(
+        rows.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        expected
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn index_scan_pages_across_many_keys() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let mut documents = Vec::new();
+    let mut indexes = Vec::new();
+    for i in 0..50u32 {
+        documents.push(entry(1, i, 10, "x", None)?);
+        indexes.push(index_entry(1, &i.to_be_bytes(), 10, Some(doc_id(1, i))));
+    }
+    f.write(&documents, &indexes).await?;
+
+    // `Fixture::scan` uses a size hint of 8, so this crosses many pages.
+    let asc = f.scan(1, 1, 10, interval(b"", None), Order::Asc).await?;
+    assert_eq!(asc.len(), 50);
+    let mut keys: Vec<_> = asc.iter().map(|(k, _)| k.clone()).collect();
+    let sorted = {
+        let mut s = keys.clone();
+        s.sort();
+        s
+    };
+    assert_eq!(keys, sorted, "ascending scan must be sorted");
+
+    let desc = f.scan(1, 1, 10, interval(b"", None), Order::Desc).await?;
+    assert_eq!(desc.len(), 50);
+    keys.reverse();
+    assert_eq!(
+        desc.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        keys
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn index_scan_ignores_other_indexes() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[entry(1, 1, 10, "x", None)?],
+        &[
+            index_entry(1, b"k", 10, Some(doc_id(1, 1))),
+            index_entry(2, b"k", 10, Some(doc_id(1, 1))),
+        ],
+    )
+    .await?;
+    assert_eq!(
+        f.scan(1, 1, 10, interval(b"", None), Order::Asc)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Previous revisions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn previous_revisions_walks_back_one_version() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+            entry(1, 1, 30, "v3", Some(20))?,
+        ],
+        &[],
+    )
+    .await?;
+
+    let id = doc_id(1, 1);
+    let out = f
+        .reader()
+        .previous_revisions(BTreeSet::from([(id, ts(30)), (id, ts(20))]), validator())
+        .await?;
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[&(id, ts(30))].ts, ts(20));
+    assert_eq!(
+        body_of(out[&(id, ts(30))].value.as_ref().unwrap()),
+        "\"v2\""
+    );
+    assert_eq!(out[&(id, ts(20))].ts, ts(10));
+
+    // Nothing precedes the first revision.
+    let none = f
+        .reader()
+        .previous_revisions(BTreeSet::from([(id, ts(10))]), validator())
+        .await?;
+    assert!(none.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn previous_revisions_of_documents_reads_exact_coordinates() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+        ],
+        &[],
+    )
+    .await?;
+
+    let id = doc_id(1, 1);
+    let query = DocumentPrevTsQuery {
+        id,
+        ts: ts(20),
+        prev_ts: ts(10),
+    };
+    let out = f
+        .reader()
+        .previous_revisions_of_documents(BTreeSet::from([query]), validator())
+        .await?;
+    assert_eq!(body_of(out[&query].value.as_ref().unwrap()), "\"v1\"");
+
+    // A coordinate that does not exist is absent rather than an error.
+    let missing = DocumentPrevTsQuery {
+        id,
+        ts: ts(20),
+        prev_ts: ts(11),
+    };
+    let out = f
+        .reader()
+        .previous_revisions_of_documents(BTreeSet::from([missing]), validator())
+        .await?;
+    assert!(out.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Conflicts
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn conflict_strategy_error_rejects_a_duplicate_document() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(&[entry(1, 1, 10, "v1", None)?], &[]).await?;
+    let err = f
+        .write(&[entry(1, 1, 10, "again", None)?], &[])
+        .await
+        .expect_err("duplicate (ts, id) must be rejected");
+    assert!(
+        err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflict_strategy_error_rejects_a_duplicate_index_entry() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.write(
+        &[entry(1, 1, 10, "v1", None)?],
+        &[index_entry(1, b"k", 10, Some(id))],
+    )
+    .await?;
+    let err = f
+        .persistence
+        .write(
+            &[],
+            &[index_entry(1, b"k", 10, Some(id))],
+            ConflictStrategy::Error,
+        )
+        .await
+        .expect_err("duplicate index entry must be rejected");
+    assert!(
+        err.to_string().contains("already exists"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflict_strategy_overwrite_replaces_in_place() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(&[entry(1, 1, 10, "v1", None)?], &[]).await?;
+    f.persistence
+        .write(
+            &[entry(1, 1, 10, "replaced", None)?],
+            &[],
+            ConflictStrategy::Overwrite,
+        )
+        .await?;
+
+    let entries: Vec<_> = f
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"replaced\"");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Retention
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_removes_revisions_at_or_before_a_timestamp() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+            entry(1, 1, 30, "v3", Some(20))?,
+        ],
+        &[],
+    )
+    .await?;
+
+    let deleted = f.persistence.delete(vec![(ts(20), doc_id(1, 1))]).await?;
+    assert_eq!(deleted, 2, "revisions at 10 and 20 should be removed");
+
+    let remaining = f.log(TimestampRange::all(), Order::Asc).await?;
+    assert_eq!(
+        remaining.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        vec![30]
+    );
+
+    // The per-tablet index has to be cleaned up alongside the log, or a
+    // tablet-scoped scan would resolve a body that is no longer there.
+    let by_table: Vec<_> = f
+        .reader()
+        .load_documents_from_table(tablet(1), TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(by_table.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_index_entries_removes_versions_at_or_before_a_timestamp() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+            entry(1, 1, 30, "v3", Some(20))?,
+        ],
+        &[
+            index_entry(1, b"k", 10, Some(id)),
+            index_entry(1, b"k", 20, Some(id)),
+            index_entry(1, b"k", 30, Some(id)),
+        ],
+    )
+    .await?;
+
+    let chunk = f.persistence.load_index_chunk(None, 100).await?;
+    assert_eq!(chunk.len(), 3);
+    let expired: Vec<_> = chunk.into_iter().filter(|e| e.ts <= ts(20)).collect();
+    let deleted = f.persistence.delete_index_entries(expired).await?;
+    assert_eq!(deleted, 2);
+
+    let remaining = f.persistence.load_index_chunk(None, 100).await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].ts, ts(30));
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_tablet_documents_removes_whole_documents_in_chunks() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let mut writes = Vec::new();
+    for i in 0..5u32 {
+        writes.push(entry(1, i, 10 + i as u64, "x", None)?);
+        writes.push(entry(1, i, 100 + i as u64, "y", Some(10 + i as u64))?);
+    }
+    writes.push(entry(2, 0, 200, "other tablet", None)?);
+    f.write(&writes, &[]).await?;
+
+    let mut total = 0;
+    loop {
+        let deleted = f.persistence.delete_tablet_documents(tablet(1), 3).await?;
+        total += deleted;
+        if deleted == 0 {
+            break;
+        }
+    }
+    assert_eq!(total, 10, "both revisions of all five documents");
+
+    let remaining = f.log(TimestampRange::all(), Order::Asc).await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].1.table(), tablet(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_index_chunk_pages_in_order() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    let mut documents = Vec::new();
+    let mut indexes = Vec::new();
+    for (i, key) in [b"a".as_slice(), b"b", b"c"].iter().enumerate() {
+        for version in 0..3u64 {
+            let at = 10 + i as u64 * 10 + version;
+            documents.push(entry(1, (i * 3 + version as usize) as u32, at, "x", None)?);
+            indexes.push(index_entry(1, key, at, Some(id)));
+        }
+    }
+    f.write(&documents, &indexes).await?;
+
+    let all = f.persistence.load_index_chunk(None, 100).await?;
+    assert_eq!(all.len(), 9);
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted, "chunks must arrive in IndexEntry order");
+
+    // Paging with a cursor must cover the set exactly once.
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let chunk = f.persistence.load_index_chunk(cursor.clone(), 2).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        cursor = chunk.last().cloned();
+        paged.extend(chunk);
+    }
+    assert_eq!(paged, all);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Globals, freshness and durability
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn persistence_globals_round_trip() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    assert!(f
+        .reader()
+        .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+        .await?
+        .is_none());
+    f.persistence
+        .write_persistence_global(
+            PersistenceGlobalKey::MaxRepeatableTimestamp,
+            serde_json::json!(1234),
+        )
+        .await?;
+    assert_eq!(
+        f.reader()
+            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+            .await?,
+        Some(serde_json::json!(1234)),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn max_ts_covers_both_the_log_and_the_repeatable_timestamp() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    assert_eq!(f.reader().max_ts().await?, None);
+
+    f.write(&[entry(1, 1, 10, "v1", None)?], &[]).await?;
+    assert_eq!(f.reader().max_ts().await?, Some(ts(10)));
+
+    // A repeatable timestamp ahead of the log wins; one behind it does not.
+    f.persistence
+        .write_persistence_global(
+            PersistenceGlobalKey::MaxRepeatableTimestamp,
+            serde_json::json!(50),
+        )
+        .await?;
+    assert_eq!(f.reader().max_ts().await?, Some(ts(50)));
+
+    f.write(&[entry(1, 2, 60, "v2", None)?], &[]).await?;
+    assert_eq!(f.reader().max_ts().await?, Some(ts(60)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_database_is_fresh_and_a_reopened_one_is_not() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+
+    let persistence = RocksDbPersistence::new(&path)?;
+    assert!(persistence.is_fresh());
+    persistence
+        .write(
+            &[entry(1, 1, 10, "durable", None)?],
+            &[],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    persistence.shutdown().await?;
+    drop(persistence);
+
+    let reopened = RocksDbPersistence::new(&path)?;
+    assert!(!reopened.is_fresh());
+    let entries: Vec<_> = reopened
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"durable\"");
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_survive_a_reopen_without_a_clean_shutdown() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new(&path)?;
+        let id = doc_id(1, 1);
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(id))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        // Dropped without `shutdown`, so recovery must come from the WAL.
+    }
+
+    let reopened = RocksDbPersistence::new(&path)?;
+    let rows: Vec<_> = reopened
+        .reader()
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(10),
+            &interval(b"", None),
+            Order::Asc,
+            8,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the index entry and its document must both recover"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_writes_are_accepted() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    f.write(&[], &[]).await?;
+    assert!(f.log(TimestampRange::all(), Order::Asc).await?.is_empty());
+    Ok(())
+}
