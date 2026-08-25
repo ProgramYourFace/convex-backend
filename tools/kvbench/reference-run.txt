@@ -1,0 +1,39 @@
+Reference run — 4 vCPU Intel Xeon @ 2.10 GHz, 15 GB RAM, virtio disk (VM, backing
+unknown). Kept for shape, not as a target: run the harness on the cell's PVC storage
+class before drawing any conclusion. Engine configuration is recorded in README.md.
+
+########## RELAXED — no fsync (matches synchronous_commit=off) ##########
+convex storage-shape benchmark
+docs=500000 batch=64 indexes=3 value=400B rows/doc=6 durability=no fsync (OS buffer)
+dir=/tmp/kvb-r
+
+running fjall ... 11.3s
+running rocksdb ... 4.6s
+running redb ... 41.2s
+running sqlite ... 13.2s
+
+engine         docs/s      rows/s    p50 ms    p99 ms    scans/s    p99 ms   prevrev/s   disk MB  scan rows
+-----------------------------------------------------------------------------------------------------------
+fjall           53414      320483      0.96      2.40       9099      0.25       94000     685.2     192000
+rocksdb        114813      688880      0.55      0.88      42046      0.05      153366     633.7     192000
+redb            12226       73355      5.21      7.54      54068      0.05      179951    1028.5     192000
+sqlite          42940      257639      0.90      6.20       2208      0.70      148187     570.0     192000
+
+
+########## DURABLE — fsync per batch ##########
+convex storage-shape benchmark
+docs=500000 batch=64 indexes=3 value=400B rows/doc=6 durability=fsync per batch
+dir=/tmp/kvb-d
+
+running fjall ... 12.8s
+running rocksdb ... 9.7s
+running redb ... 42.3s
+running sqlite ... 32.0s
+
+engine         docs/s      rows/s    p50 ms    p99 ms    scans/s    p99 ms   prevrev/s   disk MB  scan rows
+-----------------------------------------------------------------------------------------------------------
+fjall           45500      273003      1.03      2.93      13347      0.20       89961     685.1     192000
+rocksdb         53121      318727      1.11      1.84      41278      0.06      156436     633.7     192000
+redb            11904       71425      5.34      8.00      51180      0.05      160666    1028.5     192000
+sqlite          16448       98690      2.02     18.80       2186      0.70      147329     570.0     192000
+

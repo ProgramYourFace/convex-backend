@@ -124,9 +124,12 @@ its data model. We would be paying for a feature we cannot use.
 | **redb 2.x**, **LMDB** | Copy-on-write B-tree | MIT/Apache-2.0 | Excellent read latency, one write transaction at a time. Architecturally the same side of the trade as Postgres, minus the network — useful as a *control* in benchmarking, not as the answer for write-heavy ingest. |
 | **sled** | Hybrid | MIT/Apache-2.0 | Still pre-1.0, and its README states the on-disk format will change in ways requiring manual migration before 1.0. Not for a system of record. |
 
-**Recommendation:** benchmark RocksDB and fjall on the real hardware (§6), default to
-RocksDB unless fjall wins clearly. RocksDB's operational track record under exactly this
-kind of workload is the tiebreaker, and pure-Rust is a preference, not a requirement.
+**Recommendation:** benchmark RocksDB and fjall on the real hardware (§6). On the
+reference VM RocksDB led on every column (§6.1), but neither engine was tuned and the two
+converge once fsync dominates — so treat that as a reason to measure, not as the answer.
+Absent a clear win for fjall on your disk, default to RocksDB: its operational track
+record under exactly this workload is the tiebreaker, and pure-Rust is a preference
+rather than a requirement.
 
 ---
 
@@ -314,11 +317,78 @@ cargo run --release -- --docs 200000 --batch 64 --indexes 3 --relaxed
 cargo run --release -- --docs 200000 --batch 64 --indexes 3 --durable
 ```
 
-**Known gaps in the harness, deliberately:** it measures forward index scans only, so it
-will not show the §5.2 descending-scan cost; and it uses layout A (document bytes in
-`doc`) rather than the layout B recommended in §4.1 (bytes in `dlog`), which changes the
-read numbers but not the write numbers. Both are small extensions if the write results
-justify going further.
+### 6.1 A first run
+
+Measured here, on a 4 vCPU Xeon @ 2.10 GHz / 15 GB RAM VM with a virtio disk of
+unknown backing. **These are not your numbers** — the point of the harness is that you
+run it on the cell's PVC. They are included because the *shape* of the result is
+informative and reproducible.
+
+500,000 documents, batches of 64, 3 indexes, 400-byte values — so 3,000,000 physical
+keys. All four engines returned identical scan output (192,000 rows), checked before any
+timing was reported.
+
+**`--relaxed` (no fsync — what `synchronous_commit=off` gives you today)**
+
+| engine | docs/s | rows/s | p50 ms | p99 ms | scans/s | prevrev/s | disk MB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| rocksdb | **114,813** | 688,880 | 0.55 | 0.88 | **42,046** | 153,366 | 634 |
+| fjall | 53,414 | 320,483 | 0.96 | 2.40 | 9,099 | 94,000 | 685 |
+| sqlite *(control)* | 42,940 | 257,639 | 0.90 | 6.20 | 2,208 | 148,187 | 570 |
+| redb | 12,226 | 73,355 | 5.21 | 7.54 | 54,068 | **179,951** | 1,029 |
+
+**`--durable` (fsync every batch)**
+
+| engine | docs/s | rows/s | p50 ms | p99 ms | scans/s | prevrev/s | disk MB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| rocksdb | **53,121** | 318,727 | 1.11 | **1.84** | **41,278** | 156,436 | 634 |
+| fjall | 45,500 | 273,003 | 1.03 | 2.93 | 13,347 | 89,961 | 685 |
+| sqlite *(control)* | 16,448 | 98,690 | 2.02 | 18.80 | 2,186 | 147,329 | 570 |
+| redb | 11,904 | 71,425 | 5.34 | 8.00 | 51,180 | 160,666 | 1,029 |
+
+Five things worth reading off these.
+
+**The axis is B-tree versus LSM, not embedded versus server.** redb is embedded,
+in-process and has no network — and it is *slower than the SQLite control on writes*
+(0.28× relaxed, 0.72× durable) while being the **fastest engine on reads**. That is the
+trade from §1 showing up exactly where the theory says it should. Removing the socket is
+not what wins here; changing the storage model is.
+
+**The scan gap is larger than the write gap.** RocksDB scans ~19× faster than the
+relational control in both modes. That is `DISTINCT ON` + `GROUP BY` + join versus a
+single seek, and it lands on every `withIndex` query in the app, not just on ingest.
+
+**Durability is where the LSM's shape pays.** Under fsync the write gap *widens*
+(2.7× → 3.2×) and the tail separates hard: SQLite p99 18.80 ms against RocksDB 1.84 ms.
+A sequential WAL append amortised by group commit degrades gracefully; B-tree page
+flushing does not. This matters more than the throughput column if you ever want
+`synchronous_commit` back on.
+
+**The two LSMs are not interchangeable, and this run does not settle which.** RocksDB is
+2.1× fjall relaxed but only 1.17× durable — under fsync the disk dominates and the
+implementations converge. Neither has been tuned. Do not pick between them on this table.
+
+**The SQLite control is a floor, not a stand-in for Postgres.** It runs in-process, with
+no socket, no lease statements (§5.4), no MVCC row versions and no checkpoint full-page
+writes — all of which the real Postgres pays on top. The measured 2.7–3.2× therefore
+*understates* the gap against the deployment. The harness cannot say by how much; only a
+run against the actual cell can.
+
+One more understatement: the harness is single-threaded, while Convex issues up to 16
+concurrent `Persistence::write` calls and RocksDB coalesces concurrent writers into one
+WAL fsync via its write-group mechanism (`write_thread.h:319-333`). Real concurrency
+should widen RocksDB's durable-mode lead, not narrow it.
+
+### 6.2 Known gaps in the harness, deliberately
+
+It measures forward index scans only, so it does not show the §5.2 descending-scan cost.
+It uses layout A (document bytes in `doc`) rather than the layout B recommended in §4.1,
+which changes the read numbers but not the write numbers. Its index keys are unique, so
+version shadowing is barely exercised — add an index keyed on `device` alone to measure
+that. And it does not charge the KV engines for §5.1's uniqueness check. See
+[`tools/kvbench/README.md`](../../tools/kvbench/README.md) for the full list. Each is a
+small extension; add the ones that matter to your decision rather than trusting the
+defaults.
 
 ---
 
@@ -326,7 +396,7 @@ justify going further.
 
 | Phase | Work | Exit criterion |
 |---|---|---|
-| 0 | Run `kvbench` on cell hardware, both durability modes | A measured write-throughput ratio against the SQLite control. If it is under ~3×, stop — the bottleneck is elsewhere (see 001 §2) |
+| 0 | Run `kvbench` on cell hardware, both durability modes | A measured ratio against the SQLite control on *your* disk. On the reference VM it was 2.7–3.2× on writes and ~19× on scans (§6.1), against a control that is already faster than the real Postgres. If your hardware shows materially less, stop — the bottleneck is elsewhere (see 001 §2) |
 | 1 | `crates/kv_persistence/`: the five keyspaces, both traits, batch deletes, existing retention worker unchanged | Convex's own persistence test suite green against the new backend |
 | 2 | Wire-up: one `DbDriverTag` variant (`crates/clusters/src/db_driver_tag.rs` — the enum plus its `value_variants`, `as_str`, `from_str` and `persistence_version` arms) and one arm each in `persistence_seed`, `connect_persistence`, `connect_persistence_reader` | A cell boots on it and passes the aa-app integration suite |
 | 3 | Shadow-write: run both backends, compare reads, alert on divergence | A week clean under production ingest |
@@ -353,5 +423,8 @@ team can already debug, back up, replicate and hire for. `crates/kv_persistence`
 software you own, in the write path of your system of record, with the §5.1 uniqueness
 weakness and the §5.4 loss of lease-based failover as permanent properties.
 
-Phase 0 exists so that trade is made against a number rather than an argument. Run it
-before writing any of phase 1.
+Phase 0 exists so that trade is made against a number rather than an argument. The
+reference run (§6.1) says the number is likely to be worth having — 2.7–3.2× on writes and
+~19× on index scans against a control that is *already faster than the real Postgres* —
+but it says so on a VM whose disk is nothing like a cell PVC. Run it there before writing
+any of phase 1.
