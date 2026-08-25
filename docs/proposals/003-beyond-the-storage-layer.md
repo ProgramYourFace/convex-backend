@@ -458,6 +458,66 @@ multiplies reads, because a cache hit stops making a network call. And §1 is wo
 further ~30 % on writes and another order of magnitude on reads on top of this, but it is
 genuinely optional: everything above is available without it.
 
+### Where the CPU goes
+
+The throughput numbers above have a simple explanation underneath them, and it is worth
+stating separately because it generalises past this workload. Both configurations were
+run with the Postgres server in its own `cpuacct` cgroup, so its CPU — including
+short-lived per-connection backends — is accounted rather than estimated:
+
+```
+8 000 events                    backend process   postgres      total CPU   wall
+postgres                                13.00s      4.28s          17.28s  16.89s
+rocksdb                                  7.68s      0.00s           7.68s   8.29s
+```
+
+**2.25× less total CPU for the same work.** Both runs sit at roughly one core busy
+(CPU ≈ wall), which means this workload is CPU-bound at one core and the CPU saving *is*
+the throughput gain — 2.25× less CPU, 2.2× the events per second. The two numbers agree,
+which is the reassuring part.
+
+The saving comes from two places, only one of which is obvious:
+
+- **4.28s of Postgres server work disappears entirely.** Parse, plan, execute, buffer
+  management, WAL, per-connection backend processes.
+- **The Convex process itself gets cheaper too**, 13.00s → 7.68s, running identical
+  Convex code over an identical workload. That difference is the client half of the
+  boundary: wire-protocol encode and decode, socket syscalls, and a tokio wakeup per
+  round trip, across the 25 254 round trips §10 counted. Since the RocksDB figure also
+  *contains* the storage work that Postgres was doing in its own 4.28s, 5.32s is a lower
+  bound on what the client side of the socket was costing.
+
+### Memory
+
+Less dramatic, and worth being precise about rather than assuming an embedded engine is
+automatically lighter.
+
+```
+                        backend maxrss   postgres PSS   processes
+postgres                       62.8 MiB      126.2 MiB           9
+rocksdb                        77.6 MiB              —           1
+```
+
+RocksDB's process is ~15 MiB larger, because the block cache and memtables moved into it.
+The Postgres configuration is larger in total because it is also running a second program.
+Two structural differences behind that:
+
+- **Per-connection processes.** Postgres forks a backend per connection. Measured here at
+  **1.06 MiB PSS per idle connection**, and more once a connection has run queries and
+  built its catalog and prepared-statement caches — Convex keeps up to
+  `POSTGRES_MAX_CACHED_STATEMENTS` per connection, and `POSTGRES_MAX_CONNECTIONS`
+  defaults to **128**. An embedded engine has no such per-client cost at all.
+- **The buffer pool moves into a budget you already own.** This is accounting, not
+  savings: `shared_buffers` and the RocksDB block cache are both fixed reservations, and
+  both sit above the OS page cache, so no caching layer is actually eliminated. What
+  changes is that the reservation is now inside the container whose limit you set — which
+  is a real operational simplification and a real new footgun, since RocksDB reads no
+  cgroup limit and an overrun kills the backend rather than a sidecar
+  ([004](./004-rocksdb-in-kubernetes.md) §3).
+
+So: compute is a large, measured, structural win. Memory is a modest one that mostly
+shows up as fewer processes and one less thing to size independently.
+
 ### One caveat about the measurement
 
 This benchmark issues its reads through the same `PersistenceReader` the backend uses,
