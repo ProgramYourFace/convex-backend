@@ -2,11 +2,11 @@
 
 An embedded RocksDB implementation of `Persistence` / `PersistenceReader`.
 
-Selected with `--db rocksdb` (or `INSTANCE_DB=rocksdb`), where the database spec
-is a filesystem path rather than a connection URL:
+Selected with `--db rocksdb`, where the positional database spec is a filesystem
+path rather than a connection URL:
 
 ```sh
-convex-local-backend --db rocksdb --db-spec /convex/data/db
+convex-local-backend --db rocksdb /convex/data/db
 ```
 
 Nothing above the trait changes. The committer, index cache, retention,

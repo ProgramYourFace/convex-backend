@@ -450,7 +450,7 @@ update-in-place pages, in a separate process, over a socket, on one CPU.** An em
 removes the emulation, the process and the socket at once.
 
 The strongest argument against is operational, not technical: Postgres is a database your
-team can already debug, back up, replicate and hire for. `crates/kv_persistence` would be
+team can already debug, back up, replicate and hire for. `crates/rocksdb_persistence` is
 software you own, in the write path of your system of record, with the §5.1 uniqueness
 weakness and the §5.4 loss of lease-based failover as permanent properties.
 
