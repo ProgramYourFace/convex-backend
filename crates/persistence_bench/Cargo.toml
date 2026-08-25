@@ -1,0 +1,29 @@
+[package]
+name = "persistence_bench"
+version = "0.1.0"
+authors = ["Convex, Inc. <no-reply@convex.dev>"]
+edition = "2024"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+description = "Compares persistence backends by driving the real Convex commit path"
+
+[[bin]]
+name = "persistence-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+common = { workspace = true }
+database = { workspace = true }
+governor = { workspace = true }
+indexing = { workspace = true }
+model = { workspace = true }
+rocksdb_persistence = { workspace = true }
+runtime = { workspace = true }
+search = { workspace = true }
+sqlite = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+value = { workspace = true }
+
+[lints]
+workspace = true

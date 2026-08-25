@@ -7327,6 +7327,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "persistence_bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "database",
+ "governor",
+ "indexing",
+ "model",
+ "rocksdb_persistence",
+ "runtime",
+ "search",
+ "sqlite",
+ "tempfile",
+ "tokio",
+ "value",
+]
+
+[[package]]
 name = "petgraph"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
