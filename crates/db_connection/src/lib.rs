@@ -159,6 +159,15 @@ pub async fn connect_persistence<RT: Runtime>(
             Ok(persistence as Arc<dyn Persistence>)
         },
         PersistenceSeed::RocksDb { path } => {
+            // Postgres fences a deployment with a `read_only` row that every
+            // write checks. An embedded store has no equivalent, and silently
+            // ignoring the request would let a migration or an import run
+            // against a database the operator believes is frozen.
+            anyhow::ensure!(
+                !flags.allow_read_only,
+                "the RocksDB backend has no read-only mode: it cannot fence writes the way the \
+                 relational backends do with their `read_only` row. Stop the writer instead.",
+            );
             // The same signal the relational backends raise on lease loss. An
             // embedded engine has no lease, but it does latch read-only on a
             // background error — a full disk, a corrupt SST — after which every

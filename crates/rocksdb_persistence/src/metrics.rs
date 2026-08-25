@@ -87,12 +87,28 @@ pub fn log_oldest_write(seconds: f64) {
     log_gauge(&ROCKSDB_OLDEST_WRITE_SECONDS, seconds);
 }
 
-register_convex_counter!(
+register_convex_gauge!(
     ROCKSDB_BACKGROUND_ERRORS_TOTAL,
     "Latched RocksDB background errors, which stop the database accepting writes"
 );
+/// A gauge, not a counter: the property is the *total* latched so far, so
+/// adding it to a counter on every poll would multiply one error by the poll
+/// rate.
 pub fn log_background_errors(count: u64) {
-    log_counter(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count);
+    log_gauge(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count as f64);
+}
+
+register_convex_gauge!(
+    ROCKSDB_WRITE_STOPPED_TOTAL,
+    "Whether RocksDB is deliberately stalling writers as backpressure"
+);
+/// Tells a deliberate stall apart from a hang — the difference between an
+/// ingest burst and a volume that has stopped accepting writes.
+pub fn log_write_stopped(stopped: bool) {
+    log_gauge(
+        &ROCKSDB_WRITE_STOPPED_TOTAL,
+        if stopped { 1.0 } else { 0.0 },
+    );
 }
 
 register_convex_histogram!(

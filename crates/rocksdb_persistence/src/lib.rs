@@ -135,6 +135,17 @@ pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
 /// family. Namespaced away from every `PersistenceGlobalKey`.
 const IDENTITY_KEY: &[u8] = b"__convex_rocksdb_backup_identity";
 
+/// Key under which the on-disk layout version lives, in the same column family.
+const FORMAT_VERSION_KEY: &[u8] = b"__convex_rocksdb_format_version";
+
+/// Version of the on-disk layout this build writes and understands.
+///
+/// The key encodings in [`keys`] — the escaping, the descending-timestamp
+/// convention, the set of column families — are a format, and a format with no
+/// version is one that opens an incompatible directory cleanly and returns
+/// wrong answers. Bump this whenever any of them changes.
+const FORMAT_VERSION: u64 = 1;
+
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadCheck {
@@ -149,7 +160,6 @@ pub struct ReadCheck {
 /// unrelated decisions — durability, failure escalation, and whether this
 /// process is the one that owns the database's background work — and a
 /// `open(path, true, false, None)` at a call site says none of that.
-#[derive(Default)]
 pub struct OpenOptions {
     /// Durability mode. `None` takes it from the environment.
     pub sync: Option<options::SyncMode>,
@@ -157,10 +167,31 @@ pub struct OpenOptions {
     /// that has stopped accepting writes keeps the process alive.
     pub shutdown: Option<ShutdownSignal>,
     /// Whether to run background work — the interval WAL flusher, the periodic
-    /// backup worker and the health monitor. False for short-lived opens such
-    /// as a restore rehearsal, which must not attach either to the production
-    /// backup chain or to a shutdown signal.
+    /// backup worker and the health monitor.
+    ///
+    /// Defaults to **true**, because `SyncMode::Interval` without a flusher is
+    /// not merely un-optimised, it is *less* durable than `Never`: the database
+    /// is opened with `manual_wal_flush`, so acknowledged writes sit in
+    /// RocksDB's own buffer with nothing to move them. A default of false made
+    /// every caller that did not think about it — including this crate's own
+    /// tests and the benchmark — silently opt out of the durability mode they
+    /// asked for.
+    ///
+    /// Set it false only for a short-lived open that must not touch shared
+    /// state: a restore rehearsal, which would otherwise attach a backup worker
+    /// to a scratch database and write generations of it into the production
+    /// chain.
     pub background: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            sync: None,
+            shutdown: None,
+            background: true,
+        }
+    }
 }
 
 /// An embedded RocksDB [`Persistence`].
@@ -225,6 +256,16 @@ impl RocksDbPersistence {
         Self::open(path, true, opts)
     }
 
+    /// Whether an interval WAL flusher is running.
+    ///
+    /// Exists so a test about the flusher can assert that one exists: the
+    /// difference between "the flusher made this durable" and "`Inner::drop`
+    /// did" is invisible in the result, and a test that cannot tell them apart
+    /// is not testing what it claims.
+    pub fn has_wal_flusher(&self) -> bool {
+        self.inner.wal_flusher.get().is_some()
+    }
+
     /// Open a read-only view of a database another process has open for
     /// writing.
     ///
@@ -275,8 +316,8 @@ impl RocksDbPersistence {
         // database, so its absence is the reliable "nothing here yet" signal —
         // more so than the directory existing, which a mount or a failed
         // earlier attempt can also produce.
-        let newly_created = !path.join("CURRENT").exists();
-        if newly_created && !create_if_missing {
+        let directory_is_new = !path.join("CURRENT").exists();
+        if directory_is_new && !create_if_missing {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
 
@@ -289,10 +330,66 @@ impl RocksDbPersistence {
         let db = Db::open_cf_descriptors(&shared.db, path, cfs)
             .with_context(|| format!("failed to open RocksDB at {}", path.display()))?;
 
+        // Freshness is a property of the *data*, not of the directory. RocksDB
+        // writes `CURRENT` as the last step of creating a database, before
+        // Convex has written a single row, so a process killed anywhere inside
+        // `Database::initialize` — an OOM, an eviction, a node reboot — would
+        // reopen to a directory that exists and a database that is empty. Its
+        // caller would then skip initialization and fail forever on the missing
+        // bootstrap tables, with no way out but deleting the volume. Postgres
+        // asks the same question of the data (`SELECT 1 FROM documents LIMIT
+        // 1`), and recovers from this automatically.
+        let newly_created = {
+            let dlog = db
+                .cf_handle(CF_DLOG)
+                .context("missing column family dlog just after opening")?;
+            let mut iter = db.raw_iterator_cf(&dlog);
+            iter.seek_to_first();
+            iter.status()?;
+            !iter.valid()
+        };
+
+        // Refuse a directory this build does not understand, rather than
+        // reading it with the wrong encodings.
+        {
+            let globals = db
+                .cf_handle(CF_GLOBALS)
+                .context("missing column family globals just after opening")?;
+            match db.get_cf(&globals, FORMAT_VERSION_KEY)? {
+                Some(raw) => {
+                    let found: u64 =
+                        String::from_utf8_lossy(&raw)
+                            .trim()
+                            .parse()
+                            .with_context(|| {
+                                format!("unreadable format version in {}", path.display())
+                            })?;
+                    anyhow::ensure!(
+                        found == FORMAT_VERSION,
+                        "{} was written in RocksDB layout version {found}, and this build \
+                         understands {FORMAT_VERSION}. Opening it would read the data with the \
+                         wrong key encodings.",
+                        path.display(),
+                    );
+                },
+                // Absent on a database this build just created, and on one
+                // written before versioning existed — which is the same layout,
+                // so stamping it is correct rather than a migration.
+                None if !newly_created || create_if_missing => {
+                    db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
+                },
+                None => {},
+            }
+        }
+
         tracing::info!(
             "opened RocksDB persistence at {} ({})",
             path.display(),
-            if newly_created { "fresh" } else { "existing" },
+            match (directory_is_new, newly_created) {
+                (true, _) => "created",
+                (false, true) => "existing but empty; will be initialized",
+                (false, false) => "existing",
+            },
         );
 
         let inner = Arc::new(Inner {
@@ -351,8 +448,15 @@ impl RocksDbPersistence {
 /// `Persistence::shutdown` is the intended teardown, but nothing in the tree
 /// calls it: `Database::shutdown` stops the committer and its workers and
 /// returns, and no relational backend overrides `shutdown` either, so the hook
-/// was never wired up. Dropping the handle is therefore the path production
-/// actually takes, and it has to be the safe one. Without this, `db` — the
+/// was never wired up. Dropping the handle is the closest thing to a teardown
+/// that runs, so it has to be the safe one.
+///
+/// It is not guaranteed to run either. `local_backend` installs no SIGTERM
+/// handler, so a Kubernetes pod stop terminates the process with no destructor
+/// executing at all — which under `SyncMode::Interval` costs up to one interval
+/// on every rolling restart. Under the default `SyncMode::Every` nothing is
+/// lost. Wiring a signal handler to `Persistence::shutdown` is an upstream gap
+/// affecting every backend, not just this one. Without this, `db` — the
 /// first field — would close while the workers were still running, and in
 /// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
 impl Drop for Inner {

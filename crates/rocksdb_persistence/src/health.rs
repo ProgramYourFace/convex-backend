@@ -174,12 +174,34 @@ fn check(
     if let Some(waiting) = stalled
         && waiting > *options::WRITE_STALL_TIMEOUT
     {
-        shutdown.signal(anyhow::anyhow!(
-            "a RocksDB write has been in flight for {waiting:?}, past the stall timeout. The \
-             engine blocks rather than failing when it cannot make progress — a full volume looks \
-             exactly like this — so stopping beats parking every writer forever"
-        ));
-        return;
+        // RocksDB also blocks writers *deliberately*, as backpressure: the
+        // write buffer manager is built with `allow_stall`, and the L0
+        // slowdown/stop triggers are at their defaults. That kind of stall
+        // drains as compaction catches up, and killing the process for it would
+        // turn an ingest burst into an outage. `is-write-stopped` says which
+        // kind this is; only an unexplained one is a hang.
+        let deliberate = inner
+            .db
+            .property_int_value("rocksdb.is-write-stopped")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            > 0;
+        metrics::log_write_stopped(deliberate);
+        if deliberate {
+            tracing::warn!(
+                "a RocksDB write has been in flight for {waiting:?}, but the engine reports \
+                 deliberate write stalling — treating this as backpressure rather than a hang"
+            );
+        } else {
+            shutdown.signal(anyhow::anyhow!(
+                "a RocksDB write has been in flight for {waiting:?} with no write stall reported, \
+                 past the stall timeout. The engine blocks rather than failing when it cannot \
+                 make progress — a full volume looks exactly like this — so stopping beats \
+                 parking every writer forever"
+            ));
+            return;
+        }
     }
 
     if let Some(errors) = background_errors(inner)

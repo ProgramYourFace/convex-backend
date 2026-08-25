@@ -977,6 +977,12 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
             &path,
             SyncMode::Interval(Duration::from_millis(50)),
         )?;
+        // Without this the WAL would be flushed by `Inner::drop` instead, and
+        // the test would be checking the *next* test's behaviour.
+        assert!(
+            persistence.has_wal_flusher(),
+            "this test is about the flusher; drop-flush is covered separately"
+        );
         let id = doc_id(1, 1);
         persistence
             .write(
@@ -1404,11 +1410,18 @@ async fn dropping_during_a_flush_tick_does_not_panic() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     for round in 0..200u32 {
         let path = dir.path().join(format!("db{round}"));
+        // `background: true` is the default, and load-bearing here: without a
+        // flusher thread there is no tick for the drop to race, and this test
+        // would assert nothing.
         let persistence = RocksDbPersistence::new_with_sync_mode(
             &path,
             // Short enough that the flusher is very likely mid-tick at drop.
             SyncMode::Interval(Duration::from_micros(200)),
         )?;
+        assert!(
+            persistence.has_wal_flusher(),
+            "no flusher means no tick to race, and this test would pass vacuously"
+        );
         for i in 1..=4u32 {
             persistence
                 .write(
@@ -1580,11 +1593,13 @@ async fn a_rejecting_retention_validator_stops_every_read_path() -> anyhow::Resu
     Ok(())
 }
 
-/// The scratch directory is deleted by a rehearsal, so it must never be
-/// anything the command did not create — a scheduled
-/// `rehearse --scratch /convex/data/db` would otherwise destroy production.
+/// A rehearsal must never delete anything at the path an operator named. The
+/// earlier design marked a scratch directory as "mine to clear", which is a
+/// permanent deletion grant: a directory that hosted a rehearsal once is a
+/// directory the command will empty forever after, live database and all.
+/// It now works inside a directory it names itself and removes only that.
 #[tokio::test]
-async fn rehearse_refuses_a_scratch_directory_it_did_not_create() -> anyhow::Result<()> {
+async fn rehearse_leaves_everything_at_the_scratch_path_alone() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let backup_dir = dir.path().join("backup");
     {
@@ -1600,20 +1615,75 @@ async fn rehearse_refuses_a_scratch_directory_it_did_not_create() -> anyhow::Res
         persistence.shutdown().await?;
     }
 
-    // Stand in for the live data directory: populated, not ours.
-    let precious = dir.path().join("precious");
-    std::fs::create_dir_all(&precious)?;
-    std::fs::write(precious.join("CURRENT"), "do not delete")?;
+    // Stand in for a data volume: a live-looking database and a user file.
+    let volume = dir.path().join("volume");
+    std::fs::create_dir_all(volume.join("db"))?;
+    std::fs::create_dir_all(volume.join("file_storage"))?;
+    std::fs::write(volume.join("db/CURRENT"), "live")?;
+    std::fs::write(volume.join("file_storage/blob1"), "user upload")?;
 
-    let err = backup::rehearse(&backup_dir, &precious, None)
-        .expect_err("rehearsing into a populated directory must refuse");
-    assert!(
-        format!("{err:#}").contains("not created by a rehearsal"),
-        "{err:#}"
+    // Rehearse into it twice — the second run is the one the old marker scheme
+    // turned into a deletion.
+    backup::rehearse(&backup_dir, &volume, None)?;
+    backup::rehearse(&backup_dir, &volume, None)?;
+
+    assert_eq!(
+        std::fs::read_to_string(volume.join("db/CURRENT"))?,
+        "live",
+        "the rehearsal must not have touched the database at that path"
     );
+    assert_eq!(
+        std::fs::read_to_string(volume.join("file_storage/blob1"))?,
+        "user upload",
+        "nor anything else under it"
+    );
+    // And it cleans up after itself rather than accumulating.
+    let leftovers: Vec<_> = std::fs::read_dir(&volume)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("convex-rehearsal-"))
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    Ok(())
+}
+
+/// `is_fresh` decides whether the caller runs `Database::initialize`. RocksDB
+/// writes `CURRENT` as the *last* step of creating a database, before Convex
+/// has written a row, so deriving freshness from the directory means a process
+/// killed anywhere inside initialization reopens to "not fresh" and an empty
+/// database — skipping initialization forever and failing on the missing
+/// bootstrap tables, with no recovery but deleting the volume.
+#[tokio::test]
+async fn an_empty_database_is_still_fresh_after_a_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        // Created, then killed before writing anything — an OOM or an eviction
+        // partway through initialization.
+        let persistence = RocksDbPersistence::new(&path)?;
+        assert!(persistence.is_fresh());
+    }
+    assert!(path.join("CURRENT").exists(), "the directory now exists");
+
+    let reopened = RocksDbPersistence::new(&path)?;
     assert!(
-        precious.join("CURRENT").exists(),
-        "the refusal must leave the directory untouched"
+        reopened.is_fresh(),
+        "an empty database must still be fresh, or initialization never runs"
+    );
+
+    // One row is enough to stop being fresh.
+    reopened
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    reopened.shutdown().await?;
+    drop(reopened);
+    assert!(
+        !RocksDbPersistence::new(&path)?.is_fresh(),
+        "a database with data is not fresh"
     );
     Ok(())
 }

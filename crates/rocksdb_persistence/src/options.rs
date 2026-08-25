@@ -256,6 +256,16 @@ pub static WRITE_STALL_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS", 120).max(5))
 });
 
+/// Floor on how long a write-ahead log may go unflushed before the flusher is
+/// presumed dead, independent of the configured interval.
+///
+/// Without it a short interval makes the deadline short too — six seconds at
+/// 100 ms — and an ordinary fsync tail on a throttled volume becomes a process
+/// kill.
+pub static MIN_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_MIN_FLUSH_SILENCE_SECONDS", 120).max(10))
+});
+
 /// How long `shutdown` waits for background compactions to settle.
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64)));

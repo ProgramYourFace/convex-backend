@@ -102,10 +102,14 @@ struct IndexPage {
     cursor: Option<Vec<u8>>,
 }
 
-/// Ceiling on how many index entries may share one truncated key prefix before
-/// [`Inner::load_index_chunk`] gives up. Reaching it needs many distinct index
-/// keys that agree on their first `MAX_INDEX_KEY_PREFIX_LEN` bytes, each with
-/// its own version run. Failing loudly beats buffering without bound.
+/// Ceiling on how many index entries may share one `key_prefix` before
+/// [`Inner::load_index_chunk`] gives up.
+///
+/// For any key short enough to be its own prefix — which is nearly all of
+/// them — a group is one key's *version run*, so the real trigger is a single
+/// index key rewritten this many times inside the retention window, not a
+/// prefix collision. Failing loudly beats buffering without bound, but it is a
+/// hard error, so the ceiling is set far above any plausible run.
 const MAX_INDEX_ENTRY_GROUP: usize = 65_536;
 
 /// How many index keys one page may examine per row it is asked to produce.

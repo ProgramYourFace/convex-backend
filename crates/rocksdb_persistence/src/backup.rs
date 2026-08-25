@@ -132,10 +132,6 @@ struct LockedEngine {
 /// Name of the file that records which database owns a backup directory.
 const OWNER_FILE: &str = "convex-backup-owner";
 
-/// Written into a rehearsal's scratch directory, so a later rehearsal knows the
-/// directory is its own to delete.
-const SCRATCH_MARKER: &str = ".convex-rehearsal-scratch";
-
 /// Records, or checks, which database a backup directory belongs to.
 ///
 /// Two cells pointed at one `ROCKSDB_BACKUP_DIR` — a shared volume, a templated
@@ -255,9 +251,8 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
 
 /// The restore itself, without the empty-target precondition.
 ///
-/// Split out for [`rehearse`], which has already made a stronger check — that
-/// the directory is one it created — and whose own scratch marker would
-/// otherwise trip the emptiness test.
+/// Split out for [`rehearse`], which restores into a directory it constructed
+/// itself and so has no pre-existing content to protect.
 fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Result<()> {
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
@@ -310,43 +305,30 @@ pub fn rehearse(
     };
     verify(dir, target.backup_id)?;
 
-    // `--scratch` comes straight from an operator's argv, and this is the
-    // command the runbook says to put on a schedule, so a bare `remove_dir_all`
-    // on it turns `rehearse … --scratch /convex/data/db` into a way to delete
-    // the live database. `restore --to` already refuses a non-empty target; the
-    // asymmetry was the trap.
+    // Never delete a path the operator named. The previous attempt marked a
+    // scratch directory as "mine to clear" — but a marker is a *permanent*
+    // deletion grant on that path, and a directory that hosted a rehearsal last
+    // year is a directory this command will happily empty today, live database
+    // and all. A flag would be no better; the dangerous invocation would carry
+    // it.
     //
-    // A flag would not fix it — the dangerous invocation would just carry the
-    // flag. Instead only a directory this command created is ever cleared,
-    // marked by a file nothing else writes. That makes repeated rehearsals work
-    // (the nightly case) while making "delete something I did not make"
-    // unreachable rather than merely discouraged.
-    let marker = scratch.join(SCRATCH_MARKER);
-    if scratch.exists() {
-        let mut entries = std::fs::read_dir(scratch)
-            .with_context(|| format!("failed to read {}", scratch.display()))?;
-        if entries.next().is_some() {
-            anyhow::ensure!(
-                marker.exists(),
-                "{} is not empty and was not created by a rehearsal, so it will not be cleared. \
-                 Point --scratch at an empty or absent directory — this command deletes what it \
-                 is given, and refuses to guess that a populated directory is disposable.",
-                scratch.display(),
-            );
-            std::fs::remove_dir_all(scratch)
-                .with_context(|| format!("failed to clear {}", scratch.display()))?;
-        }
+    // Instead the rehearsal works inside a directory it names itself, and
+    // removes only that. `scratch` is created if absent and otherwise left
+    // exactly as found — whatever else is in it is none of this command's
+    // business.
+    std::fs::create_dir_all(scratch)
+        .with_context(|| format!("failed to create {}", scratch.display()))?;
+    let restored = scratch.join(format!(
+        "convex-rehearsal-{}-{}",
+        target.backup_id,
+        std::process::id()
+    ));
+    if restored.exists() {
+        // Only reachable for a path this process just constructed, so clearing
+        // it cannot touch anything else.
+        std::fs::remove_dir_all(&restored)
+            .with_context(|| format!("failed to clear {}", restored.display()))?;
     }
-    std::fs::create_dir_all(scratch)?;
-    // Marked before the restore, not after: a rehearsal killed part-way through
-    // leaves a directory the next run can recognise and clear, rather than one
-    // it has to refuse.
-    std::fs::write(&marker, "created by rocksdb-backup rehearse\n")
-        .with_context(|| format!("failed to mark {} as scratch", scratch.display()))?;
-    // The database goes in a subdirectory because `RestoreDBFromBackup` empties
-    // its target — restoring directly into `scratch` would delete the marker
-    // that makes the *next* rehearsal willing to reuse it.
-    let restored = scratch.join("db");
     std::fs::create_dir_all(&restored)?;
     restore_into(dir, &restored, Some(target.backup_id))?;
 
@@ -369,6 +351,11 @@ pub fn rehearse(
         .verify_readable()
         .context("the restored database opened but could not be read")?;
     drop(persistence);
+    // Leave nothing behind on success. A failed rehearsal keeps its directory
+    // for inspection; the next run's name differs by pid, so it never collides.
+    if let Err(e) = std::fs::remove_dir_all(&restored) {
+        tracing::warn!("could not clean up {}: {e}", restored.display());
+    }
     Ok((target, read))
 }
 

@@ -93,7 +93,8 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
 | `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled write |
-| `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS` | 120 | how long one write may be in flight before the process is stopped |
+| `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS` | 120 | how long one write may be in flight, with no stall reported, before the process is stopped |
+| `ROCKSDB_MIN_FLUSH_SILENCE_SECONDS` | 120 | floor on how long the WAL may go unflushed before the flusher is presumed dead |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -116,19 +117,24 @@ What it buys depends entirely on the commit rate, because RocksDB already coales
 concurrent writers into one write group and fsyncs once for the group. Measured on the
 device-location workload (`crates/persistence_bench`, fsync p50 0.17 ms on the test VM):
 
-| events per commit | commits/s | every | interval=100ms | gain |
+| events per commit | every | interval=100ms | never | interval's gain |
 |--:|--:|--:|--:|--:|
-| 1 | 494 | 494 ev/s | 618 ev/s | **+25 %** |
-| 4 | 225 | 901 ev/s | 1047 ev/s | **+16 %** |
-| 16 | 79 | 1271 ev/s | 1464 ev/s | **+15 %** |
-| 64 | 25 | 1574 ev/s | 1669 ev/s | +6 %, within noise |
+| 1 | 403 ev/s | 532 ev/s | 549 ev/s | **+32 %** |
+| 4 | 682 ev/s | 829 ev/s | 940 ev/s | **+22 %** |
+| 16 | 1111 ev/s | 1202 ev/s | 1076 ev/s | +8 % |
+| 64 | 1159 ev/s | 1291 ev/s | 1279 ev/s | +11 % |
 
-Interval mode captures essentially all of what `never` offers while keeping the loss
-window bounded, so there is no reason to prefer `never` over a short interval. But the
-gain is a function of how many commits per second reach the disk: batch writes into
-larger transactions and the fsync stops mattering, which is the cheaper fix. Note that
-these ratios are a floor for slower storage — on a network-attached volume where an
-fsync costs milliseconds rather than 0.17 ms, the same commit rate pays more for it.
+Interval mode captures most of what `never` offers while keeping the loss window bounded,
+so there is little reason to prefer `never` over a short interval. But the gain is a
+function of how many commits per second reach the disk: batch writes into larger
+transactions and the fsync stops mattering, which is the cheaper fix. These ratios are a
+floor for slower storage — on a network-attached volume where an fsync costs milliseconds
+rather than 0.17 ms, the same commit rate pays more for it.
+
+(An earlier version of this table reported larger gains. It was measured through a code
+path that opened the database with `manual_wal_flush` and *no flusher thread*, so the
+"interval" column was `never` plus buffering and never fsynced at all. The default now
+runs background work, and these numbers are from a configuration that actually flushes.)
 
 `ROCKSDB_SYNC_WRITES=false` is the analogue of Postgres's
 `synchronous_commit=off`: it trades a bounded window of recent writes on host
@@ -203,10 +209,9 @@ restoring for — it belongs in an init container or a one-shot job. `restore` r
 non-empty target: move the old directory aside instead, so a live database is never
 written underneath and the current one stays recoverable.
 
-`rehearse` clears its scratch directory, but only one it created itself — marked by a
-file nothing else writes. Pointing it at a populated directory refuses rather than
-deleting, so `rehearse --scratch /convex/data/db` cannot destroy the live database, and
-repeated rehearsals still work. A backup directory also records which database owns it
+`rehearse` never deletes anything at the path you give it. It restores into a
+uniquely-named subdirectory it creates and removes only that, leaving the rest of the
+directory exactly as found — so `rehearse --scratch /convex/data/db` cannot destroy the live database. A backup directory also records which database owns it
 and refuses a second one, since interleaved generations mean retention prunes the wrong
 ones and a restore returns whichever wrote last.
 
@@ -267,8 +272,11 @@ So a health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and ra
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
 on any of:
 
-- **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`**, which is the
-  signal a full volume actually produces;
+- **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`** *and* no write
+  stall reported by the engine. RocksDB also blocks writers deliberately, as
+  backpressure — `allow_stall` on the write buffer manager, the L0 slowdown triggers —
+  and that drains as compaction catches up, so `rocksdb.is-write-stopped` separates an
+  ingest burst from a volume that has stopped accepting writes;
 - **a latched background error**, read from the `default` column family. That detail
   matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
   increments it on `default`, so polling the five families this backend defines returns a
@@ -341,9 +349,12 @@ thread, as the Postgres backend also does.
 Reads are paged: a page is fetched on a blocking thread, the retention validator
 is consulted, and only then are its rows yielded — the same order Postgres uses,
 so a snapshot that falls out of retention mid-scan is never handed to the caller.
-Paging without an engine snapshot is safe because a `(ts, id)` row is written
-once and only ever removed by retention, which cannot touch anything the
-validator has approved.
+Each page reads against one engine snapshot, so the index walk and the document bodies
+it resolves see the same instant. Rows *can* disappear between pages — retention removes
+them continuously, and `delete_tablet_documents` does so with no reference to the
+retention window at all — and what makes that safe is that every cursor is a value rather
+than a position: a resume seeks to the cursor's key and steps past it only if the seek
+landed on it.
 
 ## Not implemented
 
