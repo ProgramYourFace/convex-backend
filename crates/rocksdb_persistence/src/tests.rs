@@ -1338,14 +1338,24 @@ async fn load_documents_does_not_skip_a_row_when_the_cursor_row_is_deleted() -> 
 #[tokio::test]
 async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow::Result<()> {
     use common::index::MAX_INDEX_KEY_PREFIX_LEN;
+    use value::sha256::Sha256;
 
     let f = Fixture::new()?;
-    // Two keys agreeing on the whole truncated prefix, differing past it.
+    // Two keys agreeing on the whole truncated prefix, differing past it. The
+    // suffixes are not arbitrary: `IndexEntry` breaks the tie on
+    // `sha256(full_key)`, so the pair has to be one where sha256 order
+    // *disagrees* with byte order. Suffixes 1 and 2 do not (this test was
+    // originally written with them and passed vacuously); 1 and 3 do.
     let mut a = vec![b'z'; MAX_INDEX_KEY_PREFIX_LEN];
     let mut b = a.clone();
     a.push(1);
-    b.push(2);
+    b.push(3);
     assert!(a < b, "a is the byte-order-smaller key");
+    assert!(
+        Sha256::hash(&a).as_ref() > Sha256::hash(&b).as_ref(),
+        "the point of this test is a pair whose IndexEntry order is the reverse of storage order; \
+         if this ever stops holding, pick different suffixes rather than deleting the assertion",
+    );
 
     for (i, key) in [a.clone(), b.clone()].into_iter().enumerate() {
         let n = i as u32 + 1;
@@ -1364,17 +1374,24 @@ async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow:
     sorted.sort();
     assert_eq!(all, sorted, "entries must be emitted in IndexEntry order");
 
-    // Paging with the cursor must reach the second entry, whichever of the two
-    // sorts first — the bug dropped it because the filter ran against a stream
-    // that was not in IndexEntry order.
-    let first = f.persistence.load_index_chunk(None, 1).await?;
-    assert_eq!(first.len(), 1);
-    let rest = f
-        .persistence
-        .load_index_chunk(Some(first[0].clone()), 16)
-        .await?;
-    assert_eq!(rest.len(), 1, "paging must not drop the remaining entry");
-    assert_eq!(vec![first[0].clone(), rest[0].clone()], sorted);
+    // Page one entry at a time. The entry that sorts second in `IndexEntry`
+    // order sits *first* in storage, so resuming at the cursor's own storage
+    // position would start past it and it would never be emitted.
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let chunk = f.persistence.load_index_chunk(cursor.clone(), 1).await?;
+        let Some(entry) = chunk.into_iter().next() else {
+            break;
+        };
+        cursor = Some(entry.clone());
+        paged.push(entry);
+        assert!(paged.len() <= 4, "paging is not terminating");
+    }
+    assert_eq!(
+        paged, sorted,
+        "paging one at a time must yield every entry, in IndexEntry order"
+    );
     Ok(())
 }
 
@@ -1560,6 +1577,73 @@ async fn a_rejecting_retention_validator_stops_every_read_path() -> anyhow::Resu
         previous.is_err(),
         "previous_revisions yielded a rejected read"
     );
+    Ok(())
+}
+
+/// The scratch directory is deleted by a rehearsal, so it must never be
+/// anything the command did not create — a scheduled
+/// `rehearse --scratch /convex/data/db` would otherwise destroy production.
+#[tokio::test]
+async fn rehearse_refuses_a_scratch_directory_it_did_not_create() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+        persistence.shutdown().await?;
+    }
+
+    // Stand in for the live data directory: populated, not ours.
+    let precious = dir.path().join("precious");
+    std::fs::create_dir_all(&precious)?;
+    std::fs::write(precious.join("CURRENT"), "do not delete")?;
+
+    let err = backup::rehearse(&backup_dir, &precious, None)
+        .expect_err("rehearsing into a populated directory must refuse");
+    assert!(
+        format!("{err:#}").contains("not created by a rehearsal"),
+        "{err:#}"
+    );
+    assert!(
+        precious.join("CURRENT").exists(),
+        "the refusal must leave the directory untouched"
+    );
+    Ok(())
+}
+
+/// Two databases sharing one backup directory interleave their generations,
+/// so retention prunes the wrong ones and a restore returns whichever wrote
+/// last. Silent until someone restores, so it is refused at backup time.
+#[tokio::test]
+async fn a_backup_directory_belongs_to_one_database() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+
+    let first = RocksDbPersistence::new(&dir.path().join("a"))?;
+    first
+        .write(&[entry(1, 1, 10, "a", None)?], &[], ConflictStrategy::Error)
+        .await?;
+    first.backup(&backup_dir, 4)?;
+
+    let second = RocksDbPersistence::new(&dir.path().join("b"))?;
+    second
+        .write(&[entry(1, 2, 20, "b", None)?], &[], ConflictStrategy::Error)
+        .await?;
+    let err = second
+        .backup(&backup_dir, 4)
+        .expect_err("a second database must not write into the same chain");
+    assert!(format!("{err:#}").contains("different database"), "{err:#}");
+
+    // The first database is still free to keep using it.
+    first.backup(&backup_dir, 4)?;
+    assert_eq!(backup::list(&backup_dir)?.len(), 2);
     Ok(())
 }
 

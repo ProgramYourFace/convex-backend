@@ -23,6 +23,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicU32,
             Ordering,
         },
         Arc,
@@ -49,6 +50,10 @@ pub(crate) struct WalFlusher {
     /// acknowledged writes in RocksDB's buffer, so this — not the presence of
     /// error logs — is the measurement of whether the mode's loss bound holds.
     clock: Arc<FlushClock>,
+    /// Flushes that have failed since the last success. Distinguishes "the disk
+    /// is slow" from "the disk is broken", which the elapsed clock alone
+    /// cannot.
+    failures: Arc<AtomicU32>,
 }
 
 struct Signal {
@@ -67,6 +72,8 @@ impl WalFlusher {
         let signal = stop.clone();
         let clock = Arc::new(FlushClock::new());
         let thread_clock = clock.clone();
+        let failures = Arc::new(AtomicU32::new(0));
+        let thread_failures = failures.clone();
         let handle = std::thread::Builder::new()
             .name("rocksdb-wal-flusher".to_string())
             .spawn(move || {
@@ -93,9 +100,11 @@ impl WalFlusher {
                     match inner.db.flush_wal(true) {
                         Ok(()) => {
                             thread_clock.record_success();
+                            thread_failures.store(0, Ordering::Relaxed);
                             timer.finish();
                         },
                         Err(e) => {
+                            thread_failures.fetch_add(1, Ordering::Relaxed);
                             timer.finish_developer_error();
                             // Log rather than crash *here*: one failed flush is
                             // a transient, the next tick retries, and the
@@ -115,7 +124,13 @@ impl WalFlusher {
             stop,
             handle: Mutex::new(Some(handle)),
             clock,
+            failures,
         })
+    }
+
+    /// Flushes that have failed since the last success.
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
     }
 
     /// How long since the log was last written through to disk.
@@ -141,7 +156,10 @@ impl WalFlusher {
             // `join` panics). Signalling is enough in that case: the loop is
             // already unwinding.
             if handle.thread().id() == std::thread::current().id() {
-                std::mem::forget(handle);
+                // Dropping the handle here would detach the thread, which is
+                // fine — it is this thread, and it is already unwinding out of
+                // the loop. Joining it would deadlock.
+                drop(handle);
             } else {
                 let _ = handle.join();
             }

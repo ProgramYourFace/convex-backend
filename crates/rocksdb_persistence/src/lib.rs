@@ -187,6 +187,8 @@ pub(crate) struct Inner {
     /// Present on any primary opened with a shutdown signal. Same `Weak`
     /// reasoning.
     health: std::sync::OnceLock<health::HealthMonitor>,
+    /// In-flight write durations, so a stalled write is visible as a level.
+    pub(crate) write_watch: health::WriteWatch,
 }
 
 impl RocksDbPersistence {
@@ -258,6 +260,7 @@ impl RocksDbPersistence {
                 wal_flusher: std::sync::OnceLock::new(),
                 backup_worker: std::sync::OnceLock::new(),
                 health: std::sync::OnceLock::new(),
+                write_watch: health::WriteWatch::default(),
             }),
         })
     }
@@ -299,6 +302,7 @@ impl RocksDbPersistence {
             wal_flusher: std::sync::OnceLock::new(),
             backup_worker: std::sync::OnceLock::new(),
             health: std::sync::OnceLock::new(),
+            write_watch: health::WriteWatch::default(),
         });
 
         if opts.background
@@ -426,6 +430,19 @@ impl Inner {
              and scans perfectly, so this is reported as a failure rather than a pass.",
         );
         Ok(check)
+    }
+
+    /// A stable name for this database, for tying a backup directory to the
+    /// database that produced it.
+    ///
+    /// RocksDB maintains a `DB ID` in its `IDENTITY` file, generated at
+    /// creation and preserved across a backup and restore — which is exactly
+    /// the property wanted here, since a restored database should still
+    /// recognise its own backup chain.
+    pub(crate) fn identity(&self) -> String {
+        std::fs::read_to_string(self.path.join("IDENTITY"))
+            .map(|id| id.trim().to_string())
+            .unwrap_or_else(|_| format!("path:{}", self.path.display()))
     }
 
     /// Bring a secondary instance up to date with its primary. A no-op on the
@@ -614,6 +631,12 @@ impl Persistence for RocksDbPersistence {
         let write = PendingWrite::encode(documents, indexes)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write", move || {
+            // Timed from inside the blocking task, because the thing being
+            // watched for is a write that never returns: RocksDB stalls a
+            // writer it cannot make progress for instead of failing it, and a
+            // parked writer holds this thread until the volume recovers or the
+            // process is stopped.
+            let _guard = inner.write_watch.begin();
             inner.apply_write(write, conflict_strategy)
         })
         .await
@@ -851,7 +874,12 @@ impl RocksDbPersistence {
                     table_name: name.to_string(),
                     data_bytes: property("rocksdb.live-sst-files-size")
                         + property("rocksdb.total-blob-file-size"),
-                    index_bytes: property("rocksdb.estimate-table-readers-mem"),
+                    // An LSM has no separable index structure to measure — the
+                    // index and filter blocks are inside the SST files already
+                    // counted above. Reporting anything here would be
+                    // double-counting; this used to report
+                    // `estimate-table-readers-mem`, which is memory, not disk.
+                    index_bytes: 0,
                     row_count: Some(property("rocksdb.estimate-num-keys")),
                 });
             }
@@ -872,9 +900,21 @@ impl RocksDbPersistence {
 /// `index_scan` and the `previous_revisions` family all resolve a list of
 /// document coordinates into bodies; batching turns what would be one point get
 /// per row into a single `multi_get`.
+/// Resolves document bodies for coordinates an index or table scan produced.
+///
+/// `read_opts` must carry the *same* snapshot the scan's iterator used.
+/// Without it the two phases read two different points in time: the iterator
+/// pins a sequence number for its lifetime, a default-options `multi_get` reads
+/// the latest state, and a retention delete landing between them removes the
+/// body of a row the iterator had already returned. The scan then fails with
+/// "missing its body" or "dangling index reference" — for data that was
+/// perfectly consistent at the snapshot it claimed to be reading. The
+/// relational backends cannot hit this because they resolve the body in the
+/// same statement, at one MVCC snapshot.
 pub(crate) fn multi_get_documents(
     inner: &Inner,
     coordinates: &[(Timestamp, InternalDocumentId)],
+    read_opts: &rocksdb::ReadOptions,
 ) -> anyhow::Result<
     BTreeMap<(Timestamp, InternalDocumentId), (Option<ResolvedDocument>, Option<Timestamp>)>,
 > {
@@ -888,7 +928,7 @@ pub(crate) fn multi_get_documents(
         .collect();
     let results = inner
         .db
-        .multi_get_cf(encoded.iter().map(|key| (&dlog, &key[..])));
+        .multi_get_cf_opt(encoded.iter().map(|key| (&dlog, &key[..])), read_opts);
 
     let mut out = BTreeMap::new();
     for ((ts, id), result) in coordinates.iter().zip(results) {

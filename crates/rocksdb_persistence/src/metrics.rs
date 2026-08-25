@@ -76,6 +76,17 @@ pub fn log_wal_flush_age(seconds: f64) {
     log_gauge(&ROCKSDB_WAL_FLUSH_AGE_SECONDS, seconds);
 }
 
+register_convex_gauge!(
+    ROCKSDB_OLDEST_WRITE_SECONDS,
+    "How long the oldest in-flight write has been running"
+);
+/// The signal a stall actually produces. A write RocksDB cannot make progress
+/// for blocks rather than failing, so no error counter moves and no `Result` is
+/// ever returned — only this number grows.
+pub fn log_oldest_write(seconds: f64) {
+    log_gauge(&ROCKSDB_OLDEST_WRITE_SECONDS, seconds);
+}
+
 register_convex_counter!(
     ROCKSDB_BACKGROUND_ERRORS_TOTAL,
     "Latched RocksDB background errors, which stop the database accepting writes"

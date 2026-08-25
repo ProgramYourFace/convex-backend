@@ -33,6 +33,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicI64,
             Ordering,
         },
         Arc,
@@ -84,8 +85,9 @@ pub struct BackupInfo {
 /// "the operator lists generations while the worker prunes" is a real sequence
 /// that this makes an error instead of a corruption.
 struct DirLock {
-    file: std::fs::File,
-    path: PathBuf,
+    /// Held only so the descriptor stays open: the `flock` lives on the fd and
+    /// is released when it closes.
+    _file: std::fs::File,
 }
 
 impl DirLock {
@@ -113,23 +115,58 @@ impl DirLock {
              directory, up to and including destroying it.",
             dir.display(),
         );
-        Ok(Self { file, path })
+        Ok(Self { _file: file })
     }
 }
 
-impl Drop for DirLock {
-    fn drop(&mut self) {
-        let _ = std::os::fd::AsRawFd::as_raw_fd(&self.file);
-        // Closing the file releases the flock; the path is left in place so the
-        // next acquirer reuses it rather than racing on create.
-        let _ = &self.path;
-    }
-}
+// No `Drop` impl: closing the file descriptor releases the `flock`, which
+// `File`'s own `Drop` does. The lock file is left in place so the next acquirer
+// reuses it rather than racing to create it.
 
 /// A backup engine and the directory lock it is only valid under.
 struct LockedEngine {
     engine: BackupEngine,
     _lock: DirLock,
+}
+
+/// Name of the file that records which database owns a backup directory.
+const OWNER_FILE: &str = "convex-backup-owner";
+
+/// Written into a rehearsal's scratch directory, so a later rehearsal knows the
+/// directory is its own to delete.
+const SCRATCH_MARKER: &str = ".convex-rehearsal-scratch";
+
+/// Records, or checks, which database a backup directory belongs to.
+///
+/// Two cells pointed at one `ROCKSDB_BACKUP_DIR` — a shared volume, a templated
+/// env var, a copy-pasted manifest — would interleave their generations into
+/// one chain. `purge_old_backups` would then prune the *other* database's
+/// generations, and a restore would return whichever database happened to run
+/// last. The directory lock prevents simultaneous corruption; it does nothing
+/// about this, and the failure is silent until someone restores.
+fn claim_directory(dir: &Path, identity: &str) -> anyhow::Result<()> {
+    let marker = dir.join(OWNER_FILE);
+    match std::fs::read_to_string(&marker) {
+        Ok(existing) => {
+            let existing = existing.trim();
+            anyhow::ensure!(
+                existing == identity,
+                "{} holds backups of a different database ({existing}, not {identity}). Two \
+                 databases must not share a backup directory: their generations interleave, \
+                 retention prunes the wrong ones, and a restore returns whichever wrote last.",
+                dir.display(),
+            );
+            Ok(())
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&marker, identity)
+                .with_context(|| format!("failed to write {}", marker.display()))?;
+            Ok(())
+        },
+        Err(e) => {
+            Err(anyhow::Error::from(e).context(format!("failed to read {}", marker.display())))
+        },
+    }
 }
 
 fn open_locked_engine(dir: &Path) -> anyhow::Result<LockedEngine> {
@@ -207,6 +244,15 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
             db_dir.display(),
         );
     }
+    restore_into(dir, db_dir, backup_id)
+}
+
+/// The restore itself, without the empty-target precondition.
+///
+/// Split out for [`rehearse`], which has already made a stronger check — that
+/// the directory is one it created — and whose own scratch marker would
+/// otherwise trip the emptiness test.
+fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Result<()> {
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
     let opts = RestoreOptions::default();
@@ -244,12 +290,45 @@ pub fn rehearse(
     };
     verify(dir, target.backup_id)?;
 
+    // `--scratch` comes straight from an operator's argv, and this is the
+    // command the runbook says to put on a schedule, so a bare `remove_dir_all`
+    // on it turns `rehearse … --scratch /convex/data/db` into a way to delete
+    // the live database. `restore --to` already refuses a non-empty target; the
+    // asymmetry was the trap.
+    //
+    // A flag would not fix it — the dangerous invocation would just carry the
+    // flag. Instead only a directory this command created is ever cleared,
+    // marked by a file nothing else writes. That makes repeated rehearsals work
+    // (the nightly case) while making "delete something I did not make"
+    // unreachable rather than merely discouraged.
+    let marker = scratch.join(SCRATCH_MARKER);
     if scratch.exists() {
-        std::fs::remove_dir_all(scratch)
-            .with_context(|| format!("failed to clear {}", scratch.display()))?;
+        let mut entries = std::fs::read_dir(scratch)
+            .with_context(|| format!("failed to read {}", scratch.display()))?;
+        if entries.next().is_some() {
+            anyhow::ensure!(
+                marker.exists(),
+                "{} is not empty and was not created by a rehearsal, so it will not be cleared. \
+                 Point --scratch at an empty or absent directory — this command deletes what it \
+                 is given, and refuses to guess that a populated directory is disposable.",
+                scratch.display(),
+            );
+            std::fs::remove_dir_all(scratch)
+                .with_context(|| format!("failed to clear {}", scratch.display()))?;
+        }
     }
     std::fs::create_dir_all(scratch)?;
-    restore(dir, scratch, Some(target.backup_id))?;
+    // Marked before the restore, not after: a rehearsal killed part-way through
+    // leaves a directory the next run can recognise and clear, rather than one
+    // it has to refuse.
+    std::fs::write(&marker, "created by rocksdb-backup rehearse\n")
+        .with_context(|| format!("failed to mark {} as scratch", scratch.display()))?;
+    // The database goes in a subdirectory because `RestoreDBFromBackup` empties
+    // its target — restoring directly into `scratch` would delete the marker
+    // that makes the *next* rehearsal willing to reuse it.
+    let restored = scratch.join("db");
+    std::fs::create_dir_all(&restored)?;
+    restore_into(dir, &restored, Some(target.backup_id))?;
 
     // Opening exercises the manifest and every column family descriptor; the
     // scan then forces real iterators over real data rather than a bare open.
@@ -258,7 +337,7 @@ pub fn rehearse(
     // scratch database would write generations *of the scratch database* into
     // the production backup chain and then prune the real ones away.
     let persistence = RocksDbPersistence::open_with(
-        scratch,
+        &restored,
         OpenOptions {
             background: false,
             ..OpenOptions::default()
@@ -290,6 +369,7 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
     anyhow::ensure!(!inner.secondary, "a secondary instance cannot take backups");
     let timer = metrics::backup_timer();
     let mut locked = open_locked_engine(dir)?;
+    claim_directory(dir, &inner.identity())?;
     let engine = &mut locked.engine;
     if let Err(e) = engine.create_new_backup_flush(&inner.db, true) {
         timer.finish_developer_error();
@@ -311,9 +391,12 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
         )));
     }
 
-    if keep > 0
-        && let Err(e) = engine.purge_old_backups(keep)
-    {
+    // `purge_old_backups` is also what triggers RocksDB's `GarbageCollect`, so
+    // `keep = 0` does not merely retain everything — it also leaves orphaned
+    // files from an interrupted backup behind forever. Retain a very large
+    // number instead of none, so collection still runs.
+    let keep = if keep == 0 { u32::MAX as usize } else { keep };
+    if let Err(e) = engine.purge_old_backups(keep) {
         // The backup is written and verified; failing to prune is not a reason
         // to report it as lost.
         tracing::warn!("failed to purge old backups in {}: {e}", dir.display());
@@ -357,6 +440,14 @@ impl BackupConfig {
 pub(crate) struct BackupWorker {
     stop: Arc<Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// Unix seconds of the newest generation, or 0 if none is known yet.
+    ///
+    /// The health monitor reads this instead of listing the directory. Listing
+    /// takes the directory lock, which the worker holds for the whole of a
+    /// backup — so a monitor polling every 15 seconds would fail the hourly
+    /// backup it collided with, and would stop publishing the backup-age gauge
+    /// for exactly as long as a backup was running.
+    newest: Arc<AtomicI64>,
 }
 
 struct Signal {
@@ -372,6 +463,15 @@ impl BackupWorker {
     /// reference would keep the database alive for as long as the thread ran,
     /// and the thread runs until the database is dropped.
     pub(crate) fn spawn(db: Weak<Inner>, config: BackupConfig) -> anyhow::Result<Self> {
+        // Seeded once, before the worker starts, so the gauge is meaningful
+        // from boot rather than only after the first interval elapses.
+        let newest = Arc::new(AtomicI64::new(
+            list(&config.dir)
+                .ok()
+                .and_then(|g| g.last().map(|i| i.timestamp))
+                .unwrap_or(0),
+        ));
+        let thread_newest = newest.clone();
         let stop = Arc::new(Signal {
             stopped: AtomicBool::new(false),
             lock: Mutex::new(()),
@@ -402,12 +502,15 @@ impl BackupWorker {
                         break;
                     };
                     match backup_inner(&inner, &config.dir, config.keep) {
-                        Ok(info) => tracing::info!(
-                            "rocksdb backup {} written: {} files, {} MiB",
-                            info.backup_id,
-                            info.num_files,
-                            info.size_bytes >> 20,
-                        ),
+                        Ok(info) => {
+                            thread_newest.store(info.timestamp, Ordering::Relaxed);
+                            tracing::info!(
+                                "rocksdb backup {} written: {} files, {} MiB",
+                                info.backup_id,
+                                info.num_files,
+                                info.size_bytes >> 20,
+                            );
+                        },
                         Err(e) => {
                             // Log rather than crash: the next tick retries, and
                             // the database is unaffected. A backup system that
@@ -424,7 +527,17 @@ impl BackupWorker {
         Ok(Self {
             stop,
             handle: Mutex::new(Some(handle)),
+            newest,
         })
+    }
+
+    /// Unix seconds of the newest generation the worker knows about, or `None`
+    /// before the first one exists.
+    pub(crate) fn newest_backup_unix_secs(&self) -> Option<i64> {
+        match self.newest.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        }
     }
 
     /// Stop the thread and wait for it. Idempotent.
@@ -443,7 +556,10 @@ impl BackupWorker {
             // `join` panics). Signalling is enough in that case: the loop is
             // already unwinding.
             if handle.thread().id() == std::thread::current().id() {
-                std::mem::forget(handle);
+                // Dropping the handle here would detach the thread, which is
+                // fine — it is this thread, and it is already unwinding out of
+                // the loop. Joining it would deadlock.
+                drop(handle);
             } else {
                 let _ = handle.join();
             }
@@ -471,7 +587,7 @@ pub(crate) mod testing {
 
     /// Takes the backup-directory lock and returns a guard, so a test can hold
     /// it the way a running backup or restore does.
-    pub(crate) fn lock_backup_dir(dir: &Path) -> anyhow::Result<impl Drop + use<>> {
+    pub(crate) fn lock_backup_dir(dir: &Path) -> anyhow::Result<impl Sized + use<>> {
         std::fs::create_dir_all(dir)?;
         super::DirLock::acquire(dir)
     }

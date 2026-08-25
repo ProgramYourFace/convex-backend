@@ -22,10 +22,12 @@
 //!   not the backup worker is alive to move it.
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         atomic::{
             AtomicBool,
+            AtomicU64,
             Ordering,
         },
         Arc,
@@ -115,7 +117,10 @@ impl HealthMonitor {
         };
         if let Some(handle) = handle {
             if handle.thread().id() == std::thread::current().id() {
-                std::mem::forget(handle);
+                // Dropping the handle here would detach the thread, which is
+                // fine — it is this thread, and it is already unwinding out of
+                // the loop. Joining it would deadlock.
+                drop(handle);
             } else {
                 let _ = handle.join();
             }
@@ -130,6 +135,24 @@ impl Drop for HealthMonitor {
 }
 
 fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path::Path>) {
+    // A write that cannot make progress does not fail — it blocks. On a full
+    // volume RocksDB stalls the writer indefinitely rather than returning an
+    // error, so the counter above stays at zero for as long as the write never
+    // completes, and each stalled write parks a blocking-pool thread. The
+    // oldest in-flight write is the signal that actually moves.
+    let stalled = inner.write_watch.oldest_in_flight();
+    metrics::log_oldest_write(stalled.map_or(0.0, |d| d.as_secs_f64()));
+    if let Some(waiting) = stalled
+        && waiting > *options::WRITE_STALL_TIMEOUT
+    {
+        shutdown.signal(anyhow::anyhow!(
+            "a RocksDB write has been in flight for {waiting:?}, past the stall timeout. The \
+             engine blocks rather than failing when it cannot make progress — a full volume looks \
+             exactly like this — so stopping beats parking every writer forever"
+        ));
+        return;
+    }
+
     if let Some(errors) = background_errors(inner)
         && errors > 0
     {
@@ -149,8 +172,13 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
     {
         let since = flusher.since_last_success();
         metrics::log_wal_flush_age(since.as_secs_f64());
+        // Escalate only when flushes are *failing*. A single fsync that takes
+        // longer than the budget is ordinary on a contended volume — at a
+        // 100 ms interval the budget is one second — and killing the process
+        // for a slow disk would be a self-inflicted outage. Consecutive
+        // failures are what mean the mode's loss bound has stopped holding.
         let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
-        if since > budget {
+        if since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS {
             shutdown.signal(anyhow::anyhow!(
                 "the RocksDB write-ahead log has not been flushed for {:?}, past {} intervals; \
                  acknowledged writes are accumulating unwritten, so stopping rather than \
@@ -162,32 +190,40 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
         }
     }
 
-    if let Some(dir) = backup_dir
-        && let Ok(generations) = backup::list(dir)
-        && let Some(newest) = generations.last()
+    // Read from the worker's own record rather than listing the directory:
+    // listing takes the backup directory lock, which the worker holds for the
+    // whole of a backup, so polling it would fail backups and blind the gauge
+    // during exactly the backups worth watching.
+    if backup_dir.is_some()
+        && let Some(worker) = inner.backup_worker.get()
+        && let Some(newest) = worker.newest_backup_unix_secs()
     {
-        metrics::log_backup_age(backup::age_seconds(newest.timestamp));
+        metrics::log_backup_age(backup::age_seconds(newest));
     }
 }
 
+/// Reads the latched background error count.
+///
+/// `rocksdb.background-errors` is served per column family, but RocksDB only
+/// ever increments it on the **default** one: `DBImpl` holds a single
+/// `default_cf_internal_stats_`, and every `bg_error_count_` bump goes through
+/// that. The five column families this backend defines are not the default one,
+/// so asking any of them returns a permanent zero. Verified against a full
+/// filesystem: the five read `0` while `default` read `3`.
+///
+/// `property_int_value` — no `_cf` — is the default family, so it is the only
+/// call here that can ever be non-zero.
 fn background_errors(inner: &Inner) -> Option<u64> {
-    // The property is per-column-family; any one of them latching stops writes
-    // to the whole database, so the first non-zero answer is enough.
-    for name in crate::keys::ALL_COLUMN_FAMILIES {
-        let cf = inner.cf(name).ok()?;
-        match inner
-            .db
-            .property_int_value_cf(&cf, rocksdb::properties::BACKGROUND_ERRORS)
-        {
-            Ok(Some(n)) if n > 0 => return Some(n),
-            Ok(_) => {},
-            Err(e) => {
-                tracing::warn!("could not read RocksDB background-errors: {e}");
-                return None;
-            },
-        }
+    match inner
+        .db
+        .property_int_value(rocksdb::properties::BACKGROUND_ERRORS)
+    {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!("could not read RocksDB background-errors: {e}");
+            None
+        },
     }
-    Some(0)
 }
 
 /// Tracks when the write-ahead log was last successfully flushed, so a
@@ -217,5 +253,54 @@ impl FlushClock {
             Err(poisoned) => *poisoned.into_inner(),
         };
         last.elapsed()
+    }
+}
+
+/// Tracks how long the oldest in-flight write has been running.
+///
+/// RocksDB's response to a volume it cannot write to is to stall the writer,
+/// not to return an error, and a stalled write never returns at all. That makes
+/// it invisible to every error-shaped signal: no `Result` is produced, no
+/// counter moves, and the process keeps answering health probes while its
+/// blocking pool fills with parked writers. Duration is the only thing that
+/// changes, so duration is what gets watched.
+#[derive(Default)]
+pub(crate) struct WriteWatch {
+    in_flight: Mutex<BTreeMap<u64, Instant>>,
+    next_id: AtomicU64,
+}
+
+impl WriteWatch {
+    /// Marks a write as started. The returned guard clears it on drop, so a
+    /// write that panics or is cancelled does not leave a phantom stall.
+    pub(crate) fn begin(&self) -> WriteGuard<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.in_flight.lock() {
+            guard.insert(id, Instant::now());
+        }
+        WriteGuard { watch: self, id }
+    }
+
+    /// How long the longest-running in-flight write has been going, if any.
+    pub(crate) fn oldest_in_flight(&self) -> Option<Duration> {
+        let guard = match self.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Ids increase, so the first entry is the earliest write still running.
+        guard.values().next().map(Instant::elapsed)
+    }
+}
+
+pub(crate) struct WriteGuard<'a> {
+    watch: &'a WriteWatch,
+    id: u64,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.watch.in_flight.lock() {
+            guard.remove(&self.id);
+        }
     }
 }

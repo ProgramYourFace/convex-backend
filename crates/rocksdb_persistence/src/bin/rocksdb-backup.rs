@@ -16,11 +16,13 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use rocksdb_persistence::backup;
 
 const HELP: &str = "\
 rocksdb-backup — administer backups of an embedded RocksDB Convex database
 
+  backup   <backup-dir> --db <db-dir> [--keep N]   take a generation now
   list     <backup-dir>                            generations, newest last
   verify   <backup-dir> [--id N]                   checksum a generation's files
   rehearse <backup-dir> --scratch <dir> [--id N]   restore to scratch and read it
@@ -28,19 +30,29 @@ rocksdb-backup — administer backups of an embedded RocksDB Convex database
 
 Without --id, the newest generation is used.
 
+`backup` is for the database being *stopped* — before an upgrade or a risky
+migration. RocksDB allows one writer, so it fails while the backend is running;
+a running deployment takes its generations from the periodic worker instead.
+
 `verify` checks that the files are intact. `rehearse` checks the thing you
 actually need to know — that a database restored from them opens and reads —
 and is what belongs on a schedule. A backup nobody has restored is not a backup.
 
-`restore` requires an empty or absent target directory. Move the existing one
-aside rather than deleting it: until the restore is confirmed good, it is the
-only other copy you have.
+`restore` requires an empty or absent target: move the existing directory aside
+rather than deleting it, since until the restore is confirmed good it is the only
+other copy you have.
+
+`rehearse` clears its scratch directory, but only one it created itself — so
+repeated rehearsals work and pointing it at a populated directory refuses rather
+than deleting.
 ";
 
 struct Args {
     command: String,
     dir: PathBuf,
     to: Option<PathBuf>,
+    db: Option<PathBuf>,
+    keep: usize,
     scratch: Option<PathBuf>,
     id: Option<u32>,
 }
@@ -58,6 +70,8 @@ fn parse() -> anyhow::Result<Args> {
         command,
         dir,
         to: None,
+        db: None,
+        keep: 24,
         scratch: None,
         id: None,
     };
@@ -71,6 +85,8 @@ fn parse() -> anyhow::Result<Args> {
             .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))?;
         match flag.as_str() {
             "--to" => args.to = Some(PathBuf::from(value)),
+            "--db" => args.db = Some(PathBuf::from(value)),
+            "--keep" => args.keep = value.parse()?,
             "--scratch" => args.scratch = Some(PathBuf::from(value)),
             "--id" => args.id = Some(value.parse()?),
             other => anyhow::bail!("unknown flag {other}"),
@@ -103,6 +119,35 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let args = parse()?;
     match args.command.as_str() {
+        "backup" => {
+            let db_dir = args
+                .db
+                .ok_or_else(|| anyhow::anyhow!("backup needs --db <db-dir>"))?;
+            // No background work: this is a one-shot tool, and attaching a
+            // periodic worker or a health monitor to it would be surprising.
+            let persistence = rocksdb_persistence::RocksDbPersistence::open_with(
+                &db_dir,
+                rocksdb_persistence::OpenOptions {
+                    background: false,
+                    ..rocksdb_persistence::OpenOptions::default()
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "could not open {}. RocksDB allows one writer, so this fails while the \
+                     backend is running — stop it first, or let the periodic worker take the \
+                     backup instead.",
+                    db_dir.display(),
+                )
+            })?;
+            let info = persistence.backup(&args.dir, args.keep)?;
+            println!(
+                "backup {} written: {} files, {} MiB",
+                info.backup_id,
+                info.num_files,
+                info.size_bytes >> 20,
+            );
+        },
         "list" => {
             let generations = backup::list(&args.dir)?;
             if generations.is_empty() {

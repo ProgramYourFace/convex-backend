@@ -196,9 +196,16 @@ it on a cell with a slow PVC will make things worse, not better.
 
 ---
 
-## 6. There is no backup story yet — read this before adopting
+## 6. Backup
 
-This is the honest gap, and the largest operational risk of the switch.
+**Superseded by [005](./005-backup-and-restore.md), which is implemented.** The gap this
+section described is closed: `BackupEngine` generations on a timer, retention, an
+advisory directory lock, verification before pruning, a rehearsal that decodes rather
+than counts, and a `rocksdb-backup` binary for restore. What follows is the reasoning
+that led there, kept because the constraints have not changed.
+
+The one part that remains true as written is the limitation at the end: there is no
+point-in-time recovery and there cannot be at this layer.
 
 Postgres gives you `pg_dump`, `pg_basebackup`, WAL archiving and point-in-time recovery,
 all of them well understood and all of them things an operator already knows how to

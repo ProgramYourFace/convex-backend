@@ -3032,6 +3032,7 @@ dependencies = [
  "postgres",
  "rocksdb_persistence",
  "sqlite",
+ "tempfile",
  "tokio-postgres",
  "tracing",
 ]

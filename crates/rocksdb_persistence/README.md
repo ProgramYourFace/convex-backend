@@ -84,7 +84,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
 | `ROCKSDB_SYNC_INTERVAL_MS` | `0` (off) | flush and fsync the WAL on a timer instead of per write; overrides `ROCKSDB_SYNC_WRITES` |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
-| `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
+| `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | cached data, index and filter blocks *and* memtable charge; the largest, but not the only, consumer |
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
 | `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
 | `ROCKSDB_MEMTABLE_BYTES` | 64 MiB | per-column-family memtable |
@@ -92,7 +92,8 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
-| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled WAL flush |
+| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled write |
+| `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS` | 120 | how long one write may be in flight before the process is stopped |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -148,10 +149,15 @@ memory. `ROCKSDB_BLOCK_CACHE_PERCENT` (default 25) is the share taken, clamped t
 [64 MiB, 4 GiB]. The chosen size and where it came from are logged at startup.
 
 A quarter rather than a half because the backend hosting this crate also runs V8
-isolates, whose heaps are the other large consumer in the process, and RocksDB's
-compaction buffers, iterators and WAL buffers sit outside the cache. Raise it on a
+isolates, whose heaps are the other large consumer in the process. Raise it on a
 deployment whose working set matters more than its isolate headroom; set
 `ROCKSDB_BLOCK_CACHE_BYTES` to override the derivation entirely.
+
+**The cache is the budget's largest term, not the whole of it.** Outside it: compaction
+buffers (one set per background job, defaulting to the core count), the table readers
+kept open by `max_open_files = -1`, blob file readers, and the batches retention builds
+before writing. Size the container with headroom over the cache rather than treating the
+cache as a ceiling.
 
 ## Configuring a write-heavy deployment
 
@@ -184,6 +190,7 @@ column family, so a backup can never hold an index entry whose document it misse
 `rocksdb-backup`, a separate binary in this crate, is the operator side:
 
 ```sh
+rocksdb-backup backup   /convex/backup --db /convex/data/db   # only while stopped
 rocksdb-backup list     /convex/backup
 rocksdb-backup verify   /convex/backup [--id N]      # checksum the files
 rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
@@ -195,6 +202,13 @@ directory's lock while a database is open, so it cannot run inside the backend i
 restoring for — it belongs in an init container or a one-shot job. `restore` refuses a
 non-empty target: move the old directory aside instead, so a live database is never
 written underneath and the current one stays recoverable.
+
+`rehearse` clears its scratch directory, but only one it created itself — marked by a
+file nothing else writes. Pointing it at a populated directory refuses rather than
+deleting, so `rehearse --scratch /convex/data/db` cannot destroy the live database, and
+repeated rehearsals still work. A backup directory also records which database owns it
+and refuses a second one, since interleaved generations mean retention prunes the wrong
+ones and a restore returns whichever wrote last.
 
 **`verify` is a checksum; `rehearse` is the test.** Verification says the files are
 present and the right size. Rehearsal restores into a scratch directory, opens the
@@ -241,20 +255,28 @@ stays that way. Every subsequent write fails, the process keeps serving, and not
 crashes. A Postgres deployment gets a pod that dies and a database another node can take
 over; an embedded one would fail every mutation indefinitely with no signal.
 
+**And the real symptom is a stall, not an error.** Measured against a full volume: writes
+stop returning entirely rather than failing, each one parking a blocking-pool thread, so
+nothing errors, nothing crashes, and no error counter moves. Only duration changes.
+
 So a health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
-on either of:
+on any of:
 
-- **a latched background error**, so the deployment restarts or fails over rather than
-  serving a database that cannot accept writes;
-- **a write-ahead log that has stopped being flushed** in interval mode, past ten
-  intervals. In that mode a write is acknowledged before it reaches the kernel, so a
-  persistently failing flush is acknowledged data accumulating unwritten — the loss is
-  unbounded, not "one interval", and stopping beats continuing to acknowledge writes that
-  are not being kept.
+- **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`**, which is the
+  signal a full volume actually produces;
+- **a latched background error**, read from the `default` column family. That detail
+  matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
+  increments it on `default`, so polling the five families this backend defines returns a
+  permanent zero. Measured on a full filesystem: those five read `0` while `default` read
+  `3`.
+- **a write-ahead log whose flushes are failing** in interval mode, ten intervals running.
+  In that mode a write is acknowledged before it reaches the kernel, so persistent flush
+  failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
+  Escalation counts *failures*, not elapsed time, so one slow fsync on a contended volume
+  cannot take the process down.
 
-It also publishes `rocksdb_wal_flush_age_seconds`, which is the direct measurement of how
-much acknowledged data is currently at risk.
+It also publishes `rocksdb_oldest_write_seconds` and `rocksdb_wal_flush_age_seconds`.
 
 ## Semantics that differ from the relational backends
 

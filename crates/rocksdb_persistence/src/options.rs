@@ -18,10 +18,7 @@ use rocksdb::{
     WriteBufferManager,
 };
 
-use crate::keys::{
-    CF_DLOG,
-    CF_IDX,
-};
+use crate::keys::CF_DLOG;
 
 /// Whether `Persistence::write` fsyncs the write-ahead log before returning.
 ///
@@ -156,7 +153,12 @@ pub static BLOCK_CACHE_BYTES: LazyLock<usize> = LazyLock::new(|| {
     match crate::memory::container_limit_bytes() {
         Some(limit) => {
             let derived = ((limit / 100) * *BLOCK_CACHE_PERCENT) as usize;
-            let clamped = derived.clamp(MIN_DERIVED_CACHE_BYTES, MAX_DERIVED_CACHE_BYTES);
+            // The floor is a floor, not an override: clamping *up* past the
+            // container's own limit is how a 128 MiB container ends up with a
+            // 64 MiB cache — half its total memory — and a 64 MiB one with all
+            // of it. Cap the floor by the limit first.
+            let floor = MIN_DERIVED_CACHE_BYTES.min(limit as usize);
+            let clamped = derived.clamp(floor, MAX_DERIVED_CACHE_BYTES);
             tracing::info!(
                 "rocksdb block cache: {} MiB ({}% of a {} MiB memory limit)",
                 clamped >> 20,
@@ -239,6 +241,16 @@ pub static BACKUP_KEEP: LazyLock<usize> =
 /// hour a backup interval would impose.
 pub static HEALTH_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_HEALTH_POLL_SECONDS", 15).max(1))
+});
+
+/// How long a single write may be in flight before the process is stopped.
+///
+/// This is a stall detector, not a latency budget: RocksDB blocks a writer it
+/// cannot make progress for rather than failing it, so a write past this point
+/// is not slow, it is stuck. Generous enough that a long compaction-induced
+/// backpressure pause does not trip it.
+pub static WRITE_STALL_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS", 120).max(5))
 });
 
 /// How long `shutdown` waits for background compactions to settle.
@@ -380,12 +392,10 @@ pub fn column_family(name: &str, shared: &RocksOptions) -> Options {
         opts.set_blob_gc_age_cutoff(0.25);
     }
 
-    if name == CF_IDX {
-        // Index scans walk one key's versions and then skip to the next key, so
-        // they benefit from larger blocks and lose nothing to the absence of a
-        // whole-key filter.
-        opts.set_optimize_filters_for_hits(true);
-    }
+    // `CF_IDX` deliberately has no bloom filter: index reads are range scans
+    // over key prefixes, which a whole-key filter cannot serve, so it would be
+    // memory spent for nothing. (`set_optimize_filters_for_hits` used to be set
+    // here, which is a no-op without a filter policy to optimise.)
 
     opts
 }

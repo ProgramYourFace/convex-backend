@@ -108,6 +108,16 @@ struct IndexPage {
 /// its own version run. Failing loudly beats buffering without bound.
 const MAX_INDEX_ENTRY_GROUP: usize = 65_536;
 
+/// `ReadOptions` pinned to `snapshot`, for resolving document bodies at the
+/// same point in time the scan's iterator is walking.
+fn snapshot_read_opts(
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, crate::Db>,
+) -> rocksdb::ReadOptions {
+    let mut opts = rocksdb::ReadOptions::default();
+    opts.set_snapshot(snapshot);
+    opts
+}
+
 impl Inner {
     /// Read a page of the document log, ordered by timestamp.
     ///
@@ -141,7 +151,13 @@ impl Inner {
         };
         let cf = self.cf(cf_name)?;
 
+        // One snapshot for both phases of this page: the keys the iterator
+        // walks, and the bodies resolved for them afterwards. See
+        // `multi_get_documents` for what reading them at two different points
+        // in time does.
+        let snapshot = self.db.snapshot();
         let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_snapshot(&snapshot);
         read_opts.set_iterate_lower_bound(lower.clone());
         read_opts.set_iterate_upper_bound(upper);
         let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
@@ -204,7 +220,7 @@ impl Inner {
         let entries = if tablet_id.is_none() {
             inline
         } else {
-            let bodies = multi_get_documents(self, &coordinates)?;
+            let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
             coordinates
                 .iter()
                 .map(|(ts, id)| {
@@ -254,7 +270,11 @@ impl Inner {
             End::Unbounded => keys::idx_upper_bound(index_id, None),
         };
 
+        // One snapshot for the index walk and the body resolution that follows
+        // it — see `multi_get_documents`.
+        let snapshot = self.db.snapshot();
         let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_snapshot(&snapshot);
         read_opts.set_iterate_lower_bound(lower.clone());
         if !upper.is_empty() {
             read_opts.set_iterate_upper_bound(upper.clone());
@@ -319,7 +339,7 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = resolved.iter().map(|(_, ts, id)| (*ts, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
         let mut rows = Vec::with_capacity(resolved.len());
         for (index_key, ts, document_id) in resolved {
             let (value, prev_ts) = bodies.get(&(ts, document_id)).cloned().ok_or_else(|| {
@@ -348,15 +368,22 @@ impl Inner {
         let idx = self.cf(CF_IDX)?;
         let mut iter = self.db.raw_iterator_cf(&idx);
         match &cursor {
-            // Start at the cursor's own key: later versions of it may still be
-            // ahead of the cursor in `IndexEntry` order.
-            Some(entry) => {
-                let mut full_key = entry.key_prefix.clone();
-                if let Some(suffix) = &entry.key_suffix {
-                    full_key.extend_from_slice(suffix);
-                }
-                iter.seek(keys::idx_key_prefix(entry.index_id, &full_key));
-            },
+            // Resume at the start of the cursor's *prefix group*, not at the
+            // cursor's own key.
+            //
+            // Within a group, `IndexEntry` order is `sha256(full_key)` order,
+            // which has no relationship to storage order. So an entry that
+            // belongs after the cursor in `IndexEntry` order — and therefore
+            // still owes the caller an appearance — can sit *before* the
+            // cursor's key in storage. Seeking to the cursor's own key would
+            // start past it and it would never be emitted at all. Seeking to
+            // the group start rescans the group and the `entry > cursor` filter
+            // below picks up exactly what is still owed.
+            //
+            // `idx_lower_bound` on the truncated prefix is at or before every
+            // key in the group, so at worst this rescans a little more than
+            // needed; the filter makes that free of duplicates.
+            Some(entry) => iter.seek(keys::idx_lower_bound(entry.index_id, &entry.key_prefix)),
             None => iter.seek_to_first(),
         }
 
@@ -377,6 +404,11 @@ impl Inner {
         let mut out = Vec::with_capacity(chunk_size);
         let mut group: Vec<IndexEntry> = Vec::new();
         let mut group_prefix: Option<Vec<u8>> = None;
+        // Draining stops as soon as `out` is full, and whatever is left in the
+        // group is simply dropped — which is correct only because the resume
+        // above rescans the whole group. Emitting a prefix of the sorted group
+        // and letting the next call re-derive the rest is what keeps the two
+        // halves consistent.
         let flush = |group: &mut Vec<IndexEntry>, out: &mut Vec<IndexEntry>| {
             group.sort();
             for entry in group.drain(..) {
@@ -442,7 +474,11 @@ impl Inner {
     ) -> anyhow::Result<BTreeMap<(InternalDocumentId, Timestamp), DocumentLogEntry>> {
         self.refresh()?;
         let docs = self.cf(CF_DOCS)?;
-        let mut iter = self.db.raw_iterator_cf(&docs);
+        // One snapshot across the revision walk and the body resolution below.
+        let snapshot = self.db.snapshot();
+        let mut iter = self
+            .db
+            .raw_iterator_cf_opt(&docs, snapshot_read_opts(&snapshot));
 
         // Locate each predecessor first, then fetch all the bodies at once.
         let mut located = Vec::with_capacity(ids.len());
@@ -465,7 +501,7 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = located.iter().map(|(id, _, prev)| (*prev, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
         let mut out = BTreeMap::new();
         for (id, ts, prev_ts) in located {
             let (value, prev_prev_ts) = bodies.get(&(prev_ts, id)).cloned().ok_or_else(|| {
@@ -492,7 +528,8 @@ impl Inner {
         self.refresh()?;
         let queries: Vec<_> = ids.into_iter().collect();
         let coordinates: Vec<_> = queries.iter().map(|q| (q.prev_ts, q.id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let snapshot = self.db.snapshot();
+        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
         let mut out = BTreeMap::new();
         for query in queries {
             let Some((value, prev_prev_ts)) = bodies.get(&(query.prev_ts, query.id)).cloned()
