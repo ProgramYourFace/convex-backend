@@ -63,6 +63,11 @@ const FLUSH_FAILURE_INTERVALS: u32 = 10;
 /// quiet — no successes, no failures — is treated as dead.
 const FLUSH_SILENCE_MULTIPLIER: u32 = 6;
 
+/// Multiple of the stall timeout past which a blocked write is escalated
+/// whatever the engine reports about itself. Backpressure that has not drained
+/// in this long is indistinguishable from a hang from every angle that matters.
+const STALL_ESCALATION_CEILING: u32 = 10;
+
 pub(crate) struct HealthMonitor {
     stop: Arc<Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -90,30 +95,39 @@ impl HealthMonitor {
         let started = Instant::now();
         let handle = std::thread::Builder::new()
             .name("rocksdb-health".to_string())
-            .spawn(move || loop {
-                {
-                    let guard = match signal.lock.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
+            .spawn(move || {
+                let mut progress = Progress::new(Instant::now());
+                loop {
+                    {
+                        let guard = match signal.lock.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        // Re-checked under the mutex; see the same pattern in
+                        // `wal_flush`. Without it a `stop()` racing the park is
+                        // lost and the caller blocks for a full poll interval.
+                        let (guard, _) = signal
+                            .wake
+                            .wait_timeout_while(guard, interval, |_| {
+                                !signal.stopped.load(Ordering::Relaxed)
+                            })
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        drop(guard);
+                    }
+                    if signal.stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Some(inner) = db.upgrade() else {
+                        break;
                     };
-                    // Re-checked under the mutex; see the same pattern in
-                    // `wal_flush`. Without it a `stop()` racing the park is
-                    // lost and the caller blocks for a full poll interval.
-                    let (guard, _) = signal
-                        .wake
-                        .wait_timeout_while(guard, interval, |_| {
-                            !signal.stopped.load(Ordering::Relaxed)
-                        })
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    drop(guard);
+                    check(
+                        &inner,
+                        &shutdown,
+                        backup_dir.as_deref(),
+                        started,
+                        &mut progress,
+                    );
                 }
-                if signal.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Some(inner) = db.upgrade() else {
-                    break;
-                };
-                check(&inner, &shutdown, backup_dir.as_deref(), started);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?;
         Ok(Self {
@@ -163,7 +177,12 @@ fn check(
     shutdown: &ShutdownSignal,
     backup_dir: Option<&std::path::Path>,
     started: Instant,
+    progress: &mut Progress,
 ) {
+    let now = Instant::now();
+    // Computed once per poll: `Progress` advances its own clock when it reads,
+    // so calling the predicate twice would move the baseline mid-check.
+    let backpressure = engine_is_applying_backpressure(inner, progress, now);
     // A write that cannot make progress does not fail — it blocks. On a full
     // volume RocksDB stalls the writer indefinitely rather than returning an
     // error, so the counter above stays at zero for as long as the write never
@@ -180,18 +199,21 @@ fn check(
         // drains as compaction catches up, and killing the process for it would
         // turn an ingest burst into an outage. `is-write-stopped` says which
         // kind this is; only an unexplained one is a hang.
-        let deliberate = engine_is_applying_backpressure(inner);
-        if deliberate {
+        // Past the ceiling nothing the engine reports buys any more time. A
+        // stall this long is an outage whatever its cause, and the deployment's
+        // recovery path cannot begin while the process still answers probes.
+        let past_ceiling = waiting > *options::WRITE_STALL_TIMEOUT * STALL_ESCALATION_CEILING;
+        if backpressure && !past_ceiling {
             tracing::warn!(
                 "a RocksDB write has been in flight for {waiting:?}, but the engine reports \
                  deliberate write stalling — treating this as backpressure rather than a hang"
             );
         } else {
             shutdown.signal(anyhow::anyhow!(
-                "a RocksDB write has been in flight for {waiting:?} with no write stall reported, \
-                 past the stall timeout. The engine blocks rather than failing when it cannot \
-                 make progress — a full volume looks exactly like this — so stopping beats \
-                 parking every writer forever"
+                "a RocksDB write has been in flight for {waiting:?} with no background work \
+                 completing, past the stall timeout. The engine blocks rather than failing when \
+                 it cannot make progress — a full volume or a hung mount looks exactly like this \
+                 — so stopping beats parking every writer forever"
             ));
             return;
         }
@@ -202,7 +224,7 @@ fn check(
     // watch — the same argument `log_backup_age` makes, applied here.
     let errors = background_errors(inner).unwrap_or(0);
     metrics::log_background_errors(errors);
-    metrics::log_write_stopped(engine_is_applying_backpressure(inner));
+    metrics::log_write_stopped(backpressure);
     if errors > 0 {
         // Read-only is not a state to keep serving from: the deployment's
         // recovery path is a restart onto the same volume, or a restore, and
@@ -295,10 +317,21 @@ fn check(
 /// the write controller. So the DB-wide memory stall — the first case the
 /// escalation is meant to exclude — reads as zero there.
 ///
-/// Running flushes and compactions are the missing signal: if either is in
-/// progress the engine is working through a backlog, which is what a memory
-/// stall is waiting for. A genuinely stuck volume has neither.
-fn engine_is_applying_backpressure(inner: &Inner) -> bool {
+/// Running flushes and compactions are the missing signal — but only while they
+/// are *finishing*. `num-running-*` reports that a job is **open**, which on a
+/// wedged volume is permanently true: `BackgroundCallCompaction` increments the
+/// counter before the job runs and decrements it only once its last file write
+/// and fsync return, so a compaction blocked on a hung device pins the counter
+/// above zero forever. Presence alone would therefore classify an indefinite
+/// I/O hang as deliberate throttling and disable the escalation in exactly the
+/// failure mode it exists for.
+///
+/// `rocksdb.current-super-version-number` advances when a flush or compaction
+/// *completes* and installs a new superversion, so it separates "working
+/// through a backlog" from "stuck holding a job open". A memory stall keeps
+/// flushes completing and so keeps reading as backpressure, which is the case
+/// this predicate was widened for in the first place.
+fn engine_is_applying_backpressure(inner: &Inner, progress: &mut Progress, now: Instant) -> bool {
     let property = |name: &str| {
         inner
             .db
@@ -307,10 +340,69 @@ fn engine_is_applying_backpressure(inner: &Inner) -> bool {
             .flatten()
             .unwrap_or(0)
     };
-    property("rocksdb.is-write-stopped") > 0
-        || property("rocksdb.actual-delayed-write-rate") > 0
-        || property("rocksdb.num-running-flushes") > 0
-        || property("rocksdb.num-running-compactions") > 0
+    // Explicit throttling by the write controller. This drains by construction,
+    // and needs no corroboration.
+    if property("rocksdb.is-write-stopped") > 0 || property("rocksdb.actual-delayed-write-rate") > 0
+    {
+        return true;
+    }
+    let running = property("rocksdb.num-running-flushes") > 0
+        || property("rocksdb.num-running-compactions") > 0;
+    running && progress.completing_work(inner, now)
+}
+
+/// Tracks whether RocksDB's background machinery is still completing work.
+///
+/// Held across polls by the health thread, so "has anything finished lately" is
+/// a measurement rather than an instantaneous reading.
+pub(crate) struct Progress {
+    last_super_version: Option<u64>,
+    last_advance: Instant,
+}
+
+impl Progress {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            last_super_version: None,
+            last_advance: now,
+        }
+    }
+
+    /// Whether a flush or compaction has completed inside the stall budget.
+    ///
+    /// The window is the same budget the stall itself is measured against: a
+    /// single legitimate compaction can easily outlast one poll interval, so
+    /// requiring movement poll-to-poll would kill healthy backends under heavy
+    /// merge load. Requiring movement within the stall timeout does not — it
+    /// escalates only when *both* clocks have stopped, the writer's and the
+    /// engine's.
+    pub(crate) fn completing_work(&mut self, inner: &Inner, now: Instant) -> bool {
+        // Per column family, and this backend's writes all land in named ones.
+        // `property_int_value` — no `_cf` — reads the *default* family, whose
+        // superversion never moves here, so it would report "nothing is
+        // completing" on a perfectly healthy engine. This is the same per-CF
+        // trap `background_errors` documents, inverted: that property is only
+        // ever bumped on `default`, this one is only ever bumped off it.
+        let current = crate::keys::ALL_COLUMN_FAMILIES
+            .iter()
+            .filter_map(|name| {
+                let handle = inner.db.cf_handle(name)?;
+                inner
+                    .db
+                    .property_int_value_cf(
+                        &handle,
+                        rocksdb::properties::CURRENT_SUPER_VERSION_NUMBER,
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .reduce(|a, b| a.saturating_add(b));
+        if current.is_some() && current != self.last_super_version {
+            self.last_super_version = current;
+            self.last_advance = now;
+        }
+        now.saturating_duration_since(self.last_advance) < *options::WRITE_STALL_TIMEOUT
+    }
 }
 
 fn background_errors(inner: &Inner) -> Option<u64> {
@@ -415,5 +507,67 @@ impl Drop for WriteGuard<'_> {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use std::time::{
+        Duration,
+        Instant,
+    };
+
+    use super::Progress;
+    use crate::{
+        options,
+        RocksDbPersistence,
+    };
+
+    /// The regression this exists for: classifying a stall as "deliberate"
+    /// because a background job is *open* rather than *finishing*.
+    ///
+    /// `num-running-compactions` is incremented before a compaction runs and
+    /// decremented only after its final fsync returns, so a job blocked on a
+    /// hung volume pins it above zero indefinitely. Keying off presence alone
+    /// therefore reported backpressure forever and disabled the stall
+    /// escalation in precisely the failure mode it was written for. Progress
+    /// has to be measured by completion, and completion has to time out.
+    #[test]
+    fn progress_goes_stale_when_nothing_completes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        let inner = &persistence.inner;
+
+        let start = Instant::now();
+        let mut progress = Progress::new(start);
+
+        // First observation: fresh clock, inside the window.
+        assert!(progress.completing_work(inner, start));
+
+        // Nothing has completed since. Once the stall budget has elapsed with
+        // the superversion unmoved, this must read false — that is what lets
+        // `check` escalate a hang instead of excusing it.
+        let stale = start + *options::WRITE_STALL_TIMEOUT + Duration::from_secs(1);
+        assert!(
+            !progress.completing_work(inner, stale),
+            "an engine that has completed no background work for longer than the stall timeout \
+             must not read as backpressure"
+        );
+
+        // A completed flush installs a new superversion, which restarts the
+        // clock: a busy engine keeps reading as backpressure and is not killed.
+        // The write matters — flushing an empty memtable is a no-op and
+        // installs nothing.
+        let globals = persistence.inner.cf(crate::keys::CF_GLOBALS)?;
+        persistence
+            .inner
+            .db
+            .put_cf(&globals, b"progress-test", b"1")?;
+        persistence.inner.db.flush_cf(&globals)?;
+        assert!(
+            progress.completing_work(inner, stale),
+            "a superversion advance must clear the stale reading"
+        );
+        Ok(())
     }
 }

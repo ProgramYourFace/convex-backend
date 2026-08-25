@@ -118,6 +118,8 @@ mod reader;
 mod wal_flush;
 
 #[cfg(test)]
+mod adversarial;
+#[cfg(test)]
 mod tests;
 
 use keys::{
@@ -680,6 +682,32 @@ impl Inner {
                 .chain(write.indexes.iter().map(|(k, _)| (&idx, &k[..])))
                 .collect();
             let n_documents = write.documents.len();
+            // `multi_get_cf` reads committed state, so it cannot see the batch's
+            // own rows: two entries naming the same key would both probe clean
+            // and the later would silently shadow the earlier. Postgres's
+            // `insert_document` is a plain INSERT with no ON CONFLICT clause and
+            // so raises a primary-key violation for that input. The keys are
+            // already materialised, so catching it here is a set insert per key.
+            let mut seen = std::collections::BTreeSet::new();
+            for (cf_is_dlog, key) in write
+                .documents
+                .iter()
+                .map(|(k, ..)| (true, &k[..]))
+                .chain(write.indexes.iter().map(|(k, _)| (false, &k[..])))
+            {
+                if !seen.insert((cf_is_dlog, key)) {
+                    if cf_is_dlog {
+                        let (ts, id) = keys::parse_dlog_key(key)?;
+                        anyhow::bail!("document {id} appears twice at timestamp {ts} in one write");
+                    }
+                    let (index_id, dup_key, ts) = keys::parse_idx_key(key)?;
+                    anyhow::bail!(
+                        "index entry for {index_id:?} key {:?} appears twice at timestamp {ts} in \
+                         one write",
+                        dup_key.0,
+                    );
+                }
+            }
             for (i, result) in self.db.multi_get_cf(probes).into_iter().enumerate() {
                 if result?.is_some() {
                     if i < n_documents {

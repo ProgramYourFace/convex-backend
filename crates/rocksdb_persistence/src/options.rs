@@ -116,10 +116,6 @@ pub static CHECK_CONFLICTS: LazyLock<bool> =
 pub static BLOCK_CACHE_PERCENT: LazyLock<u64> =
     LazyLock::new(|| env_config::<u64>("ROCKSDB_BLOCK_CACHE_PERCENT", 25).clamp(1, 90));
 
-/// Floor for the derived cache size. Below this RocksDB thrashes on its own
-/// index and filter blocks, and a cache that small is worse than useless.
-const MIN_DERIVED_CACHE_BYTES: usize = 64 << 20;
-
 /// Ceiling for the derived cache size. A very large host does not mean a very
 /// large cache is wanted by default; past this, set it explicitly.
 const MAX_DERIVED_CACHE_BYTES: usize = 4 << 30;
@@ -153,15 +149,15 @@ pub static BLOCK_CACHE_BYTES: LazyLock<usize> = LazyLock::new(|| {
     match crate::memory::container_limit_bytes() {
         Some(limit) => {
             let derived = ((limit / 100) * *BLOCK_CACHE_PERCENT) as usize;
-            // The floor may only raise the cache toward the configured share,
-            // never past it. Capping the floor by the *limit* is not enough:
-            // a 128 MiB container derives 32 MiB, and a 64 MiB floor would
-            // still take half its memory — the very outcome this is meant to
-            // prevent. Capping the floor by the derived value means the floor
-            // applies where it helps (a large host whose 25 % is tiny) and
-            // never overrides the percentage on a small one.
-            let floor = MIN_DERIVED_CACHE_BYTES.min(derived);
-            let clamped = derived.clamp(floor, MAX_DERIVED_CACHE_BYTES);
+            // Only the ceiling binds. An earlier revision also carried a
+            // 64 MiB floor capped by the derived value, which is a no-op by
+            // construction — `min(FLOOR, derived) <= derived` always, so the
+            // lower bound of the clamp could never take effect — and the
+            // comment claiming it helped "a large host whose 25 % is tiny"
+            // described a case that cannot exist. A small container is meant
+            // to get a small cache; that is the point of deriving from the
+            // limit, and raising it back up would defeat it.
+            let clamped = derived.min(MAX_DERIVED_CACHE_BYTES);
             tracing::info!(
                 "rocksdb block cache: {} MiB ({}% of a {} MiB memory limit)",
                 clamped >> 20,
