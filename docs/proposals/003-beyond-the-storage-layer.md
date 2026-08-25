@@ -433,6 +433,31 @@ is **2.93× the write throughput** (536 → 1572 events/s), **2.87× lower commi
 (114.71 → 40.02 ms), **2.93× lower p99** (165.01 → 56.26 ms) and **2.9× less disk**
 (38.9 → 13.3 MB for the same data).
 
+### The engine on its own, without §1
+
+§1 is a change to Convex code and §2 is an environment variable, so they are separable
+and a deployment may reasonably want only the second. Measured with **nothing pinned in
+memory** — the storage engine and the knob, and no other change to the backend — against
+the same Postgres server, two runs each:
+
+```
+                            events/s  commits/s   p50 ms   p99 ms   reads/s   disk MB
+postgres  stock                514/467    8.0/7.3  121.66/120.12  168/217   2321/1276     39.1
+postgres  verify=0             495/537    7.7/8.4  130.23/119.21  178/187   8742/7660     39.1
+rocksdb   verify=0           1080/1122  16.9/17.5   57.80/56.47    84/86  10199/10122     13.3
+```
+
+Against the Postgres configuration the reference deployment runs today, that is
+**≈2.2× the write throughput, 2.1× lower commit p50, 2.3× lower p99, 5.6× the read
+throughput and 2.9× less disk** — from a storage engine swap and one environment
+variable, with no change to Convex's own behaviour.
+
+Two things worth reading out of that table. `verify=0` does nothing measurable for
+Postgres *writes* — its cost there is drowned by the round trips of §10 — but still
+multiplies reads, because a cache hit stops making a network call. And §1 is worth a
+further ~30 % on writes and another order of magnitude on reads on top of this, but it is
+genuinely optional: everything above is available without it.
+
 ### One caveat about the measurement
 
 This benchmark issues its reads through the same `PersistenceReader` the backend uses,
