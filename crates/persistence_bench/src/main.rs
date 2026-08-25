@@ -13,6 +13,14 @@
 //! numbers here as the storage-attributable difference, not as end-to-end
 //! mutation latency.
 //!
+//! # Workload
+//!
+//! Modelled on aa-app's device-location ingest path — see [`workload`] for what
+//! it does and why that shape matters. In short: two run-length-encoding
+//! neighbour reads, an insert-or-merge into `deviceLocations`, and a
+//! read-modify-write upsert of the device's `deviceLatestLocations` row. Nine
+//! physical rows and three index reads per event, against a hot per-device key.
+//!
 //! # Usage
 //!
 //! ```text
@@ -38,34 +46,32 @@ use common::{
     runtime::new_rate_limiter,
     shutdown::ShutdownSignal,
 };
-use database::{
-    Database,
-    UserFacingModel,
-};
+use database::Database;
 use governor::Quota;
-use keybroker::Identity;
 use indexing::index_cache::IndexCache;
+use keybroker::Identity;
 use model::virtual_system_mapping;
 use runtime::prod::ProdRuntime;
 use search::{
     searcher::InProcessSearcher,
     Searcher,
 };
-use value::{
-    ConvexObject,
-    ConvexValue,
-    FieldName,
-    TableName,
-    TableNamespace,
-};
+mod workload;
 
 struct Config {
     docs: usize,
     /// Documents per transaction. One transaction is one commit, so this is the
     /// unit the committer batches and the persistence layer writes.
     batch: usize,
-    /// Fields per document, which sets how much there is to serialize.
-    fields: usize,
+    /// Fraction of events that extend the previous cluster instead of
+    /// starting a new row, in percent. A parked vehicle merges; a moving one
+    /// inserts. aa-app's RLE thresholds decide this from drift radius and
+    /// speed; here it is a knob because the ratio is what changes the storage
+    /// shape.
+    merge_percent: u64,
+    /// Fleet size. `docs / devices` is events per device, which sets how many
+    /// versions pile up on each hot spine key.
+    devices: u64,
     reads: usize,
     dir: PathBuf,
     backends: Vec<String>,
@@ -76,7 +82,8 @@ impl Default for Config {
         Self {
             docs: 20_000,
             batch: 64,
-            fields: 8,
+            merge_percent: 30,
+            devices: workload::DEFAULT_DEVICES,
             reads: 2_000,
             dir: PathBuf::from("/tmp/persistence-bench"),
             backends: vec!["sqlite".to_string(), "rocksdb".to_string()],
@@ -87,6 +94,7 @@ impl Default for Config {
 struct Report {
     backend: &'static str,
     load: Duration,
+    stats: workload::EventStats,
     write_docs_per_s: f64,
     commits_per_s: f64,
     commit_p50: Duration,
@@ -124,27 +132,6 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-/// A document with `fields` string fields, so each commit has real bytes to
-/// serialize and index rather than an empty object.
-fn document(n: usize, fields: usize) -> anyhow::Result<ConvexObject> {
-    let mut map = std::collections::BTreeMap::new();
-    map.insert(
-        "seq".parse::<FieldName>()?,
-        ConvexValue::Int64(n as i64),
-    );
-    map.insert(
-        "device".parse::<FieldName>()?,
-        ConvexValue::try_from(format!("device-{}", n % 4096))?,
-    );
-    for f in 0..fields.saturating_sub(2) {
-        map.insert(
-            format!("f{f}").parse::<FieldName>()?,
-            ConvexValue::try_from(format!("value-{n}-{f}"))?,
-        );
-    }
-    Ok(ConvexObject::try_from(map)?)
-}
-
 async fn run_backend(
     runtime: ProdRuntime,
     backend: &'static str,
@@ -175,50 +162,57 @@ async fn run_backend(
     .await?;
     let load = load_start.elapsed();
 
-    let table: TableName = "events".parse()?;
+    // Tables and their user indexes, before any timing starts.
+    let mut tx = database.begin(Identity::system()).await?;
+    workload::create_schema(&mut tx).await?;
+    database
+        .commit_with_write_source(tx, "persistence_bench_schema")
+        .await?;
 
-    // --- writes -----------------------------------------------------------
+    // --- ingest -----------------------------------------------------------
     let mut commit_latencies = Vec::with_capacity(cfg.docs / cfg.batch + 1);
-    let mut ids = Vec::with_capacity(cfg.reads);
+    let mut stats = workload::EventStats::default();
     let write_start = Instant::now();
-    let mut written = 0;
-    while written < cfg.docs {
-        let this_batch = cfg.batch.min(cfg.docs - written);
+    let mut applied = 0;
+    while applied < cfg.docs {
+        let this_batch = cfg.batch.min(cfg.docs - applied);
         let started = Instant::now();
         let mut tx = database.begin(Identity::system()).await?;
         for i in 0..this_batch {
-            let id = UserFacingModel::new(&mut tx, TableNamespace::Global)
-                .insert(table.clone(), document(written + i, cfg.fields)?)
-                .await?;
-            // Keep a spread of ids so the read phase is not confined to the
-            // most recently written pages.
-            if ids.len() < cfg.reads && (written + i) % 7 == 0 {
-                ids.push(id);
-            }
+            let n = (applied + i) as u64;
+            // Devices report round-robin, so each device's rows interleave with
+            // every other device's in the log — the same way a real fleet's
+            // fixes arrive through a partitioned bus.
+            let device = n % cfg.devices;
+            let timestamp = 1_700_000_000_000.0 + (n / cfg.devices) as f64 * 1_000.0;
+            let merge = cfg.merge_percent > 0 && (n % 100) < cfg.merge_percent;
+            stats.add(workload::apply_location_event(&mut tx, device, timestamp, merge).await?);
         }
         database
-            .commit_with_write_source(tx, "persistence_bench_write")
+            .commit_with_write_source(tx, "persistence_bench_ingest")
             .await?;
         commit_latencies.push(started.elapsed().as_nanos() as u64);
-        written += this_batch;
+        applied += this_batch;
     }
     let write_elapsed = write_start.elapsed().as_secs_f64();
 
     // --- reads ------------------------------------------------------------
-    // A `get` by id through the same transaction machinery a query uses, so
-    // this covers the index cache and, on a miss, the persistence reader.
+    // The dashboard read: "where is this device right now", one indexed lookup
+    // per device through `deviceLatestLocations.by_device`. This is the hot
+    // key — every event rewrote it — so it is the version-shadowing case.
     let read_start = Instant::now();
     let mut read_count = 0;
-    for chunk in ids.chunks(64.max(1)) {
+    let mut device = 0u64;
+    while read_count < cfg.reads {
         let mut tx = database.begin(Identity::system()).await?;
-        for id in chunk {
-            if UserFacingModel::new(&mut tx, TableNamespace::Global)
-                .get_with_ts(*id, None)
+        for _ in 0..64.min(cfg.reads - read_count) {
+            if workload::latest_for_device(&mut tx, device % cfg.devices)
                 .await?
                 .is_some()
             {
                 read_count += 1;
             }
+            device += 1;
         }
         drop(tx);
     }
@@ -233,6 +227,7 @@ async fn run_backend(
     Ok(Report {
         backend,
         load,
+        stats,
         write_docs_per_s: cfg.docs as f64 / write_elapsed,
         commits_per_s: commit_latencies.len() as f64 / write_elapsed,
         commit_p50: percentile(&commit_latencies, 0.50),
@@ -260,12 +255,11 @@ fn parse_config() -> anyhow::Result<Config> {
         match flag.as_str() {
             "--docs" => cfg.docs = value.parse()?,
             "--batch" => cfg.batch = value.parse::<usize>()?.max(1),
-            "--fields" => cfg.fields = value.parse::<usize>()?.max(2),
+            "--merge-percent" => cfg.merge_percent = value.parse::<u64>()?.min(100),
+            "--devices" => cfg.devices = value.parse::<u64>()?.max(1),
             "--reads" => cfg.reads = value.parse()?,
             "--dir" => cfg.dir = PathBuf::from(value),
-            "--backends" => {
-                cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect()
-            },
+            "--backends" => cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect(),
             other => anyhow::bail!("unknown flag {other}"),
         }
         i += 1;
@@ -279,10 +273,12 @@ fn main() -> anyhow::Result<()> {
     let runtime = ProdRuntime::new(&tokio);
 
     println!(
-        "convex commit-path benchmark\ndocs={} batch={} fields={} reads={}\ndir={}\n",
+        "convex device-location ingest benchmark\nevents={} batch={} merge={}% devices={} \
+         reads={}\ndir={}\n",
         cfg.docs,
         cfg.batch,
-        cfg.fields,
+        cfg.merge_percent,
+        cfg.devices,
         cfg.reads,
         cfg.dir.display(),
     );
@@ -320,8 +316,7 @@ fn main() -> anyhow::Result<()> {
 
             eprint!("running {backend} ... ");
             let started = Instant::now();
-            let report =
-                run_backend(rt.clone(), backend, persistence, data_path, cfg_ref).await?;
+            let report = run_backend(rt.clone(), backend, persistence, data_path, cfg_ref).await?;
             eprintln!("{:.1}s", started.elapsed().as_secs_f64());
             reports.push(report);
         }
@@ -331,7 +326,7 @@ fn main() -> anyhow::Result<()> {
     let ms = |d: Duration| format!("{:.2}", d.as_secs_f64() * 1000.0);
     println!(
         "\n{:<9} {:>10} {:>11} {:>10} {:>10} {:>10} {:>9}",
-        "backend", "docs/s", "commits/s", "p50 ms", "p99 ms", "reads/s", "disk MB",
+        "backend", "events/s", "commits/s", "p50 ms", "p99 ms", "reads/s", "disk MB",
     );
     println!("{}", "-".repeat(76));
     for r in &reports {
@@ -348,7 +343,14 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
     for r in &reports {
-        println!("{:<9} database load took {}", r.backend, ms(r.load));
+        println!(
+            "{:<9} load {:>7}   {} inserts, {} merges, {} index reads",
+            r.backend,
+            ms(r.load),
+            r.stats.inserts,
+            r.stats.merges,
+            r.stats.reads,
+        );
     }
     let _ = std::fs::remove_dir_all(&cfg.dir);
     Ok(())
@@ -357,10 +359,11 @@ fn main() -> anyhow::Result<()> {
 const HELP: &str = "\
 persistence-bench — compare persistence backends through the real Convex commit path
 
-  --docs N          documents to write            (default 20000)
-  --batch N         documents per transaction     (default 64)
-  --fields N        fields per document           (default 8)
-  --reads N         documents to read back        (default 2000)
+  --docs N            location events to apply    (default 20000)
+  --batch N           events per transaction      (default 64)
+  --merge-percent N   share of events that RLE-merge instead of inserting (default 30)
+  --devices N         fleet size; docs/devices is events per device (default 512)
+  --reads N           latest-location lookups     (default 2000)
   --backends a,b    subset of sqlite,rocksdb      (default both)
   --dir PATH        scratch directory             (default /tmp/persistence-bench)
 
