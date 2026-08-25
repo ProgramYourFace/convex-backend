@@ -292,6 +292,7 @@ impl RocksDbPersistence {
         let db = Db::open_cf_descriptors_as_secondary(&shared.db, path, secondary_path, cfs)
             .with_context(|| format!("failed to open RocksDB secondary at {}", path.display()))?;
         db.try_catch_up_with_primary()?;
+        check_format_version(&db, path, false)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -349,38 +350,7 @@ impl RocksDbPersistence {
             !iter.valid()
         };
 
-        // Refuse a directory this build does not understand, rather than
-        // reading it with the wrong encodings.
-        {
-            let globals = db
-                .cf_handle(CF_GLOBALS)
-                .context("missing column family globals just after opening")?;
-            match db.get_cf(&globals, FORMAT_VERSION_KEY)? {
-                Some(raw) => {
-                    let found: u64 =
-                        String::from_utf8_lossy(&raw)
-                            .trim()
-                            .parse()
-                            .with_context(|| {
-                                format!("unreadable format version in {}", path.display())
-                            })?;
-                    anyhow::ensure!(
-                        found == FORMAT_VERSION,
-                        "{} was written in RocksDB layout version {found}, and this build \
-                         understands {FORMAT_VERSION}. Opening it would read the data with the \
-                         wrong key encodings.",
-                        path.display(),
-                    );
-                },
-                // Absent on a database this build just created, and on one
-                // written before versioning existed — which is the same layout,
-                // so stamping it is correct rather than a migration.
-                None if !newly_created || create_if_missing => {
-                    db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
-                },
-                None => {},
-            }
-        }
+        check_format_version(&db, path, create_if_missing)?;
 
         tracing::info!(
             "opened RocksDB persistence at {} ({})",
@@ -479,6 +449,40 @@ impl Drop for Inner {
             tracing::error!("failed to flush the RocksDB WAL while closing: {e}");
         }
     }
+}
+
+/// Refuses a directory whose on-disk layout this build does not understand, and
+/// stamps the version on one that has none.
+///
+/// Shared by the primary and secondary open paths: a secondary reads the same
+/// files with the same encodings, and `connect_persistence_reader` is exactly
+/// where a stale binary is most likely to be pointed at a newer volume.
+fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow::Result<()> {
+    let globals = db
+        .cf_handle(CF_GLOBALS)
+        .context("missing column family globals just after opening")?;
+    match db.get_cf(&globals, FORMAT_VERSION_KEY)? {
+        Some(raw) => {
+            let found: u64 = String::from_utf8_lossy(&raw)
+                .trim()
+                .parse()
+                .with_context(|| format!("unreadable format version in {}", path.display()))?;
+            anyhow::ensure!(
+                found == FORMAT_VERSION,
+                "{} was written in RocksDB layout version {found}, and this build understands \
+                 {FORMAT_VERSION}. Opening it would read the data with the wrong key encodings.",
+                path.display(),
+            );
+        },
+        // Absent on a database just created, and on one written before
+        // versioning existed — the same layout, so stamping it is correct
+        // rather than a migration. A secondary never writes.
+        None if stamp_if_missing => {
+            db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
+        },
+        None => {},
+    }
+    Ok(())
 }
 
 impl Inner {

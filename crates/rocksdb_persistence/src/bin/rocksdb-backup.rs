@@ -24,7 +24,7 @@ rocksdb-backup — administer backups of an embedded RocksDB Convex database
 
   backup   <backup-dir> --db <db-dir> [--keep N]   take a generation now
   list     <backup-dir>                            generations, newest last
-  verify   <backup-dir> [--id N]                   checksum a generation's files
+  verify   <backup-dir> [--id N]                   check a generation's file sizes
   rehearse <backup-dir> --scratch <dir> [--id N]   restore to scratch and read it
   restore  <backup-dir> --to <db-dir> [--id N]     restore for real
 

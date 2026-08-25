@@ -977,12 +977,7 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
             &path,
             SyncMode::Interval(Duration::from_millis(50)),
         )?;
-        // Without this the WAL would be flushed by `Inner::drop` instead, and
-        // the test would be checking the *next* test's behaviour.
-        assert!(
-            persistence.has_wal_flusher(),
-            "this test is about the flusher; drop-flush is covered separately"
-        );
+        assert!(persistence.has_wal_flusher());
         let id = doc_id(1, 1);
         persistence
             .write(
@@ -994,6 +989,24 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
         // Several intervals, so this does not turn into a timing flake on a
         // loaded machine.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Assert the *flusher* did it, not the drop. `has_wal_flusher` cannot
+        // tell those apart — `Inner::drop` flushes unconditionally in interval
+        // mode, so the end state is identical either way. A secondary instance
+        // can: it reads the primary's files but neither its memtables nor its
+        // WAL buffer, so it sees the write only once a flush has moved it.
+        let observer = RocksDbPersistence::new_secondary(&path, &dir.path().join("observer"))?;
+        let seen: Vec<_> = observer
+            .reader()
+            .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+            .try_collect()
+            .await?;
+        assert_eq!(
+            seen.len(),
+            1,
+            "a secondary sees only flushed data, so this proves the flusher ran"
+        );
+        drop(observer);
     }
 
     let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;

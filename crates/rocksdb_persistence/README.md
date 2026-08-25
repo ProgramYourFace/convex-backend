@@ -275,8 +275,10 @@ on any of:
 - **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`** *and* no write
   stall reported by the engine. RocksDB also blocks writers deliberately, as
   backpressure — `allow_stall` on the write buffer manager, the L0 slowdown triggers —
-  and that drains as compaction catches up, so `rocksdb.is-write-stopped` separates an
-  ingest burst from a volume that has stopped accepting writes;
+  and that drains as compaction catches up. Separating the two takes more than
+  `rocksdb.is-write-stopped`, which is the *write controller* and does not cover the
+  write-buffer-manager stall this backend enables — running flushes and compactions are
+  the signal that the engine is working through a backlog rather than stuck;
 - **a latched background error**, read from the `default` column family. That detail
   matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
   increments it on `default`, so polling the five families this backend defines returns a
@@ -286,8 +288,10 @@ on any of:
   In that mode a write is acknowledged before it reaches the kernel, so persistent flush
   failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
   Escalation needs consecutive *failures*, not just elapsed time, so one slow fsync on a
-  contended volume cannot take the process down — with a much longer deadline on top, so a
-  flusher that dies without ever returning an error is still caught.
+  contended volume cannot take the process down. A separate, much longer deadline —
+  `max(interval × 60, ROCKSDB_MIN_FLUSH_SILENCE_SECONDS)` — catches a flusher that died
+  without ever returning an error. The floor matters: without it, a 100 ms interval would
+  make that deadline six seconds.
 
 It also publishes `rocksdb_oldest_write_seconds` and `rocksdb_wal_flush_age_seconds`.
 

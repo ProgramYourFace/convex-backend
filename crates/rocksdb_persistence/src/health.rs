@@ -180,14 +180,7 @@ fn check(
         // drains as compaction catches up, and killing the process for it would
         // turn an ingest burst into an outage. `is-write-stopped` says which
         // kind this is; only an unexplained one is a hang.
-        let deliberate = inner
-            .db
-            .property_int_value("rocksdb.is-write-stopped")
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-            > 0;
-        metrics::log_write_stopped(deliberate);
+        let deliberate = engine_is_applying_backpressure(inner);
         if deliberate {
             tracing::warn!(
                 "a RocksDB write has been in flight for {waiting:?}, but the engine reports \
@@ -204,10 +197,13 @@ fn check(
         }
     }
 
-    if let Some(errors) = background_errors(inner)
-        && errors > 0
-    {
-        metrics::log_background_errors(errors);
+    // Published on every poll, failing or not. A series that only appears once
+    // the process is already being shut down is not something an alert can
+    // watch — the same argument `log_backup_age` makes, applied here.
+    let errors = background_errors(inner).unwrap_or(0);
+    metrics::log_background_errors(errors);
+    metrics::log_write_stopped(engine_is_applying_backpressure(inner));
+    if errors > 0 {
         // Read-only is not a state to keep serving from: the deployment's
         // recovery path is a restart onto the same volume, or a restore, and
         // neither begins while the process pretends to be healthy.
@@ -237,7 +233,16 @@ fn check(
         // that without being trippable by a slow disk.
         let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
         let failing = since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS;
-        let stopped = since > budget.saturating_mul(FLUSH_SILENCE_MULTIPLIER);
+        // With an absolute floor. At the interval the README uses as its worked
+        // example — 100 ms — the multiplied budget is six seconds, and an fsync
+        // tail that long on a throttled network volume is ordinary. The flusher
+        // is *inside* `flush_wal` while that happens, so it records neither a
+        // success nor a failure and this clock keeps climbing: without the
+        // floor, a slow disk kills a healthy backend.
+        let silence_deadline = budget
+            .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
+            .max(*options::MIN_FLUSH_SILENCE);
+        let stopped = since > silence_deadline;
         if failing || stopped {
             shutdown.signal(anyhow::anyhow!(
                 "the RocksDB write-ahead log has not been flushed for {since:?} ({} failures \
@@ -281,6 +286,33 @@ fn check(
 ///
 /// `property_int_value` — no `_cf` — is the default family, so it is the only
 /// call here that can ever be non-zero.
+/// Whether the engine is deliberately holding writers back rather than hung.
+///
+/// `rocksdb.is-write-stopped` is `write_controller().IsStopped()`, and it does
+/// not cover the stall this crate explicitly enables: the write buffer manager
+/// is built with `allow_stall`, and `DBImpl::WriteBufferManagerStallWrites`
+/// parks writers through `WriteThread::BeginWriteStall` without ever touching
+/// the write controller. So the DB-wide memory stall — the first case the
+/// escalation is meant to exclude — reads as zero there.
+///
+/// Running flushes and compactions are the missing signal: if either is in
+/// progress the engine is working through a backlog, which is what a memory
+/// stall is waiting for. A genuinely stuck volume has neither.
+fn engine_is_applying_backpressure(inner: &Inner) -> bool {
+    let property = |name: &str| {
+        inner
+            .db
+            .property_int_value(name)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    property("rocksdb.is-write-stopped") > 0
+        || property("rocksdb.actual-delayed-write-rate") > 0
+        || property("rocksdb.num-running-flushes") > 0
+        || property("rocksdb.num-running-compactions") > 0
+}
+
 fn background_errors(inner: &Inner) -> Option<u64> {
     match inner
         .db
