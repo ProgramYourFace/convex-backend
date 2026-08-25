@@ -409,25 +409,24 @@ implementation inline.
 
 ---
 
-### Layer 3 — Ephemeral tables, as a persistence-level filter
+### Layer 3 — ~~Ephemeral tables~~ · **WITHDRAWN**
 
-M9, achievable without touching the committer: `WalPersistence::write` drops
-document and index rows whose tablet is in a declared ephemeral set, instead of
-forwarding them.
+Proposed M9 as a persistence-level filter: rows whose tablet is in a declared ephemeral
+set are dropped rather than written, so they still drive subscriptions but never reach
+disk.
 
-Such rows still flow through the committer, the write log and the subscription
-machinery — so live queries still fire — but never reach disk, never accrue index
-rows, and never need retention. For telemetry whose real system of record is
-ClickHouse via the egress path, this removes the write entirely rather than making
-it faster.
+**Withdrawn.** It required a developer-visible change — a table you cannot read back is
+not a Convex table, and declaring one would have meant new schema surface. The constraint
+on this work is that the Convex API stays byte-identical, and this layer broke it. There
+is no salvageable version: the whole point was the semantic change.
 
-This is a genuine semantic change: a table you cannot read back. Scope it to
-explicitly declared tables and make reads return empty, exactly as SpacetimeDB
-does for event tables.
+The throughput it would have bought is pursued instead by making the write cheaper rather
+than skipping it — see [002-storage-engine.md](./002-storage-engine.md).
 
----
+### Layer 4 — Replace Postgres with an embedded LSM
 
-### Layer 4 — Optional: replace Postgres with an embedded LSM
+**Now its own proposal:** [002-storage-engine.md](./002-storage-engine.md), with a
+measured comparison and a runnable harness. The sketch below is superseded by it.
 
 Only if Layer 1's measurements show the materializer is the ceiling.
 
@@ -472,7 +471,7 @@ Postgres CPU pinned with persistence-write time already small → Layer 2b, then
 | Layer 1 body | `crates/wal_persistence/` — 100% new | none |
 | Layer 2a | `isolate/src/environment/udf/async_syscall.rs`, JS client | **real** — isolate this commit |
 | Layer 2b, 2c | aa-app only | none |
-| Layer 3 | inside `crates/wal_persistence/` | none |
+| Layer 3 | *withdrawn* | — |
 | Layer 4 | `crates/lsm_persistence/` — new, + 1 match arm | negligible |
 
 Untouched by every layer: `committer.rs`, `database.rs`, `transaction.rs`,
@@ -496,8 +495,10 @@ rest of the bundle: keep durable I/O off the commit path (M4), defer serializati
 
 Layer 1 ports M4–M7 behind a trait Convex already maintains three implementations
 of. Layer 0 removes a retry policy sized for a different workload. Layer 2 stops
-paying for work that need not happen. Layer 3 ports M9 for the traffic that is
-really a stream.
+paying for work that need not happen. Layer 3 is withdrawn: it bought throughput
+with developer-visible semantics, which is not a trade this project is making.
+Layer 4 became [002-storage-engine.md](./002-storage-engine.md), where the write
+is made cheaper instead of being skipped.
 
 The measurement in §4 should happen first, because §2.7 shows this deployment has
 already eliminated the fsync — which means the layer that *sounds* most like
