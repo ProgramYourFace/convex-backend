@@ -22,7 +22,7 @@ items below are correctness issues rather than tuning:
 | §3 | Memory is one budget and the default split was wrong | **bug** | fixed here |
 | §4 | Crash recovery stops being unbounded | win | no action |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
-| §6 | No backup or point-in-time restore | **gap** | not implemented — read this before adopting |
+| §6 | No backup or point-in-time restore | **gap** | not implemented — the RocksDB APIs exist and are already in-crate; read this before adopting |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |
 
 ---
@@ -206,11 +206,23 @@ all of them well understood and all of them things an operator already knows how
 automate. The RocksDB backend as it stands gives you **none of that**. Its durability
 story is the PVC and nothing else. Lose the volume and the cell's data is gone.
 
-RocksDB's own primitive for this is `Checkpoint::create_checkpoint`, which hard-links
-the SST files into a new directory on the same filesystem — near-instant, near-zero extra
-space at creation, and consistent. That directory can then be copied off-node at leisure.
-It is not exposed by this crate, and wiring it up means deciding where checkpoints go,
-how they are retained, and how a restore is driven. None of that is written.
+RocksDB itself has two mechanisms for this, and **both are already exposed by the
+`rocksdb` 0.22 crate this backend depends on** — the gap is wiring, not capability:
+
+| API | What it does | Shape |
+|---|---|---|
+| `Checkpoint::create_checkpoint` | Consistent snapshot of the whole database, hard-linking SST files into a new directory | Same filesystem only. Near-instant, near-zero extra space at creation. Ideal for "snapshot then copy off-node". |
+| `BackupEngine` | `create_new_backup_flush`, `restore_from_latest_backup`, `restore_from_backup`, `purge_old_backups`, `verify_backup`, `get_backup_info` | **Incremental** — unchanged SST files are shared between backups, so backup *n+1* only writes what changed. Opens against a RocksDB `Env`, so the destination can be another filesystem. Carries its own restore path and checksum verification. |
+
+`BackupEngine` is the closer match to what an operator expects: numbered backups, a
+retention policy, verification, and a restore that does not require the database to be
+running. `create_new_backup_flush(db, true)` flushes memtables first, so a backup does
+not depend on the WAL to be complete.
+
+What is still undecided is not the mechanism but the policy: where backups go (a sidecar
+that syncs to object storage, or a `BackupEngine` opened against a mounted volume), how
+often, how many are kept, and how a restore is driven in a `StatefulSet` whose pod owns
+the directory. None of that is written.
 
 Until it is, the mitigations available are the ones that live above the trait, and both
 already exist in this deployment:
@@ -223,8 +235,63 @@ already exist in this deployment:
   already tails `document_deltas` into ClickHouse. That is a warehouse copy, not a
   restorable backup, but it means the row history exists somewhere else.
 
-Neither is a substitute for a snapshot you can restore. Treat "implement checkpoint
-export" as a prerequisite for anything holding data that the bus cannot replay.
+Neither is a substitute for a snapshot you can restore. Treat "implement backup export"
+as a prerequisite for anything holding data that the bus cannot replay.
+
+### What SurrealDB does, and why it is not the model to copy
+
+SurrealDB is the closest comparable — a Rust database that ships RocksDB as its default
+single-node engine — so it is worth knowing that **it uses neither of the above.** A
+`grep` for `Checkpoint`, `create_checkpoint`, `BackupEngine` and `backup_engine` across
+its tree returns nothing; its RocksDB layer (`core/src/kvs/rocksdb/`) touches durability
+options and compaction and stops there.
+
+Its answer is instead:
+
+- **Logical export.** `surreal export` writes SurrealQL — schema and data as statements —
+  and `surreal import` replays it. Portable and engine-agnostic, which is the stated
+  reason for the choice.
+- **Volume snapshots**, described in their own docs as something to combine with
+  exports "where available", with the caveat that they "depend on filesystem layout and
+  binary compatibility".
+- **No point-in-time recovery.** Their documentation says so directly: "point-in-time
+  recovery is not implicit in a single export: each file reflects one moment", and
+  points users at more frequent exports, replicas, or a journaled log upstream.
+
+The scaling problem with that choice is documented in their own tracker: issue #7189
+reports **~200 K records across 69 tables taking 7+ hours to restore** from an 850 MB
+`.surql` file, because restore is sequential SQL parsing and per-statement execution, so
+it grows linearly with database size. The top-ranked proposal in that issue is
+storage-engine-level backup and restore. It is open, with no maintainer response.
+
+Convex is already in the same position as SurrealDB's export path — snapshot
+export/import exists above the trait and would replay through the same machinery — so
+adopting the logical-export answer would inherit the same restore-time problem. The
+engine-level path is strictly better here and is a few hundred lines, not a research
+project.
+
+### Their durability model, which is worth borrowing from
+
+SurrealDB's RocksDB layer exposes three sync modes on the connection string, defaulting
+to the safe one:
+
+| Mode | Mechanism | Loss window |
+|---|---|---|
+| `sync=every` *(default)* | A `CommitCoordinator` batches waiters and performs a single `flush_wal(true)` for the group | none |
+| `sync=<interval>` | `manual_wal_flush(true)` plus a background thread flushing on a timer | bounded by the interval |
+| `sync=never` | OS buffers only | unbounded |
+
+This backend has the two ends — `ROCKSDB_SYNC_WRITES=true` and `false` — and not the
+middle. The safe end is equivalent work by a different route: rather than an explicit
+coordinator, `WriteOptions::set_sync(true)` lets RocksDB's own write groups coalesce
+concurrent writers and fsync the shared WAL once, which suits a committer that already
+batches. SurrealDB needs the explicit coordinator because each of its optimistic
+transactions commits on its own thread.
+
+The middle mode is the interesting gap. `ROCKSDB_SYNC_WRITES=false` today is unbounded
+loss; a timed flush would make the window a number an operator can reason about. It does
+**not** rescue §2 — a bounded window is still a window, and the relay's checkpoint can
+still be ahead of it — but it would be a better-shaped knob than the one that exists.
 
 ---
 

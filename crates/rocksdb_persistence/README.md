@@ -182,12 +182,17 @@ validator has approved.
 ## Not implemented
 
 **Backup and point-in-time restore.** The durability story is the volume and
-nothing else. RocksDB's `Checkpoint::create_checkpoint` hard-links a consistent
-snapshot into a new directory on the same filesystem, near-instantly and at
-near-zero extra space, which is the right primitive to build on — but it is not
-exposed here, and neither is a restore path. A deployment adopting this backend
-needs an answer for data its upstream log cannot replay. See
-[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §6.
+nothing else, and a deployment adopting this backend needs an answer for data its
+upstream log cannot replay.
+
+The mechanisms exist and are already reachable from the `rocksdb` crate this
+depends on — `Checkpoint::create_checkpoint` for a hard-linked consistent
+snapshot on the same filesystem, and `BackupEngine` for incremental,
+cross-filesystem backups with their own restore, retention and verification. What
+is missing is the policy around them: where backups go, how often, how many are
+kept, and how a restore is driven against a directory a running pod owns. See
+[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §6,
+which also covers why SurrealDB's logical-export answer is not the one to copy.
 
 
 **Retention via compaction filter.** The largest remaining win, and deliberately
