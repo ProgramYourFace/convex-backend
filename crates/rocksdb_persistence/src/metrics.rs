@@ -1,7 +1,9 @@
 use metrics::{
     log_counter,
     log_distribution,
+    log_gauge,
     register_convex_counter,
+    register_convex_gauge,
     register_convex_histogram,
     StatusTimer,
     Timer,
@@ -50,15 +52,36 @@ pub fn log_backup_failure() {
     log_counter(&ROCKSDB_BACKUP_FAILURES_TOTAL, 1);
 }
 
-register_convex_histogram!(
+register_convex_gauge!(
     ROCKSDB_BACKUP_AGE_SECONDS,
-    "Age of the newest backup generation, published on every worker tick"
+    "Age of the newest backup generation"
 );
-/// The metric to alert on. A worker that has stopped producing backups looks
-/// exactly like one that is working, unless something publishes how old the
-/// newest one is — failures are events you can miss, age is a level you cannot.
+/// The metric to alert on, and a gauge rather than a histogram: a level that
+/// keeps rising says "no backup has landed", where a distribution that stops
+/// receiving samples says nothing at all. Published by the health monitor on
+/// its own short timer rather than by the backup worker, so it keeps moving
+/// even if the backup worker is the thing that died.
 pub fn log_backup_age(seconds: f64) {
-    log_distribution(&ROCKSDB_BACKUP_AGE_SECONDS, seconds);
+    log_gauge(&ROCKSDB_BACKUP_AGE_SECONDS, seconds);
+}
+
+register_convex_gauge!(
+    ROCKSDB_WAL_FLUSH_AGE_SECONDS,
+    "Time since the write-ahead log was last successfully flushed, in interval sync mode"
+);
+/// In interval mode a write is acknowledged before it reaches the kernel, so
+/// this is the durability measurement: how much acknowledged data could be
+/// lost right now.
+pub fn log_wal_flush_age(seconds: f64) {
+    log_gauge(&ROCKSDB_WAL_FLUSH_AGE_SECONDS, seconds);
+}
+
+register_convex_counter!(
+    ROCKSDB_BACKGROUND_ERRORS_TOTAL,
+    "Latched RocksDB background errors, which stop the database accepting writes"
+);
+pub fn log_background_errors(count: u64) {
+    log_counter(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count);
 }
 
 register_convex_histogram!(

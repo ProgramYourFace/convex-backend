@@ -59,6 +59,7 @@ use crate::{
     metrics,
     options,
     Inner,
+    OpenOptions,
     RocksDbPersistence,
 };
 
@@ -70,6 +71,75 @@ pub struct BackupInfo {
     pub timestamp: i64,
     pub size_bytes: u64,
     pub num_files: u32,
+}
+
+/// An advisory lock over a backup directory, held for as long as an engine is
+/// open against it.
+///
+/// RocksDB's own header is explicit that concurrent `BackupEngine`s on one
+/// `backup_dir` are unspecified — `Write × Open` and `Write × Read` are listed
+/// as *"unspec = Behavior is unspecified, including possibly trashing the
+/// backup_dir"* — and it ships no lock of its own. Every entry point here opens
+/// a read-write engine, and `purge_old_backups` runs on every worker tick, so
+/// "the operator lists generations while the worker prunes" is a real sequence
+/// that this makes an error instead of a corruption.
+struct DirLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl DirLock {
+    fn acquire(dir: &Path) -> anyhow::Result<Self> {
+        let path = dir.join("convex-backup.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        // flock is advisory and released by the kernel when the fd closes, so
+        // a crashed holder does not strand the directory the way a lock file
+        // whose presence is the lock would.
+        let rc = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        anyhow::ensure!(
+            rc == 0,
+            "another process is using the backup directory {}. Backups, restores and listings \
+             must not overlap: RocksDB does not define what concurrent backup engines do to a \
+             directory, up to and including destroying it.",
+            dir.display(),
+        );
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = std::os::fd::AsRawFd::as_raw_fd(&self.file);
+        // Closing the file releases the flock; the path is left in place so the
+        // next acquirer reuses it rather than racing on create.
+        let _ = &self.path;
+    }
+}
+
+/// A backup engine and the directory lock it is only valid under.
+struct LockedEngine {
+    engine: BackupEngine,
+    _lock: DirLock,
+}
+
+fn open_locked_engine(dir: &Path) -> anyhow::Result<LockedEngine> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create backup directory {}", dir.display()))?;
+    let lock = DirLock::acquire(dir)?;
+    Ok(LockedEngine {
+        engine: open_engine(dir)?,
+        _lock: lock,
+    })
 }
 
 fn open_engine(dir: &Path) -> anyhow::Result<BackupEngine> {
@@ -100,7 +170,7 @@ fn info_of(engine: &BackupEngine) -> Vec<BackupInfo> {
 /// Lists the generations in a backup directory. Safe to call while the database
 /// that produced them is running.
 pub fn list(dir: &Path) -> anyhow::Result<Vec<BackupInfo>> {
-    Ok(info_of(&open_engine(dir)?))
+    Ok(info_of(&open_locked_engine(dir)?.engine))
 }
 
 /// Checks that a generation's files are present and the size RocksDB expects.
@@ -108,7 +178,8 @@ pub fn list(dir: &Path) -> anyhow::Result<Vec<BackupInfo>> {
 /// This is a checksum, not a rehearsal: it says the files are intact, not that
 /// a database restored from them opens. Use [`rehearse`] for that.
 pub fn verify(dir: &Path, backup_id: u32) -> anyhow::Result<()> {
-    open_engine(dir)?
+    open_locked_engine(dir)?
+        .engine
         .verify_backup(backup_id)
         .with_context(|| format!("backup {backup_id} failed verification"))
 }
@@ -136,7 +207,8 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
             db_dir.display(),
         );
     }
-    let mut engine = open_engine(dir)?;
+    let mut locked = open_locked_engine(dir)?;
+    let engine = &mut locked.engine;
     let opts = RestoreOptions::default();
     match backup_id {
         Some(id) => engine
@@ -154,7 +226,11 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
 /// this checks the thing an operator actually needs to know — that a database
 /// restored from this backup opens and reads. It costs a full copy of the data,
 /// so it belongs on a schedule of its own rather than after every backup.
-pub fn rehearse(dir: &Path, scratch: &Path, backup_id: Option<u32>) -> anyhow::Result<BackupInfo> {
+pub fn rehearse(
+    dir: &Path,
+    scratch: &Path,
+    backup_id: Option<u32>,
+) -> anyhow::Result<(BackupInfo, crate::ReadCheck)> {
     let generations = list(dir)?;
     let target = match backup_id {
         Some(id) => generations
@@ -177,18 +253,24 @@ pub fn rehearse(dir: &Path, scratch: &Path, backup_id: Option<u32>) -> anyhow::R
 
     // Opening exercises the manifest and every column family descriptor; the
     // scan then forces real iterators over real data rather than a bare open.
-    let persistence =
-        RocksDbPersistence::new(scratch).context("the restored database did not open")?;
-    let rows = persistence
+    // No background work: this process may be running in the backend's own
+    // environment, where `ROCKSDB_BACKUP_DIR` is set. A worker attached to a
+    // scratch database would write generations *of the scratch database* into
+    // the production backup chain and then prune the real ones away.
+    let persistence = RocksDbPersistence::open_with(
+        scratch,
+        OpenOptions {
+            background: false,
+            ..OpenOptions::default()
+        },
+    )
+    .context("the restored database did not open")?;
+    let read = persistence
         .inner
-        .scan_all_column_families()
+        .verify_readable()
         .context("the restored database opened but could not be read")?;
-    tracing::info!(
-        "rehearsed backup {}: restored and read {rows} rows across every column family",
-        target.backup_id,
-    );
     drop(persistence);
-    Ok(target)
+    Ok((target, read))
 }
 
 impl RocksDbPersistence {
@@ -207,21 +289,35 @@ impl RocksDbPersistence {
 fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<BackupInfo> {
     anyhow::ensure!(!inner.secondary, "a secondary instance cannot take backups");
     let timer = metrics::backup_timer();
-    let mut engine = open_engine(dir)?;
+    let mut locked = open_locked_engine(dir)?;
+    let engine = &mut locked.engine;
     if let Err(e) = engine.create_new_backup_flush(&inner.db, true) {
         timer.finish_developer_error();
         return Err(anyhow::Error::from(e).context("failed to create a backup"));
     }
+    let latest = *info_of(engine)
+        .last()
+        .context("backup reported success but recorded no generation")?;
+
+    // Verify before pruning, never after. `create_new_backup_flush` returning
+    // `Ok` says RocksDB wrote the files; it does not say the destination kept
+    // them. Pruning on the strength of an unverified generation is how the last
+    // known-good ones age out behind a silently bad new one.
+    if let Err(e) = engine.verify_backup(latest.backup_id) {
+        timer.finish_developer_error();
+        return Err(anyhow::Error::from(e).context(format!(
+            "backup {} was written but failed verification; keeping older generations",
+            latest.backup_id,
+        )));
+    }
+
     if keep > 0
         && let Err(e) = engine.purge_old_backups(keep)
     {
-        // The backup itself succeeded; failing to prune is not a reason to
-        // report it as lost.
+        // The backup is written and verified; failing to prune is not a reason
+        // to report it as lost.
         tracing::warn!("failed to purge old backups in {}: {e}", dir.display());
     }
-    let latest = *info_of(&engine)
-        .last()
-        .context("backup reported success but recorded no generation")?;
     timer.finish();
     metrics::log_backup(latest.size_bytes, latest.num_files);
     Ok(latest)
@@ -322,15 +418,6 @@ impl BackupWorker {
                             metrics::log_backup_failure();
                         },
                     }
-                    // Publish the age of the newest generation on every tick,
-                    // succeeded or not, so a worker that has stopped producing
-                    // backups is visible as a rising number rather than as an
-                    // absence of events.
-                    if let Ok(generations) = list(&config.dir)
-                        && let Some(newest) = generations.last()
-                    {
-                        metrics::log_backup_age(age_seconds(newest.timestamp));
-                    }
                 }
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB backup worker: {e}"))?;
@@ -349,7 +436,17 @@ impl BackupWorker {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(handle) = handle {
-            let _ = handle.join();
+            // The worker holds a strong `Arc<Inner>` for the duration of a
+            // tick. If the owner released the last other reference in that
+            // window, `Inner` is dropped *on this thread*, which reaches here —
+            // and joining yourself deadlocks (the platform returns EDEADLK and
+            // `join` panics). Signalling is enough in that case: the loop is
+            // already unwinding.
+            if handle.thread().id() == std::thread::current().id() {
+                std::mem::forget(handle);
+            } else {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -360,10 +457,22 @@ impl Drop for BackupWorker {
     }
 }
 
-fn age_seconds(timestamp: i64) -> f64 {
+pub(crate) fn age_seconds(timestamp: i64) -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(timestamp);
     (now - timestamp).max(0) as f64
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::Path;
+
+    /// Takes the backup-directory lock and returns a guard, so a test can hold
+    /// it the way a running backup or restore does.
+    pub(crate) fn lock_backup_dir(dir: &Path) -> anyhow::Result<impl Drop + use<>> {
+        std::fs::create_dir_all(dir)?;
+        super::DirLock::acquire(dir)
+    }
 }

@@ -133,13 +133,17 @@ fn run() -> anyhow::Result<()> {
             let scratch = args
                 .scratch
                 .ok_or_else(|| anyhow::anyhow!("rehearse needs --scratch <dir>"))?;
-            let info = backup::rehearse(&args.dir, &scratch, args.id)?;
+            let (info, read) = backup::rehearse(&args.dir, &scratch, args.id)?;
             println!(
-                "backup {} restored into {} and read back: {} files, {} MiB",
+                "backup {} restored into {} ({} files, {} MiB)",
                 info.backup_id,
                 scratch.display(),
                 info.num_files,
                 info.size_bytes >> 20,
+            );
+            println!(
+                "read back: {} documents and {} index entries decoded, {} rows scanned",
+                read.documents, read.index_entries, read.rows,
             );
         },
         "restore" => {

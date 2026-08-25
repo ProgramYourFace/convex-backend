@@ -1191,8 +1191,13 @@ async fn backup_lifecycle_generations_retention_rehearsal_and_restore() -> anyho
     // A rehearsal proves the backup opens and reads, which verification alone
     // does not.
     let scratch = dir.path().join("scratch");
-    let rehearsed = backup::rehearse(&backup_dir, &scratch, None)?;
+    let (rehearsed, read) = backup::rehearse(&backup_dir, &scratch, None)?;
     assert_eq!(rehearsed.backup_id, 4);
+    assert_eq!(
+        read.documents, 4,
+        "the rehearsal must decode every document, not merely count rows"
+    );
+    assert_eq!(read.index_entries, 4);
     // Rehearsing again must work: the scratch directory is reused, not appended
     // to, or the second run of a nightly job fails.
     backup::rehearse(&backup_dir, &scratch, None)?;
@@ -1267,6 +1272,294 @@ async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
         .backup(&dir.path().join("backup"), 4)
         .expect_err("a secondary must refuse");
     assert!(format!("{err}").contains("secondary"), "{err}");
+    Ok(())
+}
+
+/// Document retention deletes rows while exports and index backfills are
+/// scanning. A page cursor that seeks-and-steps skips the row *after* a deleted
+/// cursor row, which is a revision silently missing from an export or an index
+/// update silently missing from a backfill.
+#[tokio::test]
+async fn load_documents_does_not_skip_a_row_when_the_cursor_row_is_deleted() -> anyhow::Result<()> {
+    for order in [Order::Asc, Order::Desc] {
+        let f = Fixture::new()?;
+        for i in 1..=6u32 {
+            let at = u64::from(i) * 10;
+            f.persistence
+                .write(
+                    &[entry(1, i, at, &format!("v{i}"), None)?],
+                    &[],
+                    ConflictStrategy::Error,
+                )
+                .await?;
+        }
+
+        // Take one page, then delete the row the cursor names.
+        let reader = f.persistence.reader();
+        let mut stream =
+            Box::pin(reader.load_documents(TimestampRange::all(), order, 2, validator()));
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let entry = stream
+                .try_next()
+                .await?
+                .expect("two rows in the first page");
+            seen.push(u64::from(entry.ts));
+        }
+        let cursor_ts = *seen.last().unwrap();
+        let cursor_n = (cursor_ts / 10) as u32;
+        f.persistence
+            .delete(vec![(ts(cursor_ts), doc_id(1, cursor_n))])
+            .await?;
+
+        while let Some(entry) = stream.try_next().await? {
+            seen.push(u64::from(entry.ts));
+        }
+
+        // Deleting the cursor row may drop it from the results — it is gone.
+        // Every *other* row must still be there.
+        let mut expected: Vec<u64> = (1..=6u64).map(|i| i * 10).collect();
+        if order == Order::Desc {
+            expected.reverse();
+        }
+        expected.retain(|t| *t != cursor_ts || seen.contains(t));
+        assert_eq!(
+            seen, expected,
+            "{order:?} scan lost a row after its cursor row was deleted"
+        );
+    }
+    Ok(())
+}
+
+/// `IndexEntry` sorts on a 2500-byte prefix and breaks ties on
+/// `sha256(full_key)`, which is uncorrelated with the byte order the iterator
+/// produces. Emitting storage order would both violate the contract and make
+/// the `entry > cursor` resume filter discard entries the scan never revisits.
+#[tokio::test]
+async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow::Result<()> {
+    use common::index::MAX_INDEX_KEY_PREFIX_LEN;
+
+    let f = Fixture::new()?;
+    // Two keys agreeing on the whole truncated prefix, differing past it.
+    let mut a = vec![b'z'; MAX_INDEX_KEY_PREFIX_LEN];
+    let mut b = a.clone();
+    a.push(1);
+    b.push(2);
+    assert!(a < b, "a is the byte-order-smaller key");
+
+    for (i, key) in [a.clone(), b.clone()].into_iter().enumerate() {
+        let n = i as u32 + 1;
+        f.persistence
+            .write(
+                &[entry(1, n, 10, "v", None)?],
+                &[index_entry(1, &key, 10, Some(doc_id(1, n)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+    }
+
+    let all = f.persistence.load_index_chunk(None, 16).await?;
+    assert_eq!(all.len(), 2, "both entries are in the index");
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted, "entries must be emitted in IndexEntry order");
+
+    // Paging with the cursor must reach the second entry, whichever of the two
+    // sorts first — the bug dropped it because the filter ran against a stream
+    // that was not in IndexEntry order.
+    let first = f.persistence.load_index_chunk(None, 1).await?;
+    assert_eq!(first.len(), 1);
+    let rest = f
+        .persistence
+        .load_index_chunk(Some(first[0].clone()), 16)
+        .await?;
+    assert_eq!(rest.len(), 1, "paging must not drop the remaining entry");
+    assert_eq!(vec![first[0].clone(), rest[0].clone()], sorted);
+    Ok(())
+}
+
+/// The worker holds a strong reference for a tick, so the owner releasing the
+/// last other reference mid-tick drops the database on the worker's own thread.
+/// Joining yourself panics with EDEADLK, and since nothing calls `shutdown()`,
+/// dropping is the path production takes.
+#[tokio::test]
+async fn dropping_during_a_flush_tick_does_not_panic() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    for round in 0..200u32 {
+        let path = dir.path().join(format!("db{round}"));
+        let persistence = RocksDbPersistence::new_with_sync_mode(
+            &path,
+            // Short enough that the flusher is very likely mid-tick at drop.
+            SyncMode::Interval(Duration::from_micros(200)),
+        )?;
+        for i in 1..=4u32 {
+            persistence
+                .write(
+                    &[entry(1, i, u64::from(i) * 10, "v", None)?],
+                    &[],
+                    ConflictStrategy::Error,
+                )
+                .await?;
+        }
+        // No `shutdown()` — exactly what the backend does today.
+        drop(persistence);
+        std::fs::remove_dir_all(&path).ok();
+    }
+    Ok(())
+}
+
+/// Dropping without `shutdown()` still has to flush interval mode's buffer, or
+/// an orderly stop loses acknowledged writes.
+#[tokio::test]
+async fn dropping_flushes_the_interval_wal_buffer() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new_with_sync_mode(
+            &path,
+            // No tick can fire during the test, so only the drop can flush.
+            SyncMode::Interval(Duration::from_secs(600)),
+        )?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "dropped", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        drop(persistence);
+    }
+
+    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
+    let entries: Vec<_> = reopened
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 1, "dropping must flush the WAL buffer");
+    Ok(())
+}
+
+/// A rehearsal exists to catch a backup that restores but is wrong. A backup of
+/// an empty database restores and scans perfectly, so an empty read-back is the
+/// one result that must not be reported as success.
+#[tokio::test]
+async fn rehearse_refuses_an_empty_database() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    {
+        // Opened and backed up without ever being written to.
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        persistence.backup(&backup_dir, 4)?;
+        persistence.shutdown().await?;
+    }
+    let err = backup::rehearse(&backup_dir, &dir.path().join("scratch"), None)
+        .expect_err("an empty restore must not pass as a rehearsal");
+    assert!(format!("{err:#}").contains("empty"), "{err:#}");
+    Ok(())
+}
+
+/// RocksDB defines no behaviour for two backup engines on one directory —
+/// its own header says the result may include trashing the directory — and
+/// `purge_old_backups` runs on every worker tick, so an operator listing
+/// generations while the worker prunes is a real sequence.
+#[tokio::test]
+async fn backup_directory_refuses_concurrent_use() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+    persistence
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    persistence.backup(&backup_dir, 4)?;
+
+    // Hold the lock the way a running operation does, then contend for it.
+    let held = backup::testing::lock_backup_dir(&backup_dir)?;
+    let err = backup::list(&backup_dir).expect_err("a second holder must be refused");
+    assert!(format!("{err:#}").contains("another process"), "{err:#}");
+    drop(held);
+
+    // Released, so the directory is usable again.
+    assert_eq!(backup::list(&backup_dir)?.len(), 1);
+    Ok(())
+}
+
+/// Retention can move under a scan. Every reader must consult the validator
+/// *after* reading a page and *before* handing it to the caller, so a snapshot
+/// that fell out of retention mid-scan is never returned. Every other test uses
+/// a validator that always approves, which cannot show this.
+#[tokio::test]
+async fn a_rejecting_retention_validator_stops_every_read_path() -> anyhow::Result<()> {
+    struct Rejecting;
+    #[async_trait::async_trait]
+    impl RetentionValidator for Rejecting {
+        fn optimistic_validate_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn validate_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+            anyhow::bail!("snapshot is out of retention")
+        }
+
+        async fn validate_document_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
+            anyhow::bail!("document snapshot is out of retention")
+        }
+
+        async fn min_snapshot_ts(&self) -> anyhow::Result<common::types::RepeatableTimestamp> {
+            anyhow::bail!("unused")
+        }
+
+        async fn min_document_snapshot_ts(
+            &self,
+        ) -> anyhow::Result<common::types::RepeatableTimestamp> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.persistence
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(id))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    let rejecting: Arc<dyn RetentionValidator> = Arc::new(Rejecting);
+    let reader = f.persistence.reader();
+
+    let documents: anyhow::Result<Vec<_>> = reader
+        .load_documents(TimestampRange::all(), Order::Asc, 8, rejecting.clone())
+        .try_collect()
+        .await;
+    assert!(documents.is_err(), "load_documents yielded a rejected page");
+
+    let rows: anyhow::Result<Vec<_>> = reader
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(10),
+            &interval(b"", None),
+            Order::Asc,
+            8,
+            rejecting.clone(),
+        )
+        .try_collect()
+        .await;
+    assert!(rows.is_err(), "index_scan yielded a rejected page");
+
+    let previous = reader
+        .previous_revisions(BTreeSet::from([(id, ts(10))]), rejecting.clone())
+        .await;
+    assert!(
+        previous.is_err(),
+        "previous_revisions yielded a rejected read"
+    );
     Ok(())
 }
 

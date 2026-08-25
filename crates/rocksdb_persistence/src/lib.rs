@@ -26,16 +26,22 @@
 //!
 //! # Semantics that differ from the relational backends
 //!
-//! * **Uniqueness.** [`ConflictStrategy::Error`] is free in a B-tree, which
-//!   gets it from a primary key; an LSM silently shadows an existing key
-//!   instead. It is enforced here with one bloom-filtered point get per row
-//!   written, which is why `ROCKSDB_CHECK_CONFLICTS` exists — turning it off is
-//!   faster and gives up detection of a `(ts, id)` or `(index_id, key, ts)`
-//!   collision. Leave it on unless you have measured that it matters: on the
-//!   commit path the check is redundant (commit timestamps strictly increase,
-//!   and `check_generated_ids` rejects reused ids a layer up), but
-//!   `Database::initialize` writes bootstrap rows outside a transaction and
-//!   relies on it.
+//! * **Uniqueness is detected, not enforced.** [`ConflictStrategy::Error`] is
+//!   free in a B-tree, which gets it from a primary key inside the transaction;
+//!   an LSM silently shadows an existing key instead. It is checked here with
+//!   one bloom-filtered point get per row written — but that get happens
+//!   *before* the batch, not inside it, so it is a detector, not a constraint:
+//!   two concurrent writes naming the same `(ts, id)` can both probe clean and
+//!   both apply, the second shadowing the first. That is weaker than Postgres
+//!   and worth stating plainly.
+//!
+//!   It holds anyway on the path that matters, for a reason outside this
+//!   crate: commits are serialized through a single committer that assigns
+//!   strictly increasing timestamps, so no two commits can name the same
+//!   `(ts, id)` in the first place, and `check_generated_ids` rejects reused
+//!   document ids a layer above. The check earns its keep on
+//!   `Database::initialize`, which writes bootstrap rows outside that path.
+//!   `ROCKSDB_CHECK_CONFLICTS=false` gives up the detection.
 //! * **No lease.** The relational backends fence a stolen leadership with two
 //!   extra statements per write. An embedded store has no such concept: the
 //!   process holding the directory lock is the writer. That is a stronger
@@ -82,6 +88,7 @@ use common::{
         PersistenceTableSize,
     },
     runtime::tokio_spawn_blocking,
+    shutdown::ShutdownSignal,
     types::{
         IndexId,
         Timestamp,
@@ -102,6 +109,7 @@ use serde_json::Value as JsonValue;
 
 pub mod backup;
 pub mod codec;
+mod health;
 pub mod keys;
 mod memory;
 mod metrics;
@@ -122,6 +130,34 @@ use keys::{
 };
 
 pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
+
+/// What a read-back check actually managed to decode.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ReadCheck {
+    pub rows: usize,
+    pub documents: usize,
+    pub index_entries: usize,
+}
+
+/// How to open a database.
+///
+/// A struct rather than a run of positional flags because these are three
+/// unrelated decisions — durability, failure escalation, and whether this
+/// process is the one that owns the database's background work — and a
+/// `open(path, true, false, None)` at a call site says none of that.
+#[derive(Default)]
+pub struct OpenOptions {
+    /// Durability mode. `None` takes it from the environment.
+    pub sync: Option<options::SyncMode>,
+    /// Where to report a latched background error. Without one, a database
+    /// that has stopped accepting writes keeps the process alive.
+    pub shutdown: Option<ShutdownSignal>,
+    /// Whether to run background work — the interval WAL flusher, the periodic
+    /// backup worker and the health monitor. False for short-lived opens such
+    /// as a restore rehearsal, which must not attach either to the production
+    /// backup chain or to a shutdown signal.
+    pub background: bool,
+}
 
 /// An embedded RocksDB [`Persistence`].
 pub struct RocksDbPersistence {
@@ -148,13 +184,20 @@ pub(crate) struct Inner {
     wal_flusher: std::sync::OnceLock<wal_flush::WalFlusher>,
     /// Present only when `ROCKSDB_BACKUP_DIR` is set. Same `Weak` reasoning.
     backup_worker: std::sync::OnceLock<backup::BackupWorker>,
+    /// Present on any primary opened with a shutdown signal. Same `Weak`
+    /// reasoning.
+    health: std::sync::OnceLock<health::HealthMonitor>,
 }
 
 impl RocksDbPersistence {
-    /// Open (or create) a database at `path`, in the [`options::SyncMode`] the
-    /// environment asks for.
+    /// Open (or create) a database at `path` with the environment's settings
+    /// and no fatal-error escalation.
+    ///
+    /// Prefer [`RocksDbPersistence::open_with`] in a deployment: without a
+    /// [`ShutdownSignal`] a latched background error — a full disk, a corrupt
+    /// SST — leaves the process serving and failing every write indefinitely.
     pub fn new(path: &Path) -> anyhow::Result<Self> {
-        Self::open(path, true, options::SyncMode::current())
+        Self::open_with(path, OpenOptions::default())
     }
 
     /// Open (or create) a database in an explicit [`options::SyncMode`],
@@ -162,7 +205,18 @@ impl RocksDbPersistence {
     /// worth being able to state it in code rather than hope a variable was
     /// set.
     pub fn new_with_sync_mode(path: &Path, sync: options::SyncMode) -> anyhow::Result<Self> {
-        Self::open(path, true, sync)
+        Self::open_with(
+            path,
+            OpenOptions {
+                sync: Some(sync),
+                ..OpenOptions::default()
+            },
+        )
+    }
+
+    /// Open (or create) a database with explicit options.
+    pub fn open_with(path: &Path, opts: OpenOptions) -> anyhow::Result<Self> {
+        Self::open(path, true, opts)
     }
 
     /// Open a read-only view of a database another process has open for
@@ -203,11 +257,13 @@ impl RocksDbPersistence {
                 sync: options::SyncMode::Every,
                 wal_flusher: std::sync::OnceLock::new(),
                 backup_worker: std::sync::OnceLock::new(),
+                health: std::sync::OnceLock::new(),
             }),
         })
     }
 
-    fn open(path: &Path, create_if_missing: bool, sync: options::SyncMode) -> anyhow::Result<Self> {
+    fn open(path: &Path, create_if_missing: bool, opts: OpenOptions) -> anyhow::Result<Self> {
+        let sync = opts.sync.unwrap_or_else(options::SyncMode::current);
         // RocksDB writes a CURRENT file as the last step of creating a
         // database, so its absence is the reliable "nothing here yet" signal —
         // more so than the directory existing, which a mount or a failed
@@ -242,19 +298,74 @@ impl RocksDbPersistence {
             sync,
             wal_flusher: std::sync::OnceLock::new(),
             backup_worker: std::sync::OnceLock::new(),
+            health: std::sync::OnceLock::new(),
         });
 
-        if let options::SyncMode::Interval(interval) = sync {
+        if opts.background
+            && let options::SyncMode::Interval(interval) = sync
+        {
             let flusher = wal_flush::WalFlusher::spawn(Arc::downgrade(&inner), interval)?;
             let _ = inner.wal_flusher.set(flusher);
         }
 
-        if let Some(config) = backup::BackupConfig::from_env() {
+        // A backup directory is only ever taken from the environment, and only
+        // when the caller wants background work at all. `rocksdb-backup` opens
+        // databases too, and a rehearsal or a restore run in the backend's own
+        // environment must not attach a worker that would write generations of
+        // a scratch database into the production backup chain.
+        let backup_config = opts
+            .background
+            .then(backup::BackupConfig::from_env)
+            .flatten();
+        if let Some(config) = backup_config.clone() {
             let worker = backup::BackupWorker::spawn(Arc::downgrade(&inner), config)?;
             let _ = inner.backup_worker.set(worker);
         }
 
+        if opts.background
+            && let Some(shutdown) = opts.shutdown
+        {
+            let monitor = health::HealthMonitor::spawn(
+                Arc::downgrade(&inner),
+                shutdown,
+                backup_config.map(|c| c.dir),
+            )?;
+            let _ = inner.health.set(monitor);
+        }
+
         Ok(Self { inner })
+    }
+}
+
+/// Stops the background threads and flushes the write-ahead log before
+/// `Inner`'s fields — `db` among them — are dropped.
+///
+/// `Persistence::shutdown` is the intended teardown, but nothing in the tree
+/// calls it: `Database::shutdown` stops the committer and its workers and
+/// returns, and no relational backend overrides `shutdown` either, so the hook
+/// was never wired up. Dropping the handle is therefore the path production
+/// actually takes, and it has to be the safe one. Without this, `db` — the
+/// first field — would close while the workers were still running, and in
+/// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(monitor) = self.health.get() {
+            monitor.stop();
+        }
+        if let Some(worker) = self.backup_worker.get() {
+            worker.stop();
+        }
+        if let Some(flusher) = self.wal_flusher.get() {
+            flusher.stop();
+        }
+        // Only interval mode can be holding acknowledged writes in RocksDB's
+        // buffer; the other modes have already handed them to the kernel.
+        if matches!(self.sync, options::SyncMode::Interval(_))
+            && !self.secondary
+            && let Err(e) = self.db.flush_wal(true)
+        {
+            tracing::error!("failed to flush the RocksDB WAL while closing: {e}");
+        }
     }
 }
 
@@ -265,31 +376,56 @@ impl Inner {
             .ok_or_else(|| anyhow::anyhow!("missing column family {name}"))
     }
 
-    /// Reads every column family end to end and returns the total row count.
+    /// Reads every column family end to end, decoding what it finds, and
+    /// refuses a database that holds nothing.
     ///
-    /// Exists for [`crate::backup::rehearse`]: opening a database only
-    /// exercises its manifest and column family descriptors, which is a much
-    /// weaker statement than "this restored database can be read". Iterating
-    /// forces the block cache, the SST readers and the blob files to actually
-    /// produce data.
-    pub(crate) fn scan_all_column_families(&self) -> anyhow::Result<usize> {
-        let mut rows = 0;
+    /// Exists for [`crate::backup::rehearse`]. Opening a database exercises
+    /// only its manifest and column family descriptors, and counting rows
+    /// exercises only the iterators — neither says the bytes are the bytes that
+    /// went in. So every document is parsed, every index entry is decoded, and
+    /// an empty result is an error: a backup of nothing restores and scans
+    /// perfectly, which is exactly the false pass a rehearsal exists to catch.
+    pub(crate) fn verify_readable(&self) -> anyhow::Result<ReadCheck> {
+        let mut check = ReadCheck::default();
         for name in keys::ALL_COLUMN_FAMILIES {
             let cf = self.cf(name)?;
             let mut iter = self.db.raw_iterator_cf(&cf);
             iter.seek_to_first();
             while iter.valid() {
-                // Touch the value, not just the key: a document body in a blob
-                // file is a separate read that a key-only scan would skip, and
-                // blob files are exactly the thing worth proving came back.
-                let _ = iter.value().map(<[u8]>::len);
-                rows += 1;
+                let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                    break;
+                };
+                match name {
+                    // Parsing the body is the point: a document above the blob
+                    // threshold lives in a separate file, and a key-only or
+                    // length-only scan would never prove it came back.
+                    keys::CF_DLOG => {
+                        let (ts, id) = keys::parse_dlog_key(key)?;
+                        codec::decode_document(id.table(), value).with_context(|| {
+                            format!("document {id}@{ts} did not decode after the restore")
+                        })?;
+                        check.documents += 1;
+                    },
+                    keys::CF_IDX => {
+                        keys::parse_idx_key(key)?;
+                        codec::decode_index_entry(value)
+                            .context("index entry did not decode after the restore")?;
+                        check.index_entries += 1;
+                    },
+                    _ => {},
+                }
+                check.rows += 1;
                 iter.next();
             }
             iter.status()
                 .with_context(|| format!("failed to scan column family {name}"))?;
         }
-        Ok(rows)
+        anyhow::ensure!(
+            check.documents > 0,
+            "the restored database is readable but empty. A backup of an empty database restores \
+             and scans perfectly, so this is reported as a failure rather than a pass.",
+        );
+        Ok(check)
     }
 
     /// Bring a secondary instance up to date with its primary. A no-op on the
@@ -661,9 +797,13 @@ impl Persistence for RocksDbPersistence {
     async fn shutdown(&self) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_shutdown", move || -> anyhow::Result<()> {
-            // Stop the interval flusher before touching the database, so a
-            // timed flush cannot land in the middle of the close below. The
-            // `flush_wal` that follows covers whatever it had not yet written.
+            // Stop the background threads before touching the database, so
+            // neither a timed flush nor a backup can land in the middle of the
+            // close below. The `flush_wal` that follows covers whatever the
+            // flusher had not yet written.
+            if let Some(monitor) = inner.health.get() {
+                monitor.stop();
+            }
             if let Some(worker) = inner.backup_worker.get() {
                 worker.stop();
             }

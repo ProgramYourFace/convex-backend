@@ -92,6 +92,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
+| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled WAL flush |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -197,16 +198,33 @@ written underneath and the current one stays recoverable.
 
 **`verify` is a checksum; `rehearse` is the test.** Verification says the files are
 present and the right size. Rehearsal restores into a scratch directory, opens the
-database and reads every column family, which is the thing an operator actually needs
-to know. Put `rehearse` on a schedule — a backup nobody has restored is not a backup.
+database, and **decodes** every document and index entry it finds — not just iterating,
+which would pass on bytes that no longer parse. It fails on an empty result, because a
+backup of an empty database restores and scans perfectly and is exactly the false pass a
+rehearsal exists to catch. Put it on a schedule; a backup nobody has restored is not a
+backup.
+
+Only one process may use a backup directory at a time, enforced by an advisory lock that
+`list`, `verify`, `rehearse`, `restore` and the worker all take. RocksDB defines no
+behaviour for concurrent backup engines on one directory — its own header allows for
+trashing the directory — and `purge_old_backups` runs on every worker tick, so an
+operator listing generations while the worker prunes is a real sequence rather than a
+hypothetical one.
+
+Each generation is verified before older ones are pruned. `create_new_backup_flush`
+returning `Ok` says RocksDB wrote the files; it does not say the destination kept them,
+and pruning on the strength of an unverified generation is how the last known-good ones
+age out behind a silently bad new one.
 
 Backups are written to a local path; the crate binds no object-store `Env`, so
 replicating that directory off-node is an external job. A backup directory on the same
 volume as the database protects against a bad migration, not against losing the volume.
 
-Watch `rocksdb_backup_age_seconds`, published on every worker tick. Failures are events
-you can miss; age is a level you cannot, and a worker that has quietly stopped looks
-exactly like one that is working until you look at it.
+Watch `rocksdb_backup_age_seconds`. It is a gauge, published by the health monitor on its
+own short timer rather than by the backup worker — a level that keeps rising says "no
+backup has landed", where a distribution that stops receiving samples says nothing at
+all, and the case worth catching is precisely the one where the backup worker is the
+thing that died.
 
 **There is no point-in-time recovery, and there cannot be at this layer.** Postgres
 reaches an arbitrary moment by replaying archived WAL onto a base backup; RocksDB
@@ -216,15 +234,41 @@ that came through it — by whatever an upstream log can replay.
 See [`docs/proposals/005-backup-and-restore.md`](../../docs/proposals/005-backup-and-restore.md)
 for the runbook and for what a database backup does not cover.
 
+## Health and failure escalation
+
+RocksDB latches read-only on a background error — a full disk, a checksum failure — and
+stays that way. Every subsequent write fails, the process keeps serving, and nothing
+crashes. A Postgres deployment gets a pod that dies and a database another node can take
+over; an embedded one would fail every mutation indefinitely with no signal.
+
+So a health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
+backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
+on either of:
+
+- **a latched background error**, so the deployment restarts or fails over rather than
+  serving a database that cannot accept writes;
+- **a write-ahead log that has stopped being flushed** in interval mode, past ten
+  intervals. In that mode a write is acknowledged before it reaches the kernel, so a
+  persistently failing flush is acknowledged data accumulating unwritten — the loss is
+  unbounded, not "one interval", and stopping beats continuing to acknowledge writes that
+  are not being kept.
+
+It also publishes `rocksdb_wal_flush_age_seconds`, which is the direct measurement of how
+much acknowledged data is currently at risk.
+
 ## Semantics that differ from the relational backends
 
 Both are deliberate, and both are the reason this file exists rather than a
 one-line "it's just a KV store".
 
-**Uniqueness is not free.** `ConflictStrategy::Error` costs nothing in a B-tree,
-which gets it from a primary key; an LSM silently shadows an existing key
-instead. It is enforced here with one batched, bloom-filtered point get per row
-written. On the commit path that check is redundant — commit timestamps strictly
+**Uniqueness is detected, not enforced.** `ConflictStrategy::Error` costs nothing in a
+B-tree, which gets it from a primary key *inside the transaction*; an LSM silently
+shadows an existing key instead. It is checked here with one batched, bloom-filtered
+point get per row written — but before the batch, not inside it, so two concurrent
+writes naming the same key can both probe clean and both apply. That is weaker than
+Postgres. It holds on the path that matters for a reason outside this crate: commits are
+serialized through one committer assigning strictly increasing timestamps, so no two can
+name the same `(ts, id)`. On the commit path that check is redundant — commit timestamps strictly
 increase, so `(id, ts)` cannot collide, and `check_generated_ids` rejects reused
 document ids a layer up — but `Database::initialize` writes bootstrap rows
 outside a transaction and relies on it. So it is on by default;
@@ -294,10 +338,17 @@ this is typically one to three versions.
 
 ## Tests
 
-`cargo test -p rocksdb_persistence` covers the encodings (unit plus proptest for
-the order-preservation property the `idx` layout rests on) and the trait
-behaviour: multi-version reads at explicit timestamps, tombstones, interval
-bounds and ordering, paging across page boundaries in both directions, the
-`previous_revisions` family, conflict detection, all three retention deletes,
-persistence globals, `max_ts`, and durability across a reopen with and without a
-clean shutdown.
+`cargo test -p rocksdb_persistence` covers the encodings (unit plus proptest for the
+order-preservation property the `idx` layout rests on) and the trait behaviour:
+multi-version reads at explicit timestamps, tombstones, interval bounds and ordering,
+paging in both directions **including across a row deleted mid-scan**, the
+`previous_revisions` family, conflict detection, all three retention deletes, persistence
+globals, `max_ts`, and durability across a reopen with and without a clean shutdown.
+
+It also covers the failure paths that are easy to get wrong and impossible to notice: a
+retention validator that *rejects*, so read-then-validate ordering is asserted rather
+than assumed; dropping a database mid-flush-tick, which is the teardown production
+actually performs; index entries whose keys share a truncated prefix, where storage order
+and `IndexEntry` order diverge; and the backup lifecycle end to end — generations,
+retention, a refused concurrent opener, a refused non-empty restore target, and a
+rehearsal that refuses an empty database.

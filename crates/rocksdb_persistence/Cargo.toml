@@ -22,6 +22,7 @@ cmd_util = { workspace = true }
 common = { workspace = true }
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
+libc = { workspace = true }
 metrics = { workspace = true }
 prometheus = { workspace = true }
 rocksdb = { workspace = true }

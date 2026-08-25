@@ -265,14 +265,20 @@ and the honest mitigation is that the ingest bus can replay the gap for the data
 came through it. For anything that did not — user-authored records, anything written by a
 mutation the bus did not drive — the recovery point really is the last backup.
 
-**A backup nobody has restored is not a backup.** *Now built* — `rocksdb-backup rehearse`
-— but building the command is not the same as running it. It has to be on a schedule,
-and the schedule is still yours to create.
+**A backup nobody has restored is not a backup.** *Now built* — `rocksdb-backup rehearse`,
+which decodes rather than counts and refuses an empty result — but building the command
+is not the same as running it. It has to be on a schedule, and the schedule is still
+yours to create.
 
 **Nothing measures the backup's age.** *Now published* as `rocksdb_backup_age_seconds`,
 on every worker tick whether the backup succeeded or not, because failures are events you
 can miss and age is a level you cannot. The alert on it is still the deliverable, and is
 still yours.
+
+**Concurrent access is refused rather than coordinated.** One advisory lock per backup
+directory means a listing during a backup fails instead of corrupting, which is the right
+default but is still an error an operator will hit. Two backends must never share a
+`ROCKSDB_BACKUP_DIR`.
 
 **Backups are unencrypted.** RocksDB's backup files are the SSTs, in the clear. Whatever
 holds them off-node needs encryption at rest and access control at least as tight as the

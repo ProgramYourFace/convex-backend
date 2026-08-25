@@ -9,10 +9,15 @@
 //! The thread holds a [`Weak`] reference to the database, never a strong one.
 //! A strong reference would keep the database alive for as long as the thread
 //! ran, and the thread runs until the database is dropped, which is a cycle
-//! that never collects. The `Weak` also makes the shutdown race safe rather
-//! than merely unlikely: `upgrade` fails as soon as the last strong reference
-//! is gone, so the thread either gets a live database or gets nothing, and can
-//! never observe one mid-drop.
+//! that never collects. `upgrade` also fails as soon as the last strong
+//! reference is gone, so the thread either gets a live database or gets
+//! nothing, and can never observe one mid-drop.
+//!
+//! It does *not* make the whole teardown race-free. The thread holds a strong
+//! reference for the duration of a tick, so an owner releasing the last other
+//! reference inside that window leaves the worker holding the last one — and
+//! dropping `Inner` then runs on this thread, reaching [`WalFlusher::stop`],
+//! which is why `stop` refuses to join itself.
 
 use std::{
     sync::{
@@ -30,6 +35,7 @@ use std::{
 };
 
 use crate::{
+    health::FlushClock,
     metrics,
     Inner,
 };
@@ -39,6 +45,10 @@ pub(crate) struct WalFlusher {
     /// wait out the remaining interval.
     stop: Arc<Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// When the log was last written through to disk. A failing flush leaves
+    /// acknowledged writes in RocksDB's buffer, so this — not the presence of
+    /// error logs — is the measurement of whether the mode's loss bound holds.
+    clock: Arc<FlushClock>,
 }
 
 struct Signal {
@@ -55,6 +65,8 @@ impl WalFlusher {
             wake: Condvar::new(),
         });
         let signal = stop.clone();
+        let clock = Arc::new(FlushClock::new());
+        let thread_clock = clock.clone();
         let handle = std::thread::Builder::new()
             .name("rocksdb-wal-flusher".to_string())
             .spawn(move || {
@@ -80,14 +92,19 @@ impl WalFlusher {
                     let timer = metrics::wal_flush_timer();
                     match inner.db.flush_wal(true) {
                         Ok(()) => {
+                            thread_clock.record_success();
                             timer.finish();
                         },
                         Err(e) => {
                             timer.finish_developer_error();
-                            // Log rather than crash: the next tick retries, and
-                            // the writes are still in RocksDB's buffer. A
-                            // persistent failure here shows up as a growing
-                            // gap in `rocksdb_wal_flush_seconds`.
+                            // Log rather than crash *here*: one failed flush is
+                            // a transient, the next tick retries, and the
+                            // writes are still buffered. A persistent failure
+                            // is a different thing entirely — it means
+                            // acknowledged writes are piling up unwritten — and
+                            // the health monitor escalates that from
+                            // `since_last_success`, which is a level rather
+                            // than the absence of an event.
                             tracing::error!("rocksdb WAL flush failed: {e}");
                         },
                     }
@@ -97,7 +114,13 @@ impl WalFlusher {
         Ok(Self {
             stop,
             handle: Mutex::new(Some(handle)),
+            clock,
         })
+    }
+
+    /// How long since the log was last written through to disk.
+    pub(crate) fn since_last_success(&self) -> std::time::Duration {
+        self.clock.since_last_success()
     }
 
     /// Stop the thread and wait for it. Idempotent — `shutdown` calls it so a
@@ -111,7 +134,17 @@ impl WalFlusher {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(handle) = handle {
-            let _ = handle.join();
+            // The worker holds a strong `Arc<Inner>` for the duration of a
+            // tick. If the owner released the last other reference in that
+            // window, `Inner` is dropped *on this thread*, which reaches here —
+            // and joining yourself deadlocks (the platform returns EDEADLK and
+            // `join` panics). Signalling is enough in that case: the loop is
+            // already unwinding.
+            if handle.thread().id() == std::thread::current().id() {
+                std::mem::forget(handle);
+            } else {
+                let _ = handle.join();
+            }
         }
     }
 }

@@ -6,11 +6,18 @@
 //! the Postgres backend uses, so a snapshot that falls out of retention
 //! mid-scan is never handed to the caller.
 //!
-//! Paging without an engine snapshot is safe because of how Convex writes: a
-//! `(ts, id)` row is written once and only ever removed by retention, which
-//! cannot touch anything the retention validator has approved. Concurrent
-//! commits land at higher timestamps, outside every range being scanned. The
-//! relational backends page the same way, for the same reason.
+//! Paging holds no engine snapshot, so rows can be deleted between pages —
+//! document retention does it continuously, and `delete_tablet_documents` does
+//! it on a table drop with no reference to the retention window at all. What
+//! makes that safe is not that deletion cannot happen but that **every cursor
+//! is a value, not a position**: a resume seeks to the cursor's key and steps
+//! past it only if the seek actually landed on it. A seek-and-step would skip
+//! the row *after* a deleted cursor row, which is a revision silently missing
+//! from an export or an index update silently missing from a backfill. The
+//! relational backends get the same property from `(ts, table_id, id) > (…)`.
+//!
+//! Concurrent commits land at higher timestamps, outside every range being
+//! scanned, so they cannot appear mid-page.
 
 use std::{
     cmp,
@@ -44,7 +51,10 @@ use common::{
         TimestampRange,
     },
     query::Order,
-    runtime::tokio_spawn_blocking,
+    runtime::{
+        tokio_spawn_blocking,
+        CoopStreamExt,
+    },
     types::{
         IndexId,
         PersistenceVersion,
@@ -92,6 +102,12 @@ struct IndexPage {
     cursor: Option<Vec<u8>>,
 }
 
+/// Ceiling on how many index entries may share one truncated key prefix before
+/// [`Inner::load_index_chunk`] gives up. Reaching it needs many distinct index
+/// keys that agree on their first `MAX_INDEX_KEY_PREFIX_LEN` bytes, each with
+/// its own version run. Failing loudly beats buffering without bound.
+const MAX_INDEX_ENTRY_GROUP: usize = 65_536;
+
 impl Inner {
     /// Read a page of the document log, ordered by timestamp.
     ///
@@ -131,16 +147,23 @@ impl Inner {
         let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
 
         match (&cursor, order) {
+            // Step past the cursor row only when the seek actually landed on
+            // it. A seek is a position, not a value: if the cursor row was
+            // deleted between pages — which document retention and
+            // `delete_tablet_documents` both do, concurrently and without
+            // reference to this scan — the seek lands on the *next* row
+            // instead, and stepping again would skip it silently. Comparing
+            // against the cursor makes the resume value-based, which is what
+            // the relational backends get from `(ts, table_id, id) > (…)`.
             (Some(cursor), Order::Asc) => {
                 iter.seek(cursor);
-                // The cursor is the last row already returned, so step past it.
-                if iter.valid() {
+                if iter.valid() && iter.key() == Some(cursor.as_slice()) {
                     iter.next();
                 }
             },
             (Some(cursor), Order::Desc) => {
                 iter.seek_for_prev(cursor);
-                if iter.valid() {
+                if iter.valid() && iter.key() == Some(cursor.as_slice()) {
                     iter.prev();
                 }
             },
@@ -337,15 +360,26 @@ impl Inner {
             None => iter.seek_to_first(),
         }
 
-        // `IndexEntry` orders by timestamp ascending within a key, while
-        // storage orders newest-first, so each key's run is buffered and
-        // reversed before it is emitted.
+        // This method's contract is `IndexEntry` order, which is *not* storage
+        // order. `IndexEntry` sorts by `key_prefix` — only the first
+        // `MAX_INDEX_KEY_PREFIX_LEN` bytes — and breaks ties on
+        // `sha256(full_key)`, which has no relationship to the byte order the
+        // iterator produces. The two agree for every key short enough to be its
+        // own prefix, and disagree for keys that share a truncated prefix.
+        //
+        // So entries are grouped by `key_prefix`: across groups, storage order
+        // already is `IndexEntry` order, and within a group the whole group is
+        // sorted. That keeps the buffer bounded by the number of entries
+        // sharing one truncated prefix rather than by the size of the index,
+        // and it is also what makes the cursor filter below sound — filtering
+        // `entry > cursor` against a stream that is not in `IndexEntry` order
+        // discards entries the scan will never come back for.
         let mut out = Vec::with_capacity(chunk_size);
-        let mut run: Vec<IndexEntry> = Vec::new();
-        let mut run_prefix: Option<Vec<u8>> = None;
-        let flush = |run: &mut Vec<IndexEntry>, out: &mut Vec<IndexEntry>| {
-            run.reverse();
-            for entry in run.drain(..) {
+        let mut group: Vec<IndexEntry> = Vec::new();
+        let mut group_prefix: Option<Vec<u8>> = None;
+        let flush = |group: &mut Vec<IndexEntry>, out: &mut Vec<IndexEntry>| {
+            group.sort();
+            for entry in group.drain(..) {
                 if out.len() >= chunk_size {
                     break;
                 }
@@ -359,22 +393,28 @@ impl Inner {
             let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
                 break;
             };
-            let prefix = key[..key.len().saturating_sub(keys::TS_LEN)].to_vec();
-            if run_prefix.as_ref().is_some_and(|p| *p != prefix) {
-                flush(&mut run, &mut out);
-            }
-            run_prefix = Some(prefix);
             let (index_id, index_key, ts) = keys::parse_idx_key(key)?;
-            run.push(IndexEntry::from_index_key(
+            let entry = IndexEntry::from_index_key(
                 index_key,
                 index_id,
                 ts,
                 codec::index_entry_is_deleted(value),
-            ));
+            );
+            let prefix = entry.key_prefix.clone();
+            if group_prefix.as_ref().is_some_and(|p| *p != prefix) {
+                flush(&mut group, &mut out);
+            }
+            group_prefix = Some(prefix);
+            group.push(entry);
+            anyhow::ensure!(
+                group.len() <= MAX_INDEX_ENTRY_GROUP,
+                "more than {MAX_INDEX_ENTRY_GROUP} index entries share one truncated key prefix; \
+                 they cannot be ordered without buffering all of them",
+            );
             iter.next();
         }
         iter.status()?;
-        flush(&mut run, &mut out);
+        flush(&mut group, &mut out);
         Ok(out)
     }
 
@@ -587,6 +627,11 @@ impl PersistenceReader for RocksDbPersistence {
             page_size.max(1) as usize,
             retention_validator,
         )
+        // A page is yielded from a buffer with no await between its rows, so a
+        // consumer that awaits nothing else can run through Tokio's
+        // cooperative budget and starve tasks sharing the worker. The
+        // relational backends wrap their streams the same way.
+        .cooperative()
         .boxed()
     }
 
@@ -606,6 +651,11 @@ impl PersistenceReader for RocksDbPersistence {
             page_size.max(1) as usize,
             retention_validator,
         )
+        // A page is yielded from a buffer with no await between its rows, so a
+        // consumer that awaits nothing else can run through Tokio's
+        // cooperative budget and starve tasks sharing the worker. The
+        // relational backends wrap their streams the same way.
+        .cooperative()
         .boxed()
     }
 
@@ -675,6 +725,11 @@ impl PersistenceReader for RocksDbPersistence {
             size_hint.clamp(1, *options::SCAN_PAGE_ROWS),
             retention_validator,
         )
+        // A page is yielded from a buffer with no await between its rows, so a
+        // consumer that awaits nothing else can run through Tokio's
+        // cooperative budget and starve tasks sharing the worker. The
+        // relational backends wrap their streams the same way.
+        .cooperative()
         .boxed()
     }
 

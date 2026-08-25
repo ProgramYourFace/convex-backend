@@ -8490,6 +8490,7 @@ dependencies = [
  "common",
  "futures",
  "futures-async-stream",
+ "libc",
  "metrics",
  "prometheus",
  "proptest",

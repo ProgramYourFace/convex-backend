@@ -53,6 +53,16 @@ pub static SYNC_INTERVAL: LazyLock<Option<Duration>> =
 /// | [`Interval`](SyncMode::Interval) | up to one interval | up to one interval |
 /// | [`Never`](SyncMode::Never) | nothing | unbounded — whatever the OS had not written |
 ///
+/// [`Interval`](SyncMode::Interval)'s bound holds under two conditions worth
+/// stating, because neither is automatic. Dropping the database handle flushes
+/// the buffer, so an orderly teardown loses nothing — but
+/// `Persistence::shutdown` has no caller anywhere in the backend, for any
+/// storage engine, so an exit that never drops the handle is a crash as far as
+/// this mode is concerned. And a flush that keeps *failing* accumulates
+/// acknowledged-but-unwritten data without bound, which is why
+/// [`crate::health`] escalates a stale flush clock to a process shutdown rather
+/// than trusting the interval alone.
+///
 /// `Interval` is the only mode that can lose a write the *process* never got a
 /// chance to hand to the kernel: it turns on RocksDB's manual WAL flush, so
 /// records sit in RocksDB's own buffer until the flusher thread moves them.
@@ -117,8 +127,10 @@ const MIN_DERIVED_CACHE_BYTES: usize = 64 << 20;
 /// large cache is wanted by default; past this, set it explicitly.
 const MAX_DERIVED_CACHE_BYTES: usize = 4 << 30;
 
-/// Fallback when the process is not in a memory-limited cgroup and physical
-/// memory cannot be read either.
+/// Fallback when no cgroup memory limit applies to this process. Physical
+/// memory is only ever used to *cap* a cgroup limit, never as a substitute for
+/// one, so an unconstrained host gets this flat value regardless of its size —
+/// set `ROCKSDB_BLOCK_CACHE_BYTES` there.
 const DEFAULT_CACHE_BYTES: usize = 512 << 20;
 
 /// Shared block cache across every column family, in bytes.
@@ -220,6 +232,14 @@ pub static BACKUP_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
 /// which grows without bound — a deliberate choice rather than a default.
 pub static BACKUP_KEEP: LazyLock<usize> =
     LazyLock::new(|| env_config("ROCKSDB_BACKUP_KEEP", 24usize));
+
+/// How often the health monitor polls for a latched background error, a
+/// write-ahead log that has stopped being flushed, and the age of the newest
+/// backup. Short enough that a stuck database is noticed in seconds, not the
+/// hour a backup interval would impose.
+pub static HEALTH_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_HEALTH_POLL_SECONDS", 15).max(1))
+});
 
 /// How long `shutdown` waits for background compactions to settle.
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =

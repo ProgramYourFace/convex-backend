@@ -159,7 +159,19 @@ pub async fn connect_persistence<RT: Runtime>(
             Ok(persistence as Arc<dyn Persistence>)
         },
         PersistenceSeed::RocksDb { path } => {
-            let persistence = Arc::new(RocksDbPersistence::new(&path)?);
+            // The same signal the relational backends raise on lease loss. An
+            // embedded engine has no lease, but it does latch read-only on a
+            // background error — a full disk, a corrupt SST — after which every
+            // write fails and nothing crashes. Without somewhere to report
+            // that, the process serves and fails mutations indefinitely.
+            let persistence = Arc::new(RocksDbPersistence::open_with(
+                &path,
+                rocksdb_persistence::OpenOptions {
+                    shutdown: Some(shutdown_signal),
+                    background: true,
+                    ..rocksdb_persistence::OpenOptions::default()
+                },
+            )?);
             tracing::info!("Opened RocksDB at {}", path.display());
             Ok(persistence as Arc<dyn Persistence>)
         },
@@ -212,7 +224,14 @@ pub async fn connect_persistence_reader<RT: Runtime>(
         PersistenceSeed::RocksDb { path } => {
             // A RocksDB directory has one writer, so a standalone reader opens
             // a secondary instance beside it rather than the primary itself.
-            let secondary = path.with_extension("secondary");
+            //
+            // Each secondary needs a directory of its own for its bookkeeping —
+            // two readers sharing one would corrupt each other's catch-up state
+            // — so the path is per process, and it goes in scratch space rather
+            // than in the data volume, since it holds no durable state and
+            // should not survive the process that made it.
+            let secondary = std::env::temp_dir()
+                .join(format!("convex-rocksdb-secondary-{}", std::process::id()));
             Ok(RocksDbPersistence::new_secondary(&path, &secondary)?.reader())
         },
         PersistenceSeed::Postgres { config, options } => {
