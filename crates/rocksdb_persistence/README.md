@@ -106,11 +106,15 @@ usually wrong:
 
 | Knob | Default | Why it matters here |
 |---|--:|---|
+| `INDEX_CACHE_VERIFY_PERCENT` | 100 | At the default, every index-cache **hit** also performs the persistence read it was meant to avoid and compares the two pages. The cache cannot save a read until this is lowered. Worth 1.8–1.9× on read throughput; `1` keeps a sampled check running. |
+| `TABLES_TO_LOAD_IN_MEMORY` | *empty* | Comma-separated tables to pin in memory at startup, alongside the system tables Convex always pins. Reads against a pinned table's indexes never reach storage. Only the live row set is held, so memory tracks table size, not write volume — pin small, hot, bounded tables and nothing that grows with time. |
 | `UDF_EXECUTOR_OCC_INITIAL_BACKOFF_MS` | 100 | On an OCC conflict the whole mutation re-runs after this delay. For a mutation that takes single-digit milliseconds, the first backoff alone is an order of magnitude more than the work being retried, and two conflicts put one mutation past 300 ms before it has accomplished anything. |
 | `COMMITTER_MAX_WRITE_BATCH_DOCUMENTS` / `_BYTES` | 64 / 64 KiB | The committer combines independent commits into one `Persistence::write`. Larger batches amortise per-write overhead — which matters far more against a network database than against this one, but still helps. |
 
-Measure before changing either: if OCC retries are not what your function log shows,
-lowering the backoff buys nothing.
+Measure before changing any of them: if OCC retries are not what your function log shows,
+lowering the backoff buys nothing. The first two are measured on an ingest-shaped
+workload in [`docs/proposals/003-beyond-the-storage-layer.md`](../../docs/proposals/003-beyond-the-storage-layer.md),
+which also surveys what the ingest path still pays for above this trait.
 
 ## Semantics that differ from the relational backends
 

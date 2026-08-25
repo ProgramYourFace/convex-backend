@@ -24,11 +24,13 @@
 //! # Usage
 //!
 //! ```text
-//! persistence-bench [--docs N] [--batch N] [--fields N] [--reads N]
+//! persistence-bench [--docs N] [--batch N] [--merge-percent N] [--devices N]
+//!                   [--reads N] [--pin table,table]
 //!                   [--backends sqlite,rocksdb] [--dir PATH]
 //! ```
 
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::Arc,
     time::{
@@ -56,6 +58,7 @@ use search::{
     searcher::InProcessSearcher,
     Searcher,
 };
+use value::TableName;
 mod workload;
 
 struct Config {
@@ -73,6 +76,10 @@ struct Config {
     /// versions pile up on each hot spine key.
     devices: u64,
     reads: usize,
+    /// Tables pinned into memory before the run, the way
+    /// `TABLES_TO_LOAD_IN_MEMORY` pins them in a real deployment. Reads against
+    /// a pinned table's indexes never reach persistence.
+    pin: Vec<String>,
     dir: PathBuf,
     backends: Vec<String>,
 }
@@ -85,6 +92,7 @@ impl Default for Config {
             merge_percent: 30,
             devices: workload::DEFAULT_DEVICES,
             reads: 2_000,
+            pin: Vec::new(),
             dir: PathBuf::from("/tmp/persistence-bench"),
             backends: vec!["sqlite".to_string(), "rocksdb".to_string()],
         }
@@ -168,6 +176,17 @@ async fn run_backend(
     database
         .commit_with_write_source(tx, "persistence_bench_schema")
         .await?;
+
+    // Pin the requested tables, as `initialize_application_system_tables` does
+    // at backend startup for the tables `TABLES_TO_LOAD_IN_MEMORY` names.
+    if !cfg.pin.is_empty() {
+        let tables: BTreeSet<TableName> = cfg
+            .pin
+            .iter()
+            .map(|name| name.parse())
+            .collect::<anyhow::Result<_>>()?;
+        database.load_indexes_into_memory(tables).await?;
+    }
 
     // --- ingest -----------------------------------------------------------
     let mut commit_latencies = Vec::with_capacity(cfg.docs / cfg.batch + 1);
@@ -258,6 +277,13 @@ fn parse_config() -> anyhow::Result<Config> {
             "--merge-percent" => cfg.merge_percent = value.parse::<u64>()?.min(100),
             "--devices" => cfg.devices = value.parse::<u64>()?.max(1),
             "--reads" => cfg.reads = value.parse()?,
+            "--pin" => {
+                cfg.pin = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            },
             "--dir" => cfg.dir = PathBuf::from(value),
             "--backends" => cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect(),
             other => anyhow::bail!("unknown flag {other}"),
@@ -364,6 +390,8 @@ persistence-bench — compare persistence backends through the real Convex commi
   --merge-percent N   share of events that RLE-merge instead of inserting (default 30)
   --devices N         fleet size; docs/devices is events per device (default 512)
   --reads N           latest-location lookups     (default 2000)
+  --pin a,b           tables to hold in memory, as TABLES_TO_LOAD_IN_MEMORY
+                      does in a deployment        (default none)
   --backends a,b    subset of sqlite,rocksdb      (default both)
   --dir PATH        scratch directory             (default /tmp/persistence-bench)
 

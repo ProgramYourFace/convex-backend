@@ -1,6 +1,7 @@
 # Replacing the storage engine without touching the Convex API
 
 **Status:** phases 1–2 implemented — see `crates/rocksdb_persistence/`
+**Followed by:** [003-beyond-the-storage-layer.md](./003-beyond-the-storage-layer.md), which surveys what the ingest path still pays for above this trait
 **Date:** 2026-08-25
 **Supersedes:** Layer 3 of [001-fast-write-path.md](./001-fast-write-path.md) (ephemeral tables), withdrawn — it changed developer-visible semantics
 **Constraint:** zero change to the Convex developer API. No new `defineTable` options, no
