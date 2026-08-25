@@ -20,10 +20,10 @@ items below are correctness issues rather than tuning:
 |---|---|---|---|
 | §1 | Single-writer: already guaranteed by `replicas: 1` | invariant | satisfied by the existing design |
 | §2 | The relay checkpoint stops sharing a durability domain with Convex | **correctness** | rule below; keep `ROCKSDB_SYNC_WRITES=true` |
-| §3 | Memory is one budget and the default split was wrong | **bug** | fixed here |
+| §3 | Memory is one budget, and RocksDB reads no cgroup limit | **bug** | fixed: the cache is derived from the container limit |
 | §4 | Crash recovery stops being unbounded | win | no action |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
-| §6 | No backup or point-in-time restore | **gap** | designed in [005](./005-backup-and-restore.md), not implemented — read before adopting |
+| §6 | No backup or point-in-time restore | **gap** | backup/restore/rehearsal implemented per [005](./005-backup-and-restore.md); no PITR, and none possible at this layer |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |
 
 ---
@@ -118,20 +118,18 @@ cache and evict every data, index and filter block — including the bloom filte
 per-write uniqueness check depends on — precisely when writes were heaviest.
 `ROCKSDB_WRITE_BUFFER_BYTES` now defaults to a quarter of the cache.
 
-Sizing rule for a container:
+**This is now derived rather than configured.** Left unset, the cache is sized from the
+container's own memory limit — cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`,
+walking up the hierarchy so a limit on any ancestor binds, capped at physical memory and
+clamped to [64 MiB, 4 GiB]. `ROCKSDB_BLOCK_CACHE_PERCENT` is the share, defaulting to 25.
+For the reference backend container at `limits: { memory: 4Gi }` that is 1 GiB of cache,
+chosen without anyone setting anything, and logged at startup with the limit it came
+from.
 
-```
-ROCKSDB_BLOCK_CACHE_BYTES  ≈  (container memory limit - what the backend itself needs) / 2
-```
-
-The halving is deliberate: compaction input and output buffers, open iterators and WAL
-buffers all live outside the cache, and in practice total RSS runs somewhat above the
-cache size. For the reference backend container — `limits: { memory: 4Gi }`, already
-using ~1.3 Gi — that lands around 1 Gi of cache, up from the 512 MiB default:
-
-```yaml
-- { name: ROCKSDB_BLOCK_CACHE_BYTES, value: "1073741824" }   # 1 GiB; memtables get 256 MiB of it
-```
+A quarter rather than a half because the backend also runs V8 isolates, whose heaps are
+the other large consumer in the process, and compaction buffers, iterators and WAL
+buffers sit outside the cache. `ROCKSDB_BLOCK_CACHE_BYTES` still overrides the
+derivation outright.
 
 Against that, the sidecar gives back most of its `limits: { memory: 1536Mi }`.
 

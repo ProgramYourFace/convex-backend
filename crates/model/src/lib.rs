@@ -53,7 +53,6 @@ use backend_state::{
     BACKEND_STATE_TABLE,
 };
 use canonical_urls::CANONICAL_URLS_TABLE;
-use cmd_util::env::env_config;
 use common::{
     bootstrap_model::{
         index::{
@@ -456,7 +455,7 @@ pub async fn initialize_application_system_tables<RT: Runtime>(
     // However, we opt-in to block here in order to smooth out the database load
     // during mass backend restarts and promotions.
     database
-        .load_indexes_into_memory(tables_to_load_in_memory())
+        .load_indexes_into_memory(APP_TABLES_TO_LOAD_IN_MEMORY.clone())
         .await?;
 
     Ok(())
@@ -610,52 +609,6 @@ pub fn component_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     ]
 }
 
-/// Extra tables to pin into memory at startup, on top of
-/// [`APP_TABLES_TO_LOAD_IN_MEMORY`]. Comma-separated table names, e.g.
-/// `TABLES_TO_LOAD_IN_MEMORY=deviceLatestLocations,fleetConfig`.
-///
-/// A pinned table's enabled database indexes are held in memory and maintained
-/// by every commit, so reads against them never reach persistence. Only the
-/// *live* row set is held — one entry per index key, replaced in place — so the
-/// memory cost tracks the table's size, not its write volume. That makes this
-/// safe for small, hot, bounded tables (a per-device latest-state row, a
-/// config table read on every request) and unsafe for anything that grows with
-/// time. There is no eviction: pin a large table and the backend will hold all
-/// of it.
-///
-/// Tables are pinned at startup, so a table created after the process started
-/// is picked up on the next restart. Names that do not exist yet are ignored.
-static EXTRA_TABLES_TO_LOAD_IN_MEMORY: LazyLock<BTreeSet<TableName>> = LazyLock::new(|| {
-    parse_table_list(&env_config("TABLES_TO_LOAD_IN_MEMORY", String::new()))
-});
-
-/// Parses a comma-separated table list, skipping blanks and warning on names
-/// that are not valid table names rather than failing startup over a typo.
-fn parse_table_list(configured: &str) -> BTreeSet<TableName> {
-    configured
-        .split(',')
-        .map(|name| name.trim())
-        .filter(|name| !name.is_empty())
-        .filter_map(|name| match name.parse::<TableName>() {
-            Ok(table) => Some(table),
-            Err(e) => {
-                tracing::warn!(
-                    "Ignoring invalid table name {name:?} in TABLES_TO_LOAD_IN_MEMORY: {e}"
-                );
-                None
-            },
-        })
-        .collect()
-}
-
-/// Every table pinned into memory at startup: the system tables Convex always
-/// pins, plus whatever `TABLES_TO_LOAD_IN_MEMORY` names.
-pub fn tables_to_load_in_memory() -> BTreeSet<TableName> {
-    let mut tables = APP_TABLES_TO_LOAD_IN_MEMORY.clone();
-    tables.extend(EXTRA_TABLES_TO_LOAD_IN_MEMORY.iter().cloned());
-    tables
-}
-
 static APP_TABLES_TO_LOAD_IN_MEMORY: LazyLock<BTreeSet<TableName>> = LazyLock::new(|| {
     btreeset! {
         UDF_CONFIG_TABLE.clone(),
@@ -755,54 +708,3 @@ pub static FIRST_SEEN_INDEX: LazyLock<BTreeMap<IndexName, DatabaseVersion>> = La
         AUDIT_LOG_INDEX_BY_ACTION.name() => 128,
     }
 });
-
-#[cfg(test)]
-mod tests {
-    use value::TableName;
-
-    use super::{
-        parse_table_list,
-        APP_TABLES_TO_LOAD_IN_MEMORY,
-    };
-
-    #[test]
-    fn parse_table_list_handles_spacing_and_blanks() {
-        let tables = parse_table_list(" deviceLatestLocations , ,fleetConfig, ");
-        assert_eq!(
-            tables,
-            [
-                "deviceLatestLocations".parse::<TableName>().unwrap(),
-                "fleetConfig".parse::<TableName>().unwrap(),
-            ]
-            .into_iter()
-            .collect()
-        );
-    }
-
-    #[test]
-    fn parse_table_list_is_empty_when_unset() {
-        assert!(parse_table_list("").is_empty());
-        assert!(parse_table_list("  ").is_empty());
-    }
-
-    /// A typo should cost the operator that one table, not the backend's
-    /// ability to start.
-    #[test]
-    fn parse_table_list_skips_invalid_names() {
-        let tables = parse_table_list("device-locations,good");
-        assert_eq!(
-            tables,
-            ["good".parse::<TableName>().unwrap()].into_iter().collect()
-        );
-    }
-
-    #[test]
-    fn extra_tables_do_not_collide_with_the_system_set() {
-        // The union is taken over a `BTreeSet`, so naming a system table is a
-        // no-op rather than a double load.
-        let mut tables = APP_TABLES_TO_LOAD_IN_MEMORY.clone();
-        let before = tables.len();
-        tables.extend(parse_table_list("_modules"));
-        assert_eq!(tables.len(), before);
-    }
-}

@@ -98,16 +98,87 @@ impl SyncMode {
 pub static CHECK_CONFLICTS: LazyLock<bool> =
     LazyLock::new(|| env_config("ROCKSDB_CHECK_CONFLICTS", true));
 
+/// Fraction of the container's memory limit to give the block cache when
+/// `ROCKSDB_BLOCK_CACHE_BYTES` is not set, as a percentage.
+///
+/// Deliberately not half. The backend that hosts this crate also runs V8
+/// isolates, whose heaps are the other large consumer in the process, and
+/// RocksDB's own compaction buffers, iterators and WAL buffers sit outside the
+/// cache. A quarter leaves room for all of it; raise it on a deployment whose
+/// working set matters more than its isolate headroom.
+pub static BLOCK_CACHE_PERCENT: LazyLock<u64> =
+    LazyLock::new(|| env_config::<u64>("ROCKSDB_BLOCK_CACHE_PERCENT", 25).clamp(1, 90));
+
+/// Floor for the derived cache size. Below this RocksDB thrashes on its own
+/// index and filter blocks, and a cache that small is worse than useless.
+const MIN_DERIVED_CACHE_BYTES: usize = 64 << 20;
+
+/// Ceiling for the derived cache size. A very large host does not mean a very
+/// large cache is wanted by default; past this, set it explicitly.
+const MAX_DERIVED_CACHE_BYTES: usize = 4 << 30;
+
+/// Fallback when the process is not in a memory-limited cgroup and physical
+/// memory cannot be read either.
+const DEFAULT_CACHE_BYTES: usize = 512 << 20;
+
 /// Shared block cache across every column family, in bytes.
 ///
-/// This is the backend's memory budget, not just its read cache: memtable
-/// memory is charged against it too (see [`build`]), so cached data, index and
-/// filter blocks and unflushed writes all come out of this one number.
-/// Steady-state usage runs somewhat above it — compaction buffers, iterators
-/// and WAL buffers are outside the cache — so size it at roughly half the
-/// container's memory limit, not all of it.
-pub static BLOCK_CACHE_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("ROCKSDB_BLOCK_CACHE_BYTES", 512 << 20));
+/// This is the backend's RocksDB memory budget, not just its read cache:
+/// memtable memory is charged against it too (see [`build`]), so cached data,
+/// index and filter blocks and unflushed writes all come out of this one
+/// number. Steady-state usage runs somewhat above it, because compaction
+/// buffers, iterators and WAL buffers are outside the cache.
+///
+/// Unset, it is derived from the container's memory limit
+/// ([`crate::memory::container_limit_bytes`]) rather than from a constant,
+/// because RocksDB reads no cgroup limit and a fixed default that fits a
+/// generous host will get the backend OOM-killed on a small one.
+pub static BLOCK_CACHE_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    if let Some(explicit) = explicit_cache_bytes() {
+        tracing::info!(
+            "rocksdb block cache: {} MiB (ROCKSDB_BLOCK_CACHE_BYTES)",
+            explicit >> 20
+        );
+        return explicit;
+    }
+    match crate::memory::container_limit_bytes() {
+        Some(limit) => {
+            let derived = ((limit / 100) * *BLOCK_CACHE_PERCENT) as usize;
+            let clamped = derived.clamp(MIN_DERIVED_CACHE_BYTES, MAX_DERIVED_CACHE_BYTES);
+            tracing::info!(
+                "rocksdb block cache: {} MiB ({}% of a {} MiB memory limit)",
+                clamped >> 20,
+                *BLOCK_CACHE_PERCENT,
+                limit >> 20,
+            );
+            clamped
+        },
+        None => {
+            tracing::info!(
+                "rocksdb block cache: {} MiB (no memory limit found; set \
+                 ROCKSDB_BLOCK_CACHE_BYTES to size this deliberately)",
+                DEFAULT_CACHE_BYTES >> 20,
+            );
+            DEFAULT_CACHE_BYTES
+        },
+    }
+});
+
+/// `env_config` needs a default to compare against, which would make "unset"
+/// indistinguishable from "set to the default". The cache size has to tell
+/// those apart, so it is read directly.
+fn explicit_cache_bytes() -> Option<usize> {
+    match std::env::var("ROCKSDB_BLOCK_CACHE_BYTES") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(bytes) if bytes > 0 => Some(bytes),
+            _ => {
+                tracing::warn!("ignoring invalid ROCKSDB_BLOCK_CACHE_BYTES={raw:?}");
+                None
+            },
+        },
+        Err(_) => None,
+    }
+}
 
 /// Ceiling on memtable memory across every column family, in bytes.
 ///
@@ -138,6 +209,17 @@ pub static BLOB_THRESHOLD_BYTES: LazyLock<u64> =
 /// blocking thread is held.
 pub static SCAN_PAGE_ROWS: LazyLock<usize> =
     LazyLock::new(|| env_config::<usize>("ROCKSDB_SCAN_PAGE_ROWS", 1024).max(1));
+
+/// How often the periodic backup worker takes a generation. Only consulted
+/// when `ROCKSDB_BACKUP_DIR` is set.
+pub static BACKUP_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_BACKUP_INTERVAL_SECONDS", 3600).max(60))
+});
+
+/// Generations retained before `purge_old_backups`. Zero disables pruning,
+/// which grows without bound — a deliberate choice rather than a default.
+pub static BACKUP_KEEP: LazyLock<usize> =
+    LazyLock::new(|| env_config("ROCKSDB_BACKUP_KEEP", 24usize));
 
 /// How long `shutdown` waits for background compactions to settle.
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =

@@ -84,13 +84,17 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
 | `ROCKSDB_SYNC_INTERVAL_MS` | `0` (off) | flush and fsync the WAL on a timer instead of per write; overrides `ROCKSDB_SYNC_WRITES` |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
-| `ROCKSDB_BLOCK_CACHE_BYTES` | 512 MiB | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
+| `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
+| `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
 | `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
 | `ROCKSDB_MEMTABLE_BYTES` | 64 MiB | per-column-family memtable |
 | `ROCKSDB_BACKGROUND_JOBS` | cores | flush and compaction threads |
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
+| `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
+| `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
+| `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
 
 ### The three sync modes
 
@@ -133,10 +137,20 @@ durability domain it can roll back less than this one does, and the difference i
 lost writes rather than replayed ones. See
 [`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §2.
 
-RocksDB does not read cgroup limits, so in a container `ROCKSDB_BLOCK_CACHE_BYTES`
-is the setting that keeps the process inside its memory limit. Compaction buffers,
-iterators and WAL buffers live outside the cache, so size it at roughly half of
-what the container can spare rather than all of it.
+### Memory
+
+RocksDB reads no cgroup limit of its own, and an overrun kills the *backend* rather
+than a subprocess. So the cache is not left at a constant: unset, it is derived from
+the container's memory limit — cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`,
+walking up the hierarchy and taking the smallest limit that binds, capped at physical
+memory. `ROCKSDB_BLOCK_CACHE_PERCENT` (default 25) is the share taken, clamped to
+[64 MiB, 4 GiB]. The chosen size and where it came from are logged at startup.
+
+A quarter rather than a half because the backend hosting this crate also runs V8
+isolates, whose heaps are the other large consumer in the process, and RocksDB's
+compaction buffers, iterators and WAL buffers sit outside the cache. Raise it on a
+deployment whose working set matters more than its isolate headroom; set
+`ROCKSDB_BLOCK_CACHE_BYTES` to override the derivation entirely.
 
 ## Configuring a write-heavy deployment
 
@@ -149,7 +163,6 @@ usually wrong:
 | Knob | Default | Why it matters here |
 |---|--:|---|
 | `INDEX_CACHE_VERIFY_PERCENT` | 100 | At the default, every index-cache **hit** also performs the persistence read it was meant to avoid and compares the two pages. The cache cannot save a read until this is lowered. Worth 1.8–1.9× on read throughput; `1` keeps a sampled check running. |
-| `TABLES_TO_LOAD_IN_MEMORY` | *empty* | Comma-separated tables to pin in memory at startup, alongside the system tables Convex always pins. Reads against a pinned table's indexes never reach storage. Only the live row set is held, so memory tracks table size, not write volume — pin small, hot, bounded tables and nothing that grows with time. |
 | `UDF_EXECUTOR_OCC_INITIAL_BACKOFF_MS` | 100 | On an OCC conflict the whole mutation re-runs after this delay. For a mutation that takes single-digit milliseconds, the first backoff alone is an order of magnitude more than the work being retried, and two conflicts put one mutation past 300 ms before it has accomplished anything. |
 | `COMMITTER_MAX_WRITE_BATCH_DOCUMENTS` / `_BYTES` | 64 / 64 KiB | The committer combines independent commits into one `Persistence::write`. Larger batches amortise per-write overhead — which matters far more against a network database than against this one, but still helps. |
 
@@ -157,6 +170,51 @@ Measure before changing any of them: if OCC retries are not what your function l
 lowering the backoff buys nothing. The first two are measured on an ingest-shaped
 workload in [`docs/proposals/003-beyond-the-storage-layer.md`](../../docs/proposals/003-beyond-the-storage-layer.md),
 which also surveys what the ingest path still pays for above this trait.
+
+## Backups
+
+Set `ROCKSDB_BACKUP_DIR` and a worker takes a `BackupEngine` generation on
+`ROCKSDB_BACKUP_INTERVAL_SECONDS`, pruning to `ROCKSDB_BACKUP_KEEP`. Generations are
+incremental — unchanged SST files are shared, so the *n*th backup writes only what
+changed since *n-1* — and memtables are flushed first, so a backup never depends on
+replaying a WAL. With `atomic_flush` on, that flush is a consistent cut across every
+column family, so a backup can never hold an index entry whose document it missed.
+
+`rocksdb-backup`, a separate binary in this crate, is the operator side:
+
+```sh
+rocksdb-backup list     /convex/backup
+rocksdb-backup verify   /convex/backup [--id N]      # checksum the files
+rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
+rocksdb-backup restore  /convex/backup --to /convex/data/db
+```
+
+Separate because a restore rewrites a database directory and RocksDB holds that
+directory's lock while a database is open, so it cannot run inside the backend it is
+restoring for — it belongs in an init container or a one-shot job. `restore` refuses a
+non-empty target: move the old directory aside instead, so a live database is never
+written underneath and the current one stays recoverable.
+
+**`verify` is a checksum; `rehearse` is the test.** Verification says the files are
+present and the right size. Rehearsal restores into a scratch directory, opens the
+database and reads every column family, which is the thing an operator actually needs
+to know. Put `rehearse` on a schedule — a backup nobody has restored is not a backup.
+
+Backups are written to a local path; the crate binds no object-store `Env`, so
+replicating that directory off-node is an external job. A backup directory on the same
+volume as the database protects against a bad migration, not against losing the volume.
+
+Watch `rocksdb_backup_age_seconds`, published on every worker tick. Failures are events
+you can miss; age is a level you cannot, and a worker that has quietly stopped looks
+exactly like one that is working until you look at it.
+
+**There is no point-in-time recovery, and there cannot be at this layer.** Postgres
+reaches an arbitrary moment by replaying archived WAL onto a base backup; RocksDB
+recycles its WAL once the matching memtables flush, so there is nothing to archive. The
+recovery point is the last backup, narrowed by backing up more often, and — for data
+that came through it — by whatever an upstream log can replay.
+See [`docs/proposals/005-backup-and-restore.md`](../../docs/proposals/005-backup-and-restore.md)
+for the runbook and for what a database backup does not cover.
 
 ## Semantics that differ from the relational backends
 
@@ -213,19 +271,6 @@ once and only ever removed by retention, which cannot touch anything the
 validator has approved.
 
 ## Not implemented
-
-**Backup and point-in-time restore.** The durability story is the volume and
-nothing else, and a deployment adopting this backend needs an answer for data its
-upstream log cannot replay.
-
-The mechanisms exist and are already reachable from the `rocksdb` crate this
-depends on — `Checkpoint::create_checkpoint` for a hard-linked consistent
-snapshot on the same filesystem, and `BackupEngine` for incremental,
-cross-filesystem backups with their own restore, retention and verification. What
-is missing is the policy around them: where backups go, how often, how many are
-kept, and how a restore is driven against a directory a running pod owns. See
-[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §6,
-which also covers why SurrealDB's logical-export answer is not the one to copy.
 
 
 **Retention via compaction filter.** The largest remaining win, and deliberately

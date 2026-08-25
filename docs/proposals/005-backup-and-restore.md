@@ -1,6 +1,6 @@
 # The RocksDB backup and restore path
 
-**Status:** design and runbook — **not implemented.** No code in `rocksdb_persistence` calls either API yet, but the mechanism is verified: `backup_engine_round_trips_every_column_family_and_blob_files` in `src/tests.rs` backs up, destroys the database, restores, and checks all five column families and a blob-stored document.
+**Status:** **implemented.** `src/backup.rs` and the `rocksdb-backup` binary; §3's three pieces are built, §7's gaps are not. Tests cover the generation/retention/rehearsal/restore lifecycle, the refusal to restore over a populated directory, and a full destroy-and-restore across every column family including blob files.
 **Date:** 2026-08-25
 **Follows:** [004-rocksdb-in-kubernetes.md](./004-rocksdb-in-kubernetes.md) §6, which identifies this as the largest gap in adopting the backend
 **Scope:** the persistence layer only. See §6 for what this deliberately does not cover.
@@ -93,18 +93,17 @@ underlying storage is the minimum, and off-node replication is the actual answer
 
 ---
 
-## 3. What to implement
+## 3. What was implemented
 
-Three pieces, none large.
+Three pieces, none large. All of it lives in `crates/rocksdb_persistence`; no upstream
+Convex file is touched.
 
 **A. `RocksDbPersistence::backup(&self, dir: &Path, keep: usize)`.** Opens a
 `BackupEngine` against `dir`, calls `create_new_backup_flush(&self.inner.db, true)`, then
 `purge_old_backups(keep)`. It needs the live database handle, so it lives on the
-persistence object rather than in a standalone tool, and it runs on a blocking thread
-like every other RocksDB call in this crate.
+persistence object rather than in a standalone tool. A secondary instance refuses.
 
-**B. A background worker** that calls it on an interval, with knobs alongside the
-existing ones:
+**B. A background worker** that calls it on an interval, with these knobs:
 
 | Knob | Suggested default | Meaning |
 |---|--:|---|
@@ -117,12 +116,31 @@ unconfigured path is worse than one that does nothing. The worker should log eac
 backup's id, size and duration at info, and its failures at error — a backup system that
 fails quietly is the one failure mode worse than not having one.
 
-**C. A restore entry point.** `restore_from_latest_backup(db_dir, wal_dir)` and
-`restore_from_backup(db_dir, wal_dir, id)` must run with **no open database** — RocksDB
-holds a directory lock and the restore rewrites the directory underneath it. So this
-cannot be an endpoint on the running backend. It should be a subcommand on the binary
-(`convex-local-backend restore --from <dir> [--backup-id <n>] --to <path>`) that opens no
-database of its own, so it can run as an init container or a one-shot `Job`.
+**C. A restore entry point.** `restore_from_latest_backup` and `restore_from_backup` must
+run with **no open database** — RocksDB holds a directory lock and a restore rewrites the
+directory underneath it. So this cannot be an endpoint on the running backend. It is the
+`rocksdb-backup` binary, shipped from this crate rather than added as a subcommand to
+`convex-local-backend`, which keeps the upstream CLI untouched and makes it usable as an
+init container or a one-shot `Job`:
+
+```sh
+rocksdb-backup list     <backup-dir>
+rocksdb-backup verify   <backup-dir> [--id N]
+rocksdb-backup rehearse <backup-dir> --scratch <dir> [--id N]
+rocksdb-backup restore  <backup-dir> --to <db-dir> [--id N]
+```
+
+`restore` refuses a non-empty target directory. There is no reliable way to ask whether
+another process holds RocksDB's directory lock — the `LOCK` file exists either way, and
+the only way to find out is to take it, which is exactly what must not happen during a
+restore. Requiring an empty target sidesteps the question and rules out the worse
+mistake of writing into a live database.
+
+**D. The rehearsal, which §7 called the highest-value gap.** `rocksdb-backup rehearse`
+restores a generation into a scratch directory, opens it, and iterates every column
+family touching values as well as keys — so a blob-stored document body is a read that
+actually happens rather than one a key-only scan would skip. `verify` checksums files;
+this proves a database restored from them opens and can be read.
 
 ---
 
@@ -247,16 +265,14 @@ and the honest mitigation is that the ingest bus can replay the gap for the data
 came through it. For anything that did not — user-authored records, anything written by a
 mutation the bus did not drive — the recovery point really is the last backup.
 
-**A backup nobody has restored is not a backup.** The single highest-value thing missing
-from §3 is a scheduled restore rehearsal: take the latest backup, restore it into a
-scratch directory, open it, and assert it reads. Everything else in this document is
-theory until that runs on a cadence. `verify_backup` checks file sizes, not that the
-database opens — it is a checksum, not a rehearsal.
+**A backup nobody has restored is not a backup.** *Now built* — `rocksdb-backup rehearse`
+— but building the command is not the same as running it. It has to be on a schedule,
+and the schedule is still yours to create.
 
-**Nothing measures the backup's age.** A backup worker that dies silently looks exactly
-like one that is working. Production needs the age of the newest backup as a gauge and an
-alert when it exceeds the interval by some margin — the alert is the deliverable, not the
-metric.
+**Nothing measures the backup's age.** *Now published* as `rocksdb_backup_age_seconds`,
+on every worker tick whether the backup succeeded or not, because failures are events you
+can miss and age is a level you cannot. The alert on it is still the deliverable, and is
+still yours.
 
 **Backups are unencrypted.** RocksDB's backup files are the SSTs, in the clear. Whatever
 holds them off-node needs encryption at rest and access control at least as tight as the

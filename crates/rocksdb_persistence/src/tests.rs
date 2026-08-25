@@ -60,6 +60,7 @@ use value::{
 };
 
 use crate::{
+    backup,
     keys,
     options::SyncMode,
     RocksDbPersistence,
@@ -1151,6 +1152,121 @@ async fn backup_engine_round_trips_every_column_family_and_blob_files() -> anyho
         Some(serde_json::json!(4321)),
     );
     assert_eq!(reader.max_ts().await?, Some(ts(4321)));
+    Ok(())
+}
+
+/// The whole operator lifecycle in one pass: take generations, prune to a
+/// retention bound, rehearse a restore, and restore for real.
+#[tokio::test]
+async fn backup_lifecycle_generations_retention_rehearsal_and_restore() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+
+    let persistence = RocksDbPersistence::new(&db_path)?;
+    // Four generations, each adding a document, so a restore of generation N
+    // can be told apart from a restore of generation N+1.
+    for i in 1..=4u32 {
+        let id = doc_id(1, i);
+        let at = u64::from(i) * 10;
+        persistence
+            .write(
+                &[entry(1, i, at, &format!("v{i}"), None)?],
+                &[index_entry(1, format!("k{i}").as_bytes(), at, Some(id))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        // Keep 2, so the first two generations are pruned as the last two land.
+        let info = persistence.backup(&backup_dir, 2)?;
+        assert_eq!(info.backup_id, i, "generations are always-increasing");
+    }
+
+    let generations = backup::list(&backup_dir)?;
+    assert_eq!(
+        generations.iter().map(|g| g.backup_id).collect::<Vec<_>>(),
+        vec![3, 4],
+        "retention keeps the newest two and prunes the rest"
+    );
+
+    // A rehearsal proves the backup opens and reads, which verification alone
+    // does not.
+    let scratch = dir.path().join("scratch");
+    let rehearsed = backup::rehearse(&backup_dir, &scratch, None)?;
+    assert_eq!(rehearsed.backup_id, 4);
+    // Rehearsing again must work: the scratch directory is reused, not appended
+    // to, or the second run of a nightly job fails.
+    backup::rehearse(&backup_dir, &scratch, None)?;
+
+    // Restoring an *older* retained generation gives that generation's state,
+    // which is the whole point of keeping more than one.
+    persistence.shutdown().await?;
+    drop(persistence);
+    let restored_path = dir.path().join("restored");
+    backup::restore(&backup_dir, &restored_path, Some(3))?;
+
+    let restored = RocksDbPersistence::new(&restored_path)?;
+    let entries: Vec<_> = restored
+        .reader()
+        .load_documents(TimestampRange::all(), Order::Asc, 16, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(
+        entries.len(),
+        3,
+        "generation 3 held three documents, not the four that exist now"
+    );
+    Ok(())
+}
+
+/// Restoring over a directory that already holds data would write into a
+/// database that may be open, and destroys the only other copy. Refuse.
+#[tokio::test]
+async fn restore_refuses_a_non_empty_target() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&db_path)?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+        persistence.shutdown().await?;
+    }
+
+    let err = backup::restore(&backup_dir, &db_path, None)
+        .expect_err("restoring over a populated directory must fail");
+    assert!(
+        format!("{err}").contains("not empty"),
+        "the error should say why: {err}"
+    );
+    Ok(())
+}
+
+/// A secondary instance has no WAL and no business writing a backup; saying so
+/// beats producing a subtly incomplete one.
+#[tokio::test]
+async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let primary = RocksDbPersistence::new(&db_path)?;
+    primary
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    let secondary = RocksDbPersistence::new_secondary(&db_path, &dir.path().join("secondary"))?;
+    let err = secondary
+        .backup(&dir.path().join("backup"), 4)
+        .expect_err("a secondary must refuse");
+    assert!(format!("{err}").contains("secondary"), "{err}");
     Ok(())
 }
 

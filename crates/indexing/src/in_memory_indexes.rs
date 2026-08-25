@@ -174,16 +174,10 @@ impl BackendInMemoryIndexes {
             indexes_to_load
         );
         for (tablet_id, index_metadatas) in indexes_by_table {
-            let table_name = table_mapping.tablet_name(tablet_id)?;
             let (num_keys, total_bytes) = self
                 .load_enabled(tablet_id, index_metadatas, snapshot)
                 .await?;
-            // Logged at info because a pinned table is held in memory for the
-            // life of the process with no eviction, so its size is something an
-            // operator needs to be able to see.
-            tracing::info!(
-                "Loaded {table_name} into memory: {num_keys} keys, {total_bytes} bytes."
-            );
+            tracing::debug!("Loaded {num_keys} keys, {total_bytes} bytes.");
         }
         Ok(())
     }

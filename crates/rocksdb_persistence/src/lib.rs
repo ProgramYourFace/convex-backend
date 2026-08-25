@@ -100,8 +100,10 @@ use rocksdb::{
 };
 use serde_json::Value as JsonValue;
 
+pub mod backup;
 pub mod codec;
 pub mod keys;
+mod memory;
 mod metrics;
 pub mod options;
 mod reader;
@@ -144,6 +146,8 @@ pub(crate) struct Inner {
     /// Present only in [`options::SyncMode::Interval`]. Populated after the
     /// `Arc<Inner>` exists, because the thread needs a `Weak` back to it.
     wal_flusher: std::sync::OnceLock<wal_flush::WalFlusher>,
+    /// Present only when `ROCKSDB_BACKUP_DIR` is set. Same `Weak` reasoning.
+    backup_worker: std::sync::OnceLock<backup::BackupWorker>,
 }
 
 impl RocksDbPersistence {
@@ -198,6 +202,7 @@ impl RocksDbPersistence {
                 // A secondary instance never writes, so it has no WAL to flush.
                 sync: options::SyncMode::Every,
                 wal_flusher: std::sync::OnceLock::new(),
+                backup_worker: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -236,11 +241,17 @@ impl RocksDbPersistence {
             _write_buffer_manager: shared.write_buffer_manager,
             sync,
             wal_flusher: std::sync::OnceLock::new(),
+            backup_worker: std::sync::OnceLock::new(),
         });
 
         if let options::SyncMode::Interval(interval) = sync {
             let flusher = wal_flush::WalFlusher::spawn(Arc::downgrade(&inner), interval)?;
             let _ = inner.wal_flusher.set(flusher);
+        }
+
+        if let Some(config) = backup::BackupConfig::from_env() {
+            let worker = backup::BackupWorker::spawn(Arc::downgrade(&inner), config)?;
+            let _ = inner.backup_worker.set(worker);
         }
 
         Ok(Self { inner })
@@ -252,6 +263,33 @@ impl Inner {
         self.db
             .cf_handle(name)
             .ok_or_else(|| anyhow::anyhow!("missing column family {name}"))
+    }
+
+    /// Reads every column family end to end and returns the total row count.
+    ///
+    /// Exists for [`crate::backup::rehearse`]: opening a database only
+    /// exercises its manifest and column family descriptors, which is a much
+    /// weaker statement than "this restored database can be read". Iterating
+    /// forces the block cache, the SST readers and the blob files to actually
+    /// produce data.
+    pub(crate) fn scan_all_column_families(&self) -> anyhow::Result<usize> {
+        let mut rows = 0;
+        for name in keys::ALL_COLUMN_FAMILIES {
+            let cf = self.cf(name)?;
+            let mut iter = self.db.raw_iterator_cf(&cf);
+            iter.seek_to_first();
+            while iter.valid() {
+                // Touch the value, not just the key: a document body in a blob
+                // file is a separate read that a key-only scan would skip, and
+                // blob files are exactly the thing worth proving came back.
+                let _ = iter.value().map(<[u8]>::len);
+                rows += 1;
+                iter.next();
+            }
+            iter.status()
+                .with_context(|| format!("failed to scan column family {name}"))?;
+        }
+        Ok(rows)
     }
 
     /// Bring a secondary instance up to date with its primary. A no-op on the
@@ -626,6 +664,9 @@ impl Persistence for RocksDbPersistence {
             // Stop the interval flusher before touching the database, so a
             // timed flush cannot land in the middle of the close below. The
             // `flush_wal` that follows covers whatever it had not yet written.
+            if let Some(worker) = inner.backup_worker.get() {
+                worker.stop();
+            }
             if let Some(flusher) = inner.wal_flusher.get() {
                 flusher.stop();
             }

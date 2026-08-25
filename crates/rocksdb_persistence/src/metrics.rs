@@ -30,6 +30,38 @@ pub fn wal_flush_timer() -> StatusTimer {
 }
 
 register_convex_histogram!(
+    ROCKSDB_BACKUP_SECONDS,
+    "Time to create one backup generation",
+    &STATUS_LABEL
+);
+pub fn backup_timer() -> StatusTimer {
+    StatusTimer::new(&ROCKSDB_BACKUP_SECONDS)
+}
+
+register_convex_histogram!(ROCKSDB_BACKUP_BYTES, "Size of a backup generation");
+register_convex_histogram!(ROCKSDB_BACKUP_FILES_TOTAL, "Files in a backup generation");
+pub fn log_backup(size_bytes: u64, num_files: u32) {
+    log_distribution(&ROCKSDB_BACKUP_BYTES, size_bytes as f64);
+    log_distribution(&ROCKSDB_BACKUP_FILES_TOTAL, num_files as f64);
+}
+
+register_convex_counter!(ROCKSDB_BACKUP_FAILURES_TOTAL, "Backup attempts that failed");
+pub fn log_backup_failure() {
+    log_counter(&ROCKSDB_BACKUP_FAILURES_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    ROCKSDB_BACKUP_AGE_SECONDS,
+    "Age of the newest backup generation, published on every worker tick"
+);
+/// The metric to alert on. A worker that has stopped producing backups looks
+/// exactly like one that is working, unless something publishes how old the
+/// newest one is — failures are events you can miss, age is a level you cannot.
+pub fn log_backup_age(seconds: f64) {
+    log_distribution(&ROCKSDB_BACKUP_AGE_SECONDS, seconds);
+}
+
+register_convex_histogram!(
     ROCKSDB_CONFLICT_CHECK_SECONDS,
     "Time spent enforcing ConflictStrategy::Error before a write"
 );

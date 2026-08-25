@@ -8,6 +8,13 @@ license = "LicenseRef-FSL-1.1-Apache-2.0"
 [lib]
 doctest = false
 
+# Restore rewrites a database directory, and RocksDB holds that directory's lock
+# while a database is open, so a restore cannot run inside the backend it is
+# restoring for. Its own binary can run as an init container or a one-shot Job.
+[[bin]]
+name = "rocksdb-backup"
+path = "src/bin/rocksdb-backup.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

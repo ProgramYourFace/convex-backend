@@ -20,7 +20,7 @@ devices, 30 % RLE merges, RocksDB backend, 4-core VM):
 
 | | Area | Where | Effect | Status |
 |---|---|---|--:|---|
-| §1 | Hot bounded tables are read from disk when they could be pinned in memory | `model/src/lib.rs:654` | **+32 % events/s, 10× reads/s** | **implemented** |
+| §1 | Hot bounded tables are read from disk when they could be pinned in memory | `model/src/lib.rs:654` | **+32 % events/s, 10× reads/s** | measured, **not carried** — see §1 |
 | §2 | Every index-cache hit is *also* read from persistence and compared | `common/src/knobs.rs:1995` | **+11 % events/s, 1.8–1.9× reads/s** | config change, measured |
 | §3 | Retention reads the whole document log a second time | `database/src/retention.rs:666` | ~2× steady-state storage work | not attempted |
 | §4 | Index keys are computed twice for every row written | `write_log.rs:138` vs `committer.rs:962` | duplicate CPU per row | not attempted |
@@ -75,20 +75,19 @@ Which tables get this was a fixed list — `APP_TABLES_TO_LOAD_IN_MEMORY` in
 `crates/model/src/lib.rs:654`, thirteen system tables — passed once at startup to
 `Database::load_indexes_into_memory`, which accepts an arbitrary `BTreeSet<TableName>`.
 
-### What changed
+### Why this is not in the branch
 
-A new environment knob, `TABLES_TO_LOAD_IN_MEMORY`, is unioned into that set:
+A knob unioning extra table names into that set was built and measured, then **reverted**.
+It worked and the numbers below are real, but it is the one change here that edits
+`crates/model/src/lib.rs` — the file where Convex declares its system tables, and so the
+file in this set most likely to move underneath a rebase. Everything else in the branch
+is a new crate plus enum variants and their match arms.
 
-```sh
-TABLES_TO_LOAD_IN_MEMORY=deviceLatestLocations,fleetConfig
-```
-
-`tables_to_load_in_memory()` in `crates/model/src/lib.rs` returns the union; the single
-call site now uses it. That is the whole change on the Convex side — about thirty lines,
-additive, in a file whose surrounding list rarely moves. `crates/indexing` gains one
-line: the per-table load is logged at `info` with its name, key count and byte count,
-because a pinned table is held for the life of the process and an operator needs to see
-how big it is.
+The measurement survives without the fork change, because
+`Database::load_indexes_into_memory` is already public upstream: `persistence-bench
+--pin <tables>` calls it directly. So the option stays available and quantified, and the
+branch stays minimal. Reinstating it is ~30 additive lines if a deployment decides the
+trade is worth it.
 
 ### Why this is safe for the disk-scale constraint
 
@@ -139,7 +138,7 @@ Reads go up 10×, because they stop reaching storage. Writes go up 32 %, because
 - **Text and vector indexes are not pinned** — `load_enabled_for_tables` skips them
   deliberately.
 
-Try `--pin` in `persistence_bench` before setting it in a deployment:
+Measure it with `--pin`, which needs no fork change:
 
 ```sh
 persistence-bench --backends rocksdb --pin deviceLatestLocations

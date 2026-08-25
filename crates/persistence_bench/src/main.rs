@@ -87,6 +87,10 @@ struct Config {
     /// `TABLES_TO_LOAD_IN_MEMORY` pins them in a real deployment. Reads against
     /// a pinned table's indexes never reach persistence.
     pin: Vec<String>,
+    /// Take a RocksDB backup into this directory once the run finishes, so the
+    /// `rocksdb-backup` CLI has a realistic generation to restore and rehearse
+    /// against rather than a toy one.
+    backup: Option<PathBuf>,
     /// Connection URL for the `postgres` backend. Required to run it, since
     /// unlike the embedded backends the benchmark cannot create the server.
     pg_url: Option<String>,
@@ -103,6 +107,7 @@ impl Default for Config {
             devices: workload::DEFAULT_DEVICES,
             reads: 2_000,
             pin: Vec::new(),
+            backup: None,
             pg_url: std::env::var("PERSISTENCE_BENCH_PG_URL").ok(),
             dir: PathBuf::from("/tmp/persistence-bench"),
             backends: vec!["sqlite".to_string(), "rocksdb".to_string()],
@@ -345,6 +350,7 @@ fn parse_config() -> anyhow::Result<Config> {
                     .filter(|s| !s.is_empty())
                     .collect()
             },
+            "--backup" => cfg.backup = Some(PathBuf::from(value)),
             "--pg-url" => cfg.pg_url = Some(value),
             "--dir" => cfg.dir = PathBuf::from(value),
             "--backends" => cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect(),
@@ -435,6 +441,21 @@ fn main() -> anyhow::Result<()> {
             let started = Instant::now();
             let report = run_backend(rt.clone(), backend, persistence, disk, cfg_ref).await?;
             eprintln!("{:.1}s", started.elapsed().as_secs_f64());
+
+            // `run_backend` shut the database down and dropped it, so the
+            // directory lock is free and the path can be reopened to back up.
+            if let (Some(backup_dir), "rocksdb") = (&cfg_ref.backup, backend) {
+                let path = cfg_ref.dir.join("rocksdb");
+                let reopened = rocksdb_persistence::RocksDbPersistence::new(&path)?;
+                let info = reopened.backup(backup_dir, 8)?;
+                eprintln!(
+                    "  backup {} written to {}: {} files, {} MiB",
+                    info.backup_id,
+                    backup_dir.display(),
+                    info.num_files,
+                    info.size_bytes >> 20,
+                );
+            }
             reports.push(report);
         }
         anyhow::Ok(reports)
@@ -484,6 +505,7 @@ persistence-bench — compare persistence backends through the real Convex commi
   --pin a,b           tables to hold in memory, as TABLES_TO_LOAD_IN_MEMORY
                       does in a deployment        (default none)
   --backends a,b    subset of sqlite,rocksdb,postgres (default sqlite,rocksdb)
+  --backup DIR      after the run, back the rocksdb database up into DIR
   --pg-url URL      postgres connection URL, or PERSISTENCE_BENCH_PG_URL
   --dir PATH        scratch directory             (default /tmp/persistence-bench)
 
