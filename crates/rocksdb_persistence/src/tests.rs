@@ -62,7 +62,12 @@ use value::{
 use crate::{
     backup,
     keys,
-    options::SyncMode,
+    options::{
+        self,
+        DbTuning,
+        SyncMode,
+    },
+    OpenOptions,
     RocksDbPersistence,
 };
 
@@ -1577,5 +1582,180 @@ async fn empty_writes_are_accepted() -> anyhow::Result<()> {
     let f = Fixture::new()?;
     f.write(&[], &[]).await?;
     assert!(f.log(TimestampRange::all(), Order::Asc).await?.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Several databases in one process
+// ---------------------------------------------------------------------------
+
+/// N databases in one process must share ONE memory budget.
+///
+/// `BLOCK_CACHE_BYTES` is derived from the CONTAINER's memory limit, so it is a
+/// statement about the process. A cache per open would let N databases each
+/// claim that share and get the backend OOM-killed — the exact failure the
+/// derived sizing exists to prevent. This is the regression guard: two handles
+/// minted by separate `build` calls must be views of the same cache.
+#[tokio::test]
+async fn every_database_in_the_process_shares_one_block_cache() -> anyhow::Result<()> {
+    let before = options::build(true, SyncMode::Every);
+    let f = Fixture::new()?;
+    // Write and read enough to put blocks in the cache.
+    for i in 0..64u32 {
+        let at = u64::from(i) * 10;
+        f.write(
+            &[entry(1, i, at, &format!("v{i}"), None)?],
+            &[index_entry(
+                1,
+                format!("k{i:04}").as_bytes(),
+                at,
+                Some(doc_id(1, i)),
+            )],
+        )
+        .await?;
+    }
+    f.scan(1, 1, 1000, interval(b"", None), Order::Asc).await?;
+
+    let after = options::build(false, SyncMode::Every);
+    assert!(
+        before.cache.get_usage() > 0,
+        "reads should have populated the block cache"
+    );
+    assert_eq!(
+        before.cache.get_usage(),
+        after.cache.get_usage(),
+        "a cache minted before the database and one minted after must be the same cache; if this \
+         fails, every database in the process has its own copy of the container's whole memory \
+         budget"
+    );
+    Ok(())
+}
+
+/// Two databases in one process are two databases.
+///
+/// The property the whole multi-tenant host rests on: a tenant's state is its
+/// own directory and nothing else, so a write to one is invisible to the other
+/// at every level — the document log, the index and the globals.
+#[tokio::test]
+async fn two_databases_in_one_process_share_no_data() -> anyhow::Result<()> {
+    let a = Fixture::new()?;
+    let b = Fixture::new()?;
+
+    a.write(
+        &[entry(1, 1, 10, "only-in-a", None)?],
+        &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+    )
+    .await?;
+    a.persistence
+        .write_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp, "a".into())
+        .await?;
+
+    assert_eq!(a.log(TimestampRange::all(), Order::Asc).await?.len(), 1);
+    assert!(
+        b.log(TimestampRange::all(), Order::Asc).await?.is_empty(),
+        "a document written to one database must not appear in another"
+    );
+    assert!(
+        b.scan(1, 1, 100, interval(b"", None), Order::Asc)
+            .await?
+            .is_empty(),
+        "nor must its index entries"
+    );
+    assert_eq!(
+        b.reader()
+            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+            .await?,
+        None,
+        "nor its globals, which are the one genuinely process-shaped namespace"
+    );
+    Ok(())
+}
+
+/// Each database keeps its own backup chain.
+///
+/// `BackupEngine` numbers generations per DIRECTORY with no record of which
+/// database wrote them, so two databases pointed at one directory would
+/// interleave their chains and each one's pruning would delete the other's
+/// generations. `OpenOptions::backup_dir` is what keeps them apart.
+#[tokio::test]
+async fn each_database_backs_up_to_its_own_directory() -> anyhow::Result<()> {
+    let a = Fixture::new()?;
+    let b = Fixture::new()?;
+    let dir = tempfile::tempdir()?;
+    let a_backups = dir.path().join("a");
+    let b_backups = dir.path().join("b");
+
+    a.write(&[entry(1, 1, 10, "a", None)?], &[]).await?;
+    b.write(&[entry(1, 1, 10, "b", None)?], &[]).await?;
+    b.write(&[entry(1, 2, 20, "b2", None)?], &[]).await?;
+
+    a.persistence.backup(&a_backups, 8)?;
+    b.persistence.backup(&b_backups, 8)?;
+    b.persistence.backup(&b_backups, 8)?;
+
+    assert_eq!(backup::list(&a_backups)?.len(), 1);
+    assert_eq!(
+        backup::list(&b_backups)?.len(),
+        2,
+        "a busier tenant's generations must not be numbered against a quieter one's"
+    );
+
+    // And a restore of one yields that one's data, not the other's.
+    let restored = dir.path().join("restored");
+    backup::restore(&a_backups, &restored, None)?;
+    let reopened = RocksDbPersistence::new(&restored)?;
+    let log: Vec<_> = reopened
+        .reader()
+        .load_documents(
+            TimestampRange::all(),
+            Order::Asc,
+            100,
+            Arc::new(NoopRetentionValidator),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(log.len(), 1, "a's backup must restore a's database");
+    Ok(())
+}
+
+/// Per-database tuning is accepted and does not disturb the data path.
+///
+/// The values themselves are not observable through RocksDB's API — `Options`
+/// has no getters — so this asserts the reachable part: a database opened with
+/// a bounded descriptor budget and a small memtable still reads back what it
+/// wrote, which is what a mis-plumbed override would break.
+#[tokio::test]
+async fn a_database_opened_with_per_database_tuning_still_round_trips() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let persistence = RocksDbPersistence::open_with(
+        &dir.path().join("db"),
+        OpenOptions {
+            instance: Some("i-0068a1f3".to_owned()),
+            tuning: DbTuning {
+                max_open_files: Some(64),
+                memtable_bytes: Some(4 << 20),
+                background_jobs: Some(2),
+            },
+            ..OpenOptions::default()
+        },
+    )?;
+    persistence
+        .write(
+            &[entry(1, 1, 10, "tuned", None)?],
+            &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    let log: Vec<_> = persistence
+        .reader()
+        .load_documents(
+            TimestampRange::all(),
+            Order::Asc,
+            100,
+            Arc::new(NoopRetentionValidator),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(log.len(), 1);
     Ok(())
 }

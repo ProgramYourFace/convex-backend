@@ -339,7 +339,11 @@ mod tests {
             deployment_name: "i-0068a1f39c2b4d5e6f708192".to_owned(),
             destination: RequestDestination::ConvexCloud,
         };
-        let err = api.lookup(&host).unwrap_err();
+        // Matched rather than `unwrap_err`, which would need `Debug` on the Ok
+        // type — and `Application` does not implement it.
+        let Err(err) = api.lookup(&host) else {
+            panic!("an empty instance map must not resolve anything");
+        };
         // Must be a 404, not a 500: an unrouted request is a client-visible
         // "no such deployment", and the sync worker's reconnect logic depends
         // on the distinction.

@@ -367,13 +367,25 @@ mod tests {
             ]}"#,
         )
         .unwrap();
+        let status = |name: &str| {
+            roster
+                .instances
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name} was dropped"))
+                .status
+        };
         assert_eq!(roster.instances.len(), 3);
+        assert_eq!(status("a-one"), InstanceStatus::Provisioning);
+        assert_eq!(status("a-two"), InstanceStatus::Draining);
+        // An entry with no status at all is Ready, so a minimal roster file
+        // does not have to spell out the only state most instances are in.
+        assert_eq!(status("a-three"), InstanceStatus::Ready);
+        // ...and the canonical order is by name, not by input order.
         assert_eq!(
-            roster.instances[0].status,
-            InstanceStatus::Provisioning,
-            "sorted by name, so a-one is first"
+            roster.names().collect::<Vec<_>>(),
+            vec!["a-one", "a-three", "a-two"]
         );
-        assert_eq!(roster.instances[2].status, InstanceStatus::Ready);
     }
 
     #[test]
