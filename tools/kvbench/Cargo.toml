@@ -1,0 +1,21 @@
+[package]
+name = "kvbench"
+version = "0.1.0"
+edition = "2021"
+description = "Compares storage engines on convex-backend's Persistence read/write shapes"
+
+[features]
+default = []
+# RocksDB needs a C++ toolchain and libclang. Enable explicitly:
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo run --release --features rocksdb
+rocksdb = ["dep:rocksdb"]
+
+[dependencies]
+fjall = "3"
+redb = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
