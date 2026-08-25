@@ -82,7 +82,10 @@ use common::{
         PersistenceTableSize,
     },
     runtime::tokio_spawn_blocking,
-    types::Timestamp,
+    types::{
+        IndexId,
+        Timestamp,
+    },
     value::{
         InternalDocumentId,
         TabletId,
@@ -453,19 +456,34 @@ impl Persistence for RocksDbPersistence {
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
                 let idx = inner.cf(CF_IDX)?;
+
+                // Retention deletes every version of a key at or before a
+                // timestamp, and can name several expired versions of the same
+                // key in one call. Collapsing to the highest timestamp per key
+                // first keeps the returned count equal to the number of rows
+                // actually removed, which is what the relational backends
+                // report: their `DELETE ... WHERE a OR b` counts a row once
+                // however many clauses match it.
+                let mut highest_expired: BTreeMap<(IndexId, Vec<u8>), Timestamp> = BTreeMap::new();
+                for entry in entries {
+                    let mut full_key = entry.key_prefix;
+                    if let Some(suffix) = entry.key_suffix {
+                        full_key.extend_from_slice(&suffix);
+                    }
+                    highest_expired
+                        .entry((entry.index_id, full_key))
+                        .and_modify(|ts| *ts = (*ts).max(entry.ts))
+                        .or_insert(entry.ts);
+                }
+
                 let mut batch = WriteBatch::default();
                 let mut deleted = 0;
-                for entry in entries {
-                    // Retention deletes every version of a key at or before a
-                    // timestamp. Versions sort newest-first, so those are a
+                for ((index_id, full_key), ts) in highest_expired {
+                    // Versions sort newest-first, so the expired ones are a
                     // contiguous suffix of the key's run.
-                    let mut full_key = entry.key_prefix.clone();
-                    if let Some(suffix) = &entry.key_suffix {
-                        full_key.extend_from_slice(suffix);
-                    }
-                    let prefix = keys::idx_key_prefix(entry.index_id, &full_key);
+                    let prefix = keys::idx_key_prefix(index_id, &full_key);
                     let mut iter = inner.db.raw_iterator_cf(&idx);
-                    iter.seek(keys::idx_key(entry.index_id, &full_key, entry.ts));
+                    iter.seek(keys::idx_key(index_id, &full_key, ts));
                     while iter.valid() {
                         let Some(key) = iter.key() else { break };
                         if !key.starts_with(&prefix) {
@@ -494,9 +512,19 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
+                // Same collapse as `delete_index_entries`: one document can be
+                // named more than once, and each revision must count once.
+                let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
+                for (ts, id) in documents {
+                    highest_expired
+                        .entry(id)
+                        .and_modify(|existing| *existing = (*existing).max(ts))
+                        .or_insert(ts);
+                }
+
                 let mut batch = WriteBatch::default();
                 let mut deleted = 0;
-                for (ts, id) in documents {
+                for (id, ts) in highest_expired {
                     deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
                 }
                 inner.db.write_opt(batch, &inner.write_options())?;

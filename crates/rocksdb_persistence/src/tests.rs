@@ -734,6 +734,48 @@ async fn delete_index_entries_removes_versions_at_or_before_a_timestamp() -> any
     Ok(())
 }
 
+/// Retention hands over every expired version it found, so the same key can
+/// appear more than once in one call. The count must be rows removed, not
+/// clauses matched — which is what `DELETE ... WHERE a OR b` reports.
+#[tokio::test]
+async fn deleting_the_same_key_twice_counts_each_row_once() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    let id = doc_id(1, 1);
+    f.write(
+        &[
+            entry(1, 1, 10, "v1", None)?,
+            entry(1, 1, 20, "v2", Some(10))?,
+            entry(1, 1, 30, "v3", Some(20))?,
+        ],
+        &[
+            index_entry(1, b"k", 10, Some(id)),
+            index_entry(1, b"k", 20, Some(id)),
+            index_entry(1, b"k", 30, Some(id)),
+        ],
+    )
+    .await?;
+
+    // Both expired versions of `k` name the same two rows between them.
+    let expired: Vec<_> = f
+        .persistence
+        .load_index_chunk(None, 100)
+        .await?
+        .into_iter()
+        .filter(|e| e.ts <= ts(20))
+        .collect();
+    assert_eq!(expired.len(), 2);
+    assert_eq!(f.persistence.delete_index_entries(expired).await?, 2);
+
+    // Same for documents: two coordinates, three revisions, two removed.
+    let deleted = f
+        .persistence
+        .delete(vec![(ts(10), doc_id(1, 1)), (ts(20), doc_id(1, 1))])
+        .await?;
+    assert_eq!(deleted, 2);
+    assert_eq!(f.log(TimestampRange::all(), Order::Asc).await?.len(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn delete_tablet_documents_removes_whole_documents_in_chunks() -> anyhow::Result<()> {
     let f = Fixture::new()?;
