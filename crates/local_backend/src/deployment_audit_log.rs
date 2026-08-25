@@ -1,10 +1,8 @@
-use axum::{
-    extract::FromRef,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     http::{
         extract::{
+            FromMtState,
             Json,
             MtState,
             Query,
@@ -203,7 +201,7 @@ pub async fn list_audit_log_events(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(list_audit_log_events))

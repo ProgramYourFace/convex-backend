@@ -346,11 +346,21 @@ impl BackupConfig {
         if dir.is_empty() {
             return None;
         }
-        Some(Self {
-            dir: PathBuf::from(dir),
+        Some(Self::for_dir(PathBuf::from(dir)))
+    }
+
+    /// The same configuration for an explicitly chosen directory.
+    ///
+    /// A process that opens several databases has to name a directory per
+    /// database: generations are numbered per directory and carry no record of
+    /// which database wrote them, so sharing one would interleave two chains
+    /// and let each database's pruning delete the other's generations.
+    pub fn for_dir(dir: PathBuf) -> Self {
+        Self {
+            dir,
             interval: *options::BACKUP_INTERVAL,
             keep: *options::BACKUP_KEEP,
-        })
+        }
     }
 }
 
@@ -415,7 +425,7 @@ impl BackupWorker {
                             // not having one, so this also drives the age gauge
                             // below, which is what an alert should watch.
                             tracing::error!("rocksdb backup failed: {e:#}");
-                            metrics::log_backup_failure();
+                            metrics::log_backup_failure(&inner.instance);
                         },
                     }
                 }

@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    sync::Arc,
     time::Duration,
 };
 
@@ -282,12 +281,26 @@ struct PublicApiDoc;
 )]
 struct DashboardApiDoc;
 
-pub fn router(st: LocalAppState) -> Router {
-    let browser_routes = Router::new()
-        // Called by the browser (and optionally authenticated by a cookie or `Authorization`
-        // header). Passes version in the URL because websockets can't do it in header.
-        .route("/{client_version}/sync", get(sync));
-
+/// The backend's whole route table, generic over the router state.
+///
+/// Two bounds, and they are the entire multi-tenancy story for HTTP routing:
+///
+/// * `LocalAppState: FromMtState<S>` resolves the app from the REQUEST, which
+///   is what the ~90 legacy `/api/**` handlers extract. For `S = LocalAppState`
+///   the blanket `FromRef -> FromMtState` impl makes this the identity.
+/// * `RouterState: FromRef<S>` supplies the `ApplicationApi` the migrated
+///   routes (sync, the public API, file storage, HTTP actions) go through. That
+///   trait is already multi-tenant — every method takes `host:
+///   &ResolvedHostname` — so one dispatching implementation covers all of them
+///   and the state itself stays constant.
+///
+/// The single-tenant backend calls `router(local_app_state)` exactly as before.
+pub fn router<S>(st: S) -> Router
+where
+    LocalAppState: FromMtState<S>,
+    RouterState: FromRef<S>,
+    S: Clone + Send + Sync + 'static,
+{
     // routes are added by common_dashboard_routes below
     let (_, common_dashboard_openapi_spec) =
         OpenApiRouter::with_openapi(DashboardApiDoc::openapi())
@@ -383,6 +396,32 @@ pub fn router(st: LocalAppState) -> Router {
         .nest("/streaming_import", streaming_import_routes())
         .nest("/v1", platform_routes);
 
+    let version = SERVER_VERSION_STR.to_string();
+
+    Router::new()
+        .nest("/api", api_routes)
+        .merge(health_check_routes(version))
+        .layer(cors())
+        .with_state(st.clone())
+        .merge(migrated_routes(RouterState::from_ref(&st)))
+}
+
+/// The endpoints that go through the `ApplicationApi` trait rather than the
+/// app directly: the sync worker, the public API and file storage.
+///
+/// Built in its own function, deliberately NOT generic. These handlers extract
+/// `State<RouterState>`, which is satisfiable both by `RouterState` itself and
+/// by any state a `RouterState` can be taken from — and a `RouterState:
+/// FromRef<S>` bound in scope wins trait selection over the impls, so with a
+/// generic parameter around, every one of them would resolve to `S` instead.
+/// They do not need to: `ApplicationApi` is already the multi-tenant seam, so
+/// one state value serves every deployment and the concrete type is right.
+fn migrated_routes(st: RouterState) -> Router {
+    let browser_routes = Router::new()
+        // Called by the browser (and optionally authenticated by a cookie or `Authorization`
+        // header). Passes version in the URL because websockets can't do it in header.
+        .route("/{client_version}/sync", get(sync));
+
     // Endpoints migrated to use the RouterState trait instead of application.
     let (public_routes, public_openapi) = OpenApiRouter::with_openapi(PublicApiDoc::openapi())
         .merge(public_api_router())
@@ -401,27 +440,14 @@ pub fn router(st: LocalAppState) -> Router {
             }),
         )
         .nest("/storage", storage_api_routes());
-    let migrated = Router::new()
+    Router::new()
         .nest("/api", migrated_api_routes)
         .layer(cors())
         // Order matters. Layers only apply to routes above them.
         // Notably, any layers added here won't apply to common routes
         // added inside `serve_http`
         .nest("/http/", http_action_routes())
-        .with_state(RouterState {
-            api: Arc::new(st.application.clone()),
-            runtime: st.application.runtime(),
-            subscription_reconnect_rate_limiter: None,
-        });
-
-    let version = SERVER_VERSION_STR.to_string();
-
-    Router::new()
-        .nest("/api", api_routes)
-        .merge(health_check_routes(version))
-        .layer(cors())
         .with_state(st)
-        .merge(migrated)
 }
 
 pub fn public_api_routes<S>() -> Router<S>

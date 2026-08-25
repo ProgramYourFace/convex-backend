@@ -4,14 +4,12 @@ use ::usage_limits::{
     SeedStatus,
     UsageMeter,
 };
-use axum::{
-    extract::FromRef,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     execution_context::RequestMetadata,
     http::{
         extract::{
+            FromMtState,
             Json,
             MtState,
             Path,
@@ -494,7 +492,7 @@ fn validate_limit_above_current_usage(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

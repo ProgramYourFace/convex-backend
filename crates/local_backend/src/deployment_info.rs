@@ -1,10 +1,8 @@
-use axum::{
-    extract::FromRef,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     http::{
         extract::{
+            FromMtState,
             Json,
             MtState,
         },
@@ -93,7 +91,7 @@ pub async fn get_deployment_info(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(get_deployment_info))

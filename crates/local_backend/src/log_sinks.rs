@@ -8,13 +8,11 @@ use application::{
     log_streaming::LogSinkWithId,
     Application,
 };
-use axum::{
-    extract::FromRef,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     http::{
         extract::{
+            FromMtState,
             Json,
             MtState,
             Path,
@@ -1332,7 +1330,7 @@ pub async fn update_log_stream(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

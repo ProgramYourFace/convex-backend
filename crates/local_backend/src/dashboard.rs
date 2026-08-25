@@ -2,11 +2,7 @@ use application::{
     deploy_config::ModuleJson,
     valid_identifier::ValidIdentifier,
 };
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     components::ComponentId,
     http::{
@@ -294,9 +290,8 @@ pub struct RunTestFunctionArgs {
     request_body = RunTestFunctionArgs,
     responses((status = 200, body = serde_json::Value)),
 )]
-#[debug_handler]
 pub async fn run_test_function(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractRequestId(request_id): ExtractRequestId,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractClientVersion(client_version): ExtractClientVersion,
@@ -337,7 +332,16 @@ pub async fn run_test_function(
     Ok(Json(response))
 }
 
-pub fn local_only_dashboard_router() -> OpenApiRouter<crate::LocalAppState> {
+/// Generic over the router state for the same reason every other builder here
+/// is: a host serving several deployments from one router resolves the app from
+/// the request, not from the router state. Keeping this generic while it is
+/// empty means routes added to it later are automatically reachable there too,
+/// instead of silently going missing.
+pub fn local_only_dashboard_router<S>() -> OpenApiRouter<S>
+where
+    LocalAppState: FromMtState<S>,
+    S: Clone + Send + Sync + 'static,
+{
     OpenApiRouter::new()
 }
 

@@ -1,13 +1,8 @@
 use application::EnvVarChange;
-use axum::{
-    extract::{
-        FromRef,
-        State,
-    },
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::http::{
     extract::{
+        FromMtState,
         Json,
         MtState,
     },
@@ -86,7 +81,7 @@ pub struct UpdateEnvVarsRequest {
     ),
 )]
 pub async fn update_environment_variables(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(UpdateEnvVarsRequest { changes }): Json<UpdateEnvVarsRequest>,
@@ -164,7 +159,7 @@ fn validate_env_var(name: &String, value: &String) -> anyhow::Result<Environment
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(

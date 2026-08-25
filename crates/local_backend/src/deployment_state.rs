@@ -1,10 +1,10 @@
-use axum::{
-    extract::FromRef,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     http::{
-        extract::MtState,
+        extract::{
+            FromMtState,
+            MtState,
+        },
         ExtractRequestMetadata,
         HttpResponseError,
     },
@@ -124,7 +124,7 @@ pub async fn unpause_deployment(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new()

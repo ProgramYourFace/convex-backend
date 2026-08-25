@@ -1,12 +1,7 @@
-use axum::{
-    extract::{
-        FromRef,
-        State,
-    },
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::http::{
     extract::{
+        FromMtState,
         Json,
         MtState,
     },
@@ -65,7 +60,7 @@ pub struct UpdateCanonicalUrlRequest {
     ),
 )]
 pub async fn update_canonical_url(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(request): Json<UpdateCanonicalUrlRequest>,
@@ -174,7 +169,7 @@ pub async fn get_canonical_urls(
 
 pub fn platform_router<S>() -> OpenApiRouter<S>
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     OpenApiRouter::new().routes(utoipa_axum::routes!(

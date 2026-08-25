@@ -88,7 +88,8 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
 | `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
 | `ROCKSDB_MEMTABLE_BYTES` | 64 MiB | per-column-family memtable |
-| `ROCKSDB_BACKGROUND_JOBS` | cores | flush and compaction threads |
+| `ROCKSDB_BACKGROUND_JOBS` | cores | flush and compaction threads. A PROCESS budget, not a per-database one: RocksDB's default `Env` is a singleton whose pools are shared, and this grows them to the largest value any database asked for rather than to their sum |
+| `ROCKSDB_MAX_OPEN_FILES` | `-1` (unlimited) | table-file descriptors per database. Unlimited is right for one database and wrong for several — see *Several databases in one process* |
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
@@ -152,6 +153,47 @@ isolates, whose heaps are the other large consumer in the process, and RocksDB's
 compaction buffers, iterators and WAL buffers sit outside the cache. Raise it on a
 deployment whose working set matters more than its isolate headroom; set
 `ROCKSDB_BLOCK_CACHE_BYTES` to override the derivation entirely.
+
+## Several databases in one process
+
+Opening more than one database in a process — which
+`crates/multitenant_backend` does, one per tenant — changes what some of these
+knobs mean, because three of the resources they govern are per PROCESS and one is
+per directory.
+
+**Memory is shared, and has to be.** `ROCKSDB_BLOCK_CACHE_BYTES` is derived from
+the *container's* memory limit, so it is a statement about the process. The block
+cache and the write-buffer manager are therefore process-wide singletons: every
+database opened here shares one cache and one memtable budget. N databases each
+claiming a quarter of the container would oversubscribe memory by N and get the
+backend OOM-killed, which is exactly the failure the derived sizing exists to
+prevent. For the single database a single-tenant backend opens, sharing is
+indistinguishable from not sharing.
+
+**Descriptors, memtable shape and backups are per database, and the caller sets
+them.** `OpenOptions::tuning` (`options::DbTuning`) overrides three knobs per open,
+each defaulting to the environment:
+
+| field | why a multi-database process must set it |
+|---|---|
+| `max_open_files` | descriptors are a per-process resource; N unlimited databases race each other to `EMFILE` |
+| `memtable_bytes` | the shared write-buffer manager cannot overcommit, but at the single-tenant 64 MiB per family, N × 5 families all want the whole budget and the manager answers by force-flushing the largest memtable — a healthy bound turned into premature flushes |
+| `background_jobs` | rarely needed: the pools are already shared (above). Lower it only to cap how much of the pool one database may occupy at once |
+
+`OpenOptions::backup_dir` overrides `ROCKSDB_BACKUP_DIR` per database, and a
+multi-database process **must** set it. `BackupEngine` numbers generations per
+directory with no record of which database wrote them, so two databases pointed at
+one directory interleave their chains and each one's `purge_old_backups` deletes
+the other's.
+
+`OpenOptions::instance` labels this database's own gauges. Backup age, WAL-flush
+age and latched background errors are *levels*: N unlabelled databases publishing
+to one series would each overwrite the others, and it would report whichever wrote
+last. Rates and latencies stay unlabelled, because summing them across a process
+is what you want and a label per database would only add cardinality.
+
+Not shared, and worth budgeting for: each database runs its own health monitor
+thread, its own WAL flusher (in interval mode) and its own backup worker.
 
 ## Configuring a write-heavy deployment
 

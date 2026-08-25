@@ -1,0 +1,78 @@
+[package]
+name = "multitenant_backend"
+version = "0.1.0"
+authors = ["Convex, Inc. <no-reply@convex.dev>"]
+edition = "2024"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "convex-multitenant-backend"
+path = "src/main.rs"
+
+[features]
+testing = [
+    "common/testing",
+    "application/testing",
+    "clusters/testing",
+    "db_connection/testing",
+    "errors/testing",
+    "function_runner/testing",
+    "indexing/testing",
+    "keybroker/testing",
+    "local_backend/testing",
+    "metrics/testing",
+    "node_executor/testing",
+    "runtime/testing",
+    "search/testing",
+    "value/testing",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+application = { workspace = true }
+arc-swap = { workspace = true }
+async-broadcast = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+clusters = { workspace = true }
+cmd_util = { workspace = true }
+common = { workspace = true }
+db_connection = { workspace = true }
+errors = { workspace = true }
+file_storage = { workspace = true }
+function_runner = { workspace = true }
+futures = { workspace = true }
+headers = { workspace = true }
+http = { workspace = true }
+indexing = { workspace = true }
+keybroker = { workspace = true }
+libc = { workspace = true }
+local_backend = { workspace = true }
+metrics = { workspace = true }
+model = { workspace = true }
+node_executor = { workspace = true }
+reqwest = { workspace = true }
+rocksdb_persistence = { workspace = true }
+runtime = { workspace = true }
+search = { workspace = true }
+sentry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sync_types = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+udf = { workspace = true }
+value = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true, features = ["testing"] }
+errors = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

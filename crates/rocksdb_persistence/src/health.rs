@@ -73,6 +73,7 @@ impl HealthMonitor {
         db: Weak<Inner>,
         shutdown: ShutdownSignal,
         backup_dir: Option<PathBuf>,
+        instance: String,
     ) -> anyhow::Result<Self> {
         let stop = Arc::new(Signal {
             stopped: AtomicBool::new(false),
@@ -97,7 +98,7 @@ impl HealthMonitor {
                 let Some(inner) = db.upgrade() else {
                     break;
                 };
-                check(&inner, &shutdown, backup_dir.as_deref());
+                check(&inner, &shutdown, backup_dir.as_deref(), &instance);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?;
         Ok(Self {
@@ -129,11 +130,16 @@ impl Drop for HealthMonitor {
     }
 }
 
-fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path::Path>) {
+fn check(
+    inner: &Inner,
+    shutdown: &ShutdownSignal,
+    backup_dir: Option<&std::path::Path>,
+    instance: &str,
+) {
     if let Some(errors) = background_errors(inner)
         && errors > 0
     {
-        metrics::log_background_errors(errors);
+        metrics::log_background_errors(instance, errors);
         // Read-only is not a state to keep serving from: the deployment's
         // recovery path is a restart onto the same volume, or a restore, and
         // neither begins while the process pretends to be healthy.
@@ -148,7 +154,7 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
         && let Some(flusher) = inner.wal_flusher.get()
     {
         let since = flusher.since_last_success();
-        metrics::log_wal_flush_age(since.as_secs_f64());
+        metrics::log_wal_flush_age(instance, since.as_secs_f64());
         let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
         if since > budget {
             shutdown.signal(anyhow::anyhow!(
@@ -166,7 +172,7 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
         && let Ok(generations) = backup::list(dir)
         && let Some(newest) = generations.last()
     {
-        metrics::log_backup_age(backup::age_seconds(newest.timestamp));
+        metrics::log_backup_age(instance, backup::age_seconds(newest.timestamp));
     }
 }
 

@@ -131,6 +131,16 @@ use keys::{
 
 pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
 
+/// The gauge label for a database opened without an explicit instance name: the
+/// last component of its directory, which for a single-tenant backend is the
+/// data directory's own name and for anything else is at least unique within
+/// the process.
+fn default_instance_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadCheck {
@@ -141,10 +151,11 @@ pub struct ReadCheck {
 
 /// How to open a database.
 ///
-/// A struct rather than a run of positional flags because these are three
-/// unrelated decisions — durability, failure escalation, and whether this
-/// process is the one that owns the database's background work — and a
-/// `open(path, true, false, None)` at a call site says none of that.
+/// A struct rather than a run of positional flags because these are unrelated
+/// decisions — durability, failure escalation, whether this process owns the
+/// database's background work, and how this database shares the process with
+/// any others — and an `open(path, true, false, None)` at a call site says none
+/// of that.
 #[derive(Default)]
 pub struct OpenOptions {
     /// Durability mode. `None` takes it from the environment.
@@ -157,6 +168,26 @@ pub struct OpenOptions {
     /// as a restore rehearsal, which must not attach either to the production
     /// backup chain or to a shutdown signal.
     pub background: bool,
+    /// Which deployment this database belongs to, used to label the
+    /// per-database gauges (backup age, WAL flush age).
+    ///
+    /// Those gauges are levels, not rates, so N unlabelled databases in one
+    /// process would each overwrite the others and the series would report
+    /// whichever wrote last. `None` labels them with the directory name, which
+    /// is right for the one database a single-tenant backend opens.
+    pub instance: Option<String>,
+    /// Where the periodic backup worker writes, overriding
+    /// `ROCKSDB_BACKUP_DIR`.
+    ///
+    /// A process with several databases MUST set this per database:
+    /// `BackupEngine` generations are numbered per directory with no notion of
+    /// which database produced them, so two databases pointed at one directory
+    /// interleave their generations and each one's `purge_old_backups` deletes
+    /// the other's.
+    pub backup_dir: Option<PathBuf>,
+    /// Per-database RocksDB knobs. Defaults defer to the environment, which is
+    /// what a single-tenant backend wants; see [`options::DbTuning`].
+    pub tuning: options::DbTuning,
 }
 
 /// An embedded RocksDB [`Persistence`].
@@ -171,6 +202,8 @@ pub(crate) struct Inner {
     /// to be told to catch up before it can see recent writes.
     secondary: bool,
     path: PathBuf,
+    /// Label for this database's own gauges. See [`OpenOptions::instance`].
+    pub(crate) instance: String,
     /// Held for the lifetime of the database so the shared block cache and
     /// memtable budget outlive the column families that reference them.
     _cache: rocksdb::Cache,
@@ -250,6 +283,7 @@ impl RocksDbPersistence {
                 db,
                 newly_created: false,
                 secondary: true,
+                instance: default_instance_label(path),
                 path: path.to_path_buf(),
                 _cache: shared.cache,
                 _write_buffer_manager: shared.write_buffer_manager,
@@ -273,7 +307,7 @@ impl RocksDbPersistence {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
 
-        let shared = options::build(create_if_missing, sync);
+        let shared = options::build_with(create_if_missing, sync, opts.tuning);
         let cfs: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, options::column_family(name, &shared)))
@@ -292,6 +326,10 @@ impl RocksDbPersistence {
             db,
             newly_created,
             secondary: false,
+            instance: opts
+                .instance
+                .clone()
+                .unwrap_or_else(|| default_instance_label(path)),
             path: path.to_path_buf(),
             _cache: shared.cache,
             _write_buffer_manager: shared.write_buffer_manager,
@@ -315,7 +353,10 @@ impl RocksDbPersistence {
         // a scratch database into the production backup chain.
         let backup_config = opts
             .background
-            .then(backup::BackupConfig::from_env)
+            .then(|| match &opts.backup_dir {
+                Some(dir) => Some(backup::BackupConfig::for_dir(dir.clone())),
+                None => backup::BackupConfig::from_env(),
+            })
             .flatten();
         if let Some(config) = backup_config.clone() {
             let worker = backup::BackupWorker::spawn(Arc::downgrade(&inner), config)?;
@@ -329,6 +370,7 @@ impl RocksDbPersistence {
                 Arc::downgrade(&inner),
                 shutdown,
                 backup_config.map(|c| c.dir),
+                inner.instance.clone(),
             )?;
             let _ = inner.health.set(monitor);
         }

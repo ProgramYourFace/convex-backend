@@ -1,10 +1,6 @@
 use anyhow::Context;
 use application::deploy_config::ModuleJson;
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     bootstrap_model::{
         index::{
@@ -238,9 +234,8 @@ impl PrepareSchemaResponse {
     }
 }
 
-#[debug_handler]
 pub async fn prepare_schema(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(req): Json<PrepareSchemaArgs>,
 ) -> Result<Json<PrepareSchemaResponse>, HttpResponseError> {

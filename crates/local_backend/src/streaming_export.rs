@@ -458,7 +458,7 @@ pub async fn data_sync_cursor_from_deltas(
 /// Platform (OpenAPI-documented) routes for streaming export.
 pub fn platform_router<S>() -> utoipa_axum::router::OpenApiRouter<S>
 where
-    LocalAppState: axum::extract::FromRef<S>,
+    LocalAppState: common::http::extract::FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
     utoipa_axum::router::OpenApiRouter::new()

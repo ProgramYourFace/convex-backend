@@ -207,8 +207,25 @@ pub static MEMTABLE_BYTES: LazyLock<usize> =
     LazyLock::new(|| env_config("ROCKSDB_MEMTABLE_BYTES", 64 << 20));
 
 /// Background flush and compaction threads. Zero means available parallelism.
+///
+/// RocksDB's default `Env` is a process-wide singleton whose low- and
+/// high-priority thread pools are shared by every database opened against it,
+/// and `max_background_jobs` grows those pools to the largest value any
+/// database asked for rather than to their sum. So this is a PROCESS budget
+/// even when several databases are open, and a host running many databases does
+/// not need to divide it — see [`DbTuning::background_jobs`] for when it should
+/// anyway.
 pub static BACKGROUND_JOBS: LazyLock<i32> =
     LazyLock::new(|| env_config("ROCKSDB_BACKGROUND_JOBS", 0));
+
+/// Table-file descriptors a database may hold open. `-1`, the default, means
+/// unlimited, which is right for the one database a single-tenant backend opens
+/// and wrong for a process that opens many: file descriptors are a per-PROCESS
+/// resource, so N unlimited databases race each other to `EMFILE`. A host that
+/// opens several databases passes a bounded value per database through
+/// [`DbTuning::max_open_files`].
+pub static MAX_OPEN_FILES: LazyLock<i32> =
+    LazyLock::new(|| env_config("ROCKSDB_MAX_OPEN_FILES", -1));
 
 /// Documents at or above this many bytes are stored outside the LSM tree, in
 /// blob files, so that compacting the `dlog` column family does not rewrite
@@ -245,12 +262,93 @@ pub static HEALTH_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64)));
 
-fn background_jobs() -> i32 {
-    match *BACKGROUND_JOBS {
-        0 => std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4),
-        n => n,
+fn default_background_jobs() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+}
+
+/// The memory RocksDB is allowed to use, for the whole PROCESS.
+///
+/// [`BLOCK_CACHE_BYTES`] is derived from the container's memory limit, so it is
+/// a statement about the process, not about one database. A process that opens
+/// several databases — a host serving several tenants, each with its own store
+/// — must therefore give them ONE cache between them: N caches each sized at a
+/// quarter of the container would oversubscribe memory by N and get the backend
+/// OOM-killed, which is precisely the failure the derived sizing exists to
+/// prevent.
+///
+/// Both objects are refcounted handles in RocksDB; cloning them shares the
+/// underlying structure. For the single database a single-tenant backend opens,
+/// sharing is indistinguishable from not sharing.
+struct SharedMemory {
+    cache: Cache,
+    write_buffer_manager: WriteBufferManager,
+}
+
+/// The process's one block cache and one write-buffer manager.
+///
+/// Memtable memory is charged against the cache
+/// (`new_write_buffer_manager_with_cache`), so this single number bounds cached
+/// blocks AND unflushed writes across every database in the process.
+static SHARED_MEMORY: LazyLock<SharedMemory> = LazyLock::new(|| {
+    let cache = Cache::new_lru_cache(*BLOCK_CACHE_BYTES);
+    let write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
+        *WRITE_BUFFER_BYTES,
+        true,
+        cache.clone(),
+    );
+    SharedMemory {
+        cache,
+        write_buffer_manager,
+    }
+});
+
+/// Per-database knobs a process that opens several databases needs to set
+/// independently of the process-wide ones.
+///
+/// Every field is `None` by default and falls back to the corresponding
+/// environment knob, so a single-tenant backend behaves exactly as it did
+/// before this struct existed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DbTuning {
+    /// Overrides [`BACKGROUND_JOBS`]. The thread pools are shared process-wide
+    /// (see that knob), so the reason to lower this per database is not thread
+    /// count but *concurrency per store*: a value of N lets one database occupy
+    /// N of the shared threads at once, and leaving every database at the
+    /// host's full parallelism lets one compacting tenant monopolise the
+    /// pool.
+    pub background_jobs: Option<i32>,
+    /// Overrides [`MAX_OPEN_FILES`]. Descriptors are a process resource; a host
+    /// opening many databases must divide its `RLIMIT_NOFILE` between them
+    /// rather than let each one take what it likes.
+    pub max_open_files: Option<i32>,
+    /// Overrides [`MEMTABLE_BYTES`], the per-column-family memtable size.
+    ///
+    /// The shared write-buffer manager already bounds TOTAL memtable memory, so
+    /// this cannot overcommit; what it controls is the shape of that bound.
+    /// Left at the single-tenant default, N databases × 5 column families
+    /// all want 64 MiB and the manager answers by force-flushing whichever
+    /// memtable is largest, turning a healthy budget into a stream of
+    /// premature flushes. A host with many databases wants a smaller
+    /// per-family target.
+    pub memtable_bytes: Option<usize>,
+}
+
+impl DbTuning {
+    fn background_jobs(&self) -> i32 {
+        match self.background_jobs.unwrap_or(*BACKGROUND_JOBS) {
+            0 => default_background_jobs(),
+            n => n,
+        }
+    }
+
+    fn max_open_files(&self) -> i32 {
+        self.max_open_files.unwrap_or(*MAX_OPEN_FILES)
+    }
+
+    fn memtable_bytes(&self) -> usize {
+        self.memtable_bytes.unwrap_or(*MEMTABLE_BYTES)
     }
 }
 
@@ -258,20 +356,25 @@ fn background_jobs() -> i32 {
 pub struct RocksOptions {
     /// Database-wide options.
     pub db: Options,
-    /// Block cache shared by every column family.
+    /// Block cache shared by every column family — and, since
+    /// [`SHARED_MEMORY`], by every other database in this process.
     pub cache: Cache,
     /// Held so the manager outlives the column families that reference it.
     pub write_buffer_manager: WriteBufferManager,
+    /// Carried through to [`column_family`], which needs the memtable size.
+    tuning: DbTuning,
 }
 
 /// Build the database-wide options and the objects they reference.
 pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
-    let cache = Cache::new_lru_cache(*BLOCK_CACHE_BYTES);
-    let write_buffer_manager = WriteBufferManager::new_write_buffer_manager_with_cache(
-        *WRITE_BUFFER_BYTES,
-        true,
-        cache.clone(),
-    );
+    build_with(create_if_missing, sync, DbTuning::default())
+}
+
+/// [`build`], with per-database overrides for the knobs a multi-database
+/// process must set itself.
+pub fn build_with(create_if_missing: bool, sync: SyncMode, tuning: DbTuning) -> RocksOptions {
+    let cache = SHARED_MEMORY.cache.clone();
+    let write_buffer_manager = SHARED_MEMORY.write_buffer_manager.clone();
 
     let mut db = Options::default();
     db.create_if_missing(create_if_missing);
@@ -284,7 +387,7 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     // cut across all of them.
     db.set_atomic_flush(true);
 
-    db.set_max_background_jobs(background_jobs());
+    db.set_max_background_jobs(tuning.background_jobs());
     db.set_write_buffer_manager(&write_buffer_manager);
     // Smooth writeback rather than dumping whole files at the page cache.
     db.set_bytes_per_sync(1 << 20);
@@ -307,7 +410,7 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     }
     db.set_max_total_wal_size(1 << 30);
     db.set_keep_log_file_num(8);
-    db.set_max_open_files(-1);
+    db.set_max_open_files(tuning.max_open_files());
     // Recover as much of a torn tail as is consistent, then carry on. The
     // alternative, `AbsoluteConsistency`, refuses to open at all after an
     // unclean shutdown that left a partial record.
@@ -317,6 +420,7 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
         db,
         cache,
         write_buffer_manager,
+        tuning,
     }
 }
 
@@ -327,7 +431,7 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
 /// keys with empty or tiny values.
 pub fn column_family(name: &str, shared: &RocksOptions) -> Options {
     let mut opts = Options::default();
-    opts.set_write_buffer_size(*MEMTABLE_BYTES);
+    opts.set_write_buffer_size(shared.tuning.memtable_bytes());
     opts.set_max_write_buffer_number(3);
     opts.set_min_write_buffer_number_to_merge(1);
     opts.set_write_buffer_manager(&shared.write_buffer_manager);

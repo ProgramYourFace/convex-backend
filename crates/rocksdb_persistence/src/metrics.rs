@@ -1,15 +1,32 @@
 use metrics::{
     log_counter,
+    log_counter_with_labels,
     log_distribution,
-    log_gauge,
+    log_gauge_with_labels,
     register_convex_counter,
     register_convex_gauge,
     register_convex_histogram,
+    MetricLabel,
     StatusTimer,
     Timer,
     STATUS_LABEL,
 };
 use prometheus::VMHistogram;
+
+/// Labels the metrics that describe ONE database rather than the process.
+///
+/// Levels — the age of the newest backup, the age of the last WAL flush — are
+/// only meaningful per database: a process that opens several would otherwise
+/// have each one overwrite the others and the series would report whichever
+/// wrote last, which is the opposite of an alertable signal. Rates and
+/// latencies are left unlabelled, because summing them across the databases in
+/// a process is exactly what you want and a label per database only adds
+/// cardinality.
+const INSTANCE_LABEL: &str = "instance";
+
+fn instance_label(instance: &str) -> MetricLabel<'static> {
+    MetricLabel::new(INSTANCE_LABEL, instance.to_owned())
+}
 
 register_convex_histogram!(
     ROCKSDB_WRITE_SECONDS,
@@ -47,41 +64,64 @@ pub fn log_backup(size_bytes: u64, num_files: u32) {
     log_distribution(&ROCKSDB_BACKUP_FILES_TOTAL, num_files as f64);
 }
 
-register_convex_counter!(ROCKSDB_BACKUP_FAILURES_TOTAL, "Backup attempts that failed");
-pub fn log_backup_failure() {
-    log_counter(&ROCKSDB_BACKUP_FAILURES_TOTAL, 1);
+register_convex_counter!(
+    ROCKSDB_BACKUP_FAILURES_TOTAL,
+    "Backup attempts that failed",
+    &[INSTANCE_LABEL],
+);
+pub fn log_backup_failure(instance: &str) {
+    log_counter_with_labels(
+        &ROCKSDB_BACKUP_FAILURES_TOTAL,
+        1,
+        vec![instance_label(instance)],
+    );
 }
 
 register_convex_gauge!(
     ROCKSDB_BACKUP_AGE_SECONDS,
-    "Age of the newest backup generation"
+    "Age of the newest backup generation",
+    &[INSTANCE_LABEL],
 );
 /// The metric to alert on, and a gauge rather than a histogram: a level that
 /// keeps rising says "no backup has landed", where a distribution that stops
 /// receiving samples says nothing at all. Published by the health monitor on
 /// its own short timer rather than by the backup worker, so it keeps moving
 /// even if the backup worker is the thing that died.
-pub fn log_backup_age(seconds: f64) {
-    log_gauge(&ROCKSDB_BACKUP_AGE_SECONDS, seconds);
+pub fn log_backup_age(instance: &str, seconds: f64) {
+    log_gauge_with_labels(
+        &ROCKSDB_BACKUP_AGE_SECONDS,
+        seconds,
+        vec![instance_label(instance)],
+    );
 }
 
 register_convex_gauge!(
     ROCKSDB_WAL_FLUSH_AGE_SECONDS,
-    "Time since the write-ahead log was last successfully flushed, in interval sync mode"
+    "Time since the write-ahead log was last successfully flushed, in interval sync mode",
+    &[INSTANCE_LABEL],
 );
 /// In interval mode a write is acknowledged before it reaches the kernel, so
 /// this is the durability measurement: how much acknowledged data could be
 /// lost right now.
-pub fn log_wal_flush_age(seconds: f64) {
-    log_gauge(&ROCKSDB_WAL_FLUSH_AGE_SECONDS, seconds);
+pub fn log_wal_flush_age(instance: &str, seconds: f64) {
+    log_gauge_with_labels(
+        &ROCKSDB_WAL_FLUSH_AGE_SECONDS,
+        seconds,
+        vec![instance_label(instance)],
+    );
 }
 
 register_convex_counter!(
     ROCKSDB_BACKGROUND_ERRORS_TOTAL,
-    "Latched RocksDB background errors, which stop the database accepting writes"
+    "Latched RocksDB background errors, which stop the database accepting writes",
+    &[INSTANCE_LABEL],
 );
-pub fn log_background_errors(count: u64) {
-    log_counter(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count);
+pub fn log_background_errors(instance: &str, count: u64) {
+    log_counter_with_labels(
+        &ROCKSDB_BACKGROUND_ERRORS_TOTAL,
+        count,
+        vec![instance_label(instance)],
+    );
 }
 
 register_convex_histogram!(

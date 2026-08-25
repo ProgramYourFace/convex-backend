@@ -104,6 +104,7 @@ use crate::{
         FunctionRunnerCore,
         HttpActionMetadata,
         RunRequestArgs,
+        UnboundStorage,
     },
     FunctionFinalTransaction,
     FunctionWrites,
@@ -122,12 +123,49 @@ pub struct InProcessFunctionRunner<RT: Runtime> {
     // and ApplicationFunctionRunner.
     action_callbacks: Arc<RwLock<Option<Weak<dyn ActionCallbacks>>>>,
     fetch_client: Arc<dyn FetchClient>,
-    _concurrency_logger: Box<dyn SpawnHandle>,
+    // `None` when the isolate pool is shared with other runners in this process:
+    // whoever built the shared core owns the logger task, and dropping this
+    // runner must not cancel it.
+    _concurrency_logger: Option<Box<dyn SpawnHandle>>,
 }
 
 // We gather prometheus stats every 30 seconds, so we should make sure we log
 // active permits more frequently than that.
 const ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY: Duration = Duration::from_secs(10);
+
+/// Builds the half of an [`InProcessFunctionRunner`] that is worth sharing
+/// between the deployments hosted in one process: the V8 isolate pool plus the
+/// in-memory index, module and code caches.
+///
+/// The returned core is not bound to any deployment's storage; call
+/// [`FunctionRunnerCore::with_storage`] once per deployment and hand the result
+/// to [`InProcessFunctionRunner::new_with_core`]. The returned [`SpawnHandle`]
+/// is the concurrency logger and must be kept alive for as long as any runner
+/// built from the core — dropping it cancels the logging task.
+///
+/// `max_percent_per_client` bounds the share of the isolate pool any single
+/// deployment may occupy (see `SharedIsolateScheduler`). A single-tenant caller
+/// passes 100; a host running several deployments passes a smaller value so one
+/// noisy deployment cannot starve its neighbours.
+pub fn new_shared_core<RT: Runtime>(
+    rt: RT,
+    max_percent_per_client: usize,
+) -> anyhow::Result<(FunctionRunnerCore<RT, UnboundStorage>, Box<dyn SpawnHandle>)> {
+    let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
+        ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
+    } else {
+        ConcurrencyLimiter::unlimited()
+    };
+    let concurrency_logger = rt.spawn(
+        "concurrency_logger",
+        concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
+    );
+    let isolate_config = IsolateConfig::new("funrun", concurrency_limiter);
+    let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
+    let server =
+        FunctionRunnerCore::new(rt, UnboundStorage, max_percent_per_client, isolate_worker)?;
+    Ok((server, concurrency_logger))
+}
 
 impl<RT: Runtime> InProcessFunctionRunner<RT> {
     pub fn new(
@@ -141,20 +179,84 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         fetch_client: Arc<dyn FetchClient>,
     ) -> anyhow::Result<Self> {
         // InProcessFunctionRunner is single tenant and thus can use the full capacity.
-        let max_percent_per_client = 100;
-        let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
-            ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
-        } else {
-            ConcurrencyLimiter::unlimited()
-        };
-        let concurrency_logger = rt.spawn(
-            "concurrency_logger",
-            concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
-        );
-        let isolate_config = IsolateConfig::new("funrun", concurrency_limiter);
-        let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
-        let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
-        Ok(Self {
+        Self::new_with_capacity(
+            deployment,
+            keybroker,
+            convex_origin,
+            rt,
+            persistence_reader,
+            storage,
+            database,
+            fetch_client,
+            100,
+        )
+    }
+
+    /// Like [`InProcessFunctionRunner::new`], but bounds the share of the
+    /// (privately owned) isolate pool this runner may occupy.
+    pub fn new_with_capacity(
+        deployment: DeploymentMetadata,
+        keybroker: FunctionRunnerKeyBroker,
+        convex_origin: ConvexOrigin,
+        rt: RT,
+        persistence_reader: Arc<dyn PersistenceReader>,
+        storage: DeploymentStorage,
+        database: Database<RT>,
+        fetch_client: Arc<dyn FetchClient>,
+        max_percent_per_client: usize,
+    ) -> anyhow::Result<Self> {
+        let (core, concurrency_logger) = new_shared_core(rt, max_percent_per_client)?;
+        Ok(Self::build(
+            core.with_storage(storage),
+            deployment,
+            keybroker,
+            convex_origin,
+            persistence_reader,
+            database,
+            fetch_client,
+            Some(concurrency_logger),
+        ))
+    }
+
+    /// Builds a runner over an isolate pool and cache set shared with the other
+    /// runners in this process. See [`new_shared_core`].
+    ///
+    /// Tenant isolation does not depend on the pool being private: every
+    /// request carries `client_id == deployment.name`, the isolate worker
+    /// recreates its V8 isolate whenever `client_id` changes, and the module
+    /// and code cache keys fold in the deployment name.
+    pub fn new_with_core(
+        core: FunctionRunnerCore<RT, DeploymentStorage>,
+        deployment: DeploymentMetadata,
+        keybroker: FunctionRunnerKeyBroker,
+        convex_origin: ConvexOrigin,
+        persistence_reader: Arc<dyn PersistenceReader>,
+        database: Database<RT>,
+        fetch_client: Arc<dyn FetchClient>,
+    ) -> Self {
+        Self::build(
+            core,
+            deployment,
+            keybroker,
+            convex_origin,
+            persistence_reader,
+            database,
+            fetch_client,
+            None,
+        )
+    }
+
+    fn build(
+        server: FunctionRunnerCore<RT, DeploymentStorage>,
+        deployment: DeploymentMetadata,
+        keybroker: FunctionRunnerKeyBroker,
+        convex_origin: ConvexOrigin,
+        persistence_reader: Arc<dyn PersistenceReader>,
+        database: Database<RT>,
+        fetch_client: Arc<dyn FetchClient>,
+        concurrency_logger: Option<Box<dyn SpawnHandle>>,
+    ) -> Self {
+        Self {
             server,
             persistence_reader,
             deployment,
@@ -164,7 +266,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
             action_callbacks: Arc::new(RwLock::new(None)),
             fetch_client,
             _concurrency_logger: concurrency_logger,
-        })
+        }
     }
 
     async fn run_http_action(

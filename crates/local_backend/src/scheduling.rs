@@ -1,9 +1,5 @@
 use anyhow::Context;
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     components::{
         CanonicalizedComponentFunctionPath,
@@ -62,9 +58,8 @@ pub struct CancelAllJobsRequest {
     pub end_next_ts: Option<u64>,
 }
 
-#[debug_handler]
 pub async fn cancel_all_jobs(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(CancelAllJobsRequest {
@@ -129,9 +124,8 @@ pub struct CancelJobRequest {
     pub component_id: Option<String>,
 }
 
-#[debug_handler]
 pub async fn cancel_job(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(cancel_job_request): Json<CancelJobRequest>,

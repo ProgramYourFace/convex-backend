@@ -10,11 +10,7 @@ use application::deploy_config::{
     StartPushRequest,
     StartPushResponse,
 };
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     auth::{
         AuthInfo,
@@ -198,9 +194,8 @@ pub struct AnalyzedComponent {
     modules: BTreeMap<String, SerializedAnalyzedModule>,
 }
 
-#[debug_handler]
 pub async fn start_push(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     Json(req): Json<StartPushRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let _identity = must_be_admin_from_key(
@@ -358,9 +353,8 @@ pub async fn report_push_completed(
     Ok(spans)
 }
 
-#[debug_handler]
 pub async fn report_push_completed_handler(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     Json(req): Json<ReportPushCompletedRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let spans = report_push_completed(st, req).await?;

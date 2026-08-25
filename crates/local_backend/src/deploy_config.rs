@@ -8,11 +8,7 @@ use application::{
     },
     Application,
 };
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     components::ComponentId,
     execution_context::RequestMetadata,
@@ -257,9 +253,8 @@ pub async fn get_config_hashes(
     }))
 }
 
-#[debug_handler]
 pub async fn push_config(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(req): Json<ConfigJson>,
 ) -> Result<impl IntoResponse, HttpResponseError> {

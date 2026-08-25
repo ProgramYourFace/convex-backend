@@ -123,6 +123,7 @@ keybroker = { path = "crates/keybroker" }
 levenshtein_automata = "0.2.1"
 libc = "0.2"
 libsodium-sys-stable = { version = "1.22.2", features = [ "minimal" ] }
+local_backend = { path = "crates/local_backend" }
 log_interleaver = { path = "crates/log_interleaver" }
 log_streaming = { path = "crates/log_streaming" }
 lru = "0.18.0"
@@ -138,6 +139,7 @@ model = { path = "crates/model" }
 moka = { version = "0.12", features = [ "future", "sync" ] }
 multer = "3.1.0"
 must-let = { git = "https://github.com/sujayakar/must-let", rev = "5b487d78db235e396e61dd03ce261ced0eafff9d" }
+multitenant_backend = { path = "crates/multitenant_backend" }
 mysql = { path = "crates/mysql" }
 mysql_async = { git = "https://github.com/get-convex/mysql_async", rev = "deac775566d62246248a48fd3df58d6b5c03b729", default-features = false, features = [ "default-rustls" ] }
 native-tls = { version = "0.2", features = [ "alpn", "vendored" ] }

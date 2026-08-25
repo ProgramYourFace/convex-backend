@@ -182,6 +182,35 @@ impl<RT: Runtime> StorageForDeployment<RT> for DeploymentStorage {
     }
 }
 
+/// A [`StorageForDeployment`] that is not bound to any deployment.
+///
+/// A [`FunctionRunnerCore`] owns the expensive, process-wide half of a function
+/// runner — the V8 `IsolateClient` and the in-memory index, module and code
+/// caches — but is also parameterized by one deployment's storage. A process
+/// that hosts several deployments wants the former shared and the latter per
+/// deployment, so it builds one core over `UnboundStorage` and calls
+/// [`FunctionRunnerCore::with_storage`] once per deployment to get a handle
+/// onto the same pool and caches bound to that deployment's storage.
+///
+/// An unbound core must never run a function; the accessor fails closed rather
+/// than silently resolving to some other deployment's storage.
+#[derive(Clone, Debug)]
+pub struct UnboundStorage;
+
+#[async_trait]
+impl<RT: Runtime> StorageForDeployment<RT> for UnboundStorage {
+    async fn storage_for_deployment(
+        &self,
+        _transaction: &mut Transaction<RT>,
+        use_case: StorageUseCase,
+    ) -> anyhow::Result<Arc<dyn Storage>> {
+        anyhow::bail!(
+            "function runner storage is unbound and cannot serve {use_case}; call \
+             `FunctionRunnerCore::with_storage` before running functions"
+        )
+    }
+}
+
 pub struct FunctionRunnerCore<RT: Runtime, S: StorageForDeployment<RT>> {
     rt: RT,
     storage: S,
@@ -250,6 +279,27 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             code_cache,
             isolate_client,
         })
+    }
+
+    /// Returns a core that shares this core's isolate pool and its in-memory
+    /// index, module and code caches, but resolves storage through `storage`.
+    ///
+    /// This is the multi-deployment seam. The caches are already keyed by
+    /// deployment name and the isolate pool is already keyed by
+    /// `client_id == deployment name`, so sharing them across deployments is
+    /// safe; `S` is the one piece that is genuinely per deployment.
+    pub fn with_storage<S2: StorageForDeployment<RT>>(
+        &self,
+        storage: S2,
+    ) -> FunctionRunnerCore<RT, S2> {
+        FunctionRunnerCore {
+            rt: self.rt.clone(),
+            storage,
+            index_cache: self.index_cache.clone(),
+            module_cache: self.module_cache.clone(),
+            code_cache: self.code_cache.clone(),
+            isolate_client: self.isolate_client.clone(),
+        }
     }
 
     pub fn active_isolate_workers(&self) -> usize {

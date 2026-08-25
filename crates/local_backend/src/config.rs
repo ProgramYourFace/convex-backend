@@ -45,7 +45,7 @@ pub struct LocalConfig {
 
     /// Host port to bind for Convex HTTP Actions
     #[clap(long, default_value = "3211")]
-    site_proxy_port: u16,
+    pub site_proxy_port: u16,
 
     /// Origin of the Convex server, as accessible from the client.
     /// e.g. if the client is running on localhost, you can use the default of
@@ -56,7 +56,7 @@ pub struct LocalConfig {
     /// Note the port in this url (usually 443, the https default) need not
     /// match the bind port `--port`.
     #[clap(long, requires = "convex_site")]
-    convex_origin: Option<ConvexOrigin>,
+    pub convex_origin: Option<ConvexOrigin>,
 
     /// Origin of the Convex HTTP Actions, as accessible from the client.
     /// e.g. if the client is running on localhost, you can use the default of
@@ -70,7 +70,7 @@ pub struct LocalConfig {
     /// value from `--convex-origin` with a "/http" suffix, like
     /// https://api.my-app.com/http .
     #[clap(long, requires = "convex_origin")]
-    convex_site: Option<ConvexSite>,
+    pub convex_site: Option<ConvexSite>,
 
     /// Optional proxy for Actions fetches
     ///
@@ -95,7 +95,7 @@ pub struct LocalConfig {
 
     /// Which directory should file storage use
     #[clap(long, group = "storage", default_value = "convex_local_storage")]
-    local_storage: String,
+    pub local_storage: String,
 
     /// Use S3 storage instead of local storage.
     #[clap(long, group = "storage")]
