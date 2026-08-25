@@ -210,8 +210,10 @@ repeated rehearsals still work. A backup directory also records which database o
 and refuses a second one, since interleaved generations mean retention prunes the wrong
 ones and a restore returns whichever wrote last.
 
-**`verify` is a checksum; `rehearse` is the test.** Verification says the files are
-present and the right size. Rehearsal restores into a scratch directory, opens the
+**`verify` checks sizes; `rehearse` is the test.** RocksDB's `VerifyBackup` defaults to
+size-and-presence rather than checksums, and the binding exposes no way to change that, so
+verification catches a truncated or missing file — the common destination failure — and
+not a corrupted one. Rehearsal restores into a scratch directory, opens the
 database, and **decodes** every document and index entry it finds — not just iterating,
 which would pass on bytes that no longer parse. It fails on an empty result, because a
 backup of an empty database restores and scans perfectly and is exactly the false pass a
@@ -235,7 +237,9 @@ replicating that directory off-node is an external job. A backup directory on th
 volume as the database protects against a bad migration, not against losing the volume.
 
 Watch `rocksdb_backup_age_seconds`. It is a gauge, published by the health monitor on its
-own short timer rather than by the backup worker — a level that keeps rising says "no
+own short timer rather than by the backup worker, and emitted from process start rather
+than from the first generation — a deployment whose backups have never worked is the case
+most worth alerting on, and waiting for a first backup would leave the series absent — a level that keeps rising says "no
 backup has landed", where a distribution that stops receiving samples says nothing at
 all, and the case worth catching is precisely the one where the backup worker is the
 thing that died.
@@ -273,8 +277,9 @@ on any of:
 - **a write-ahead log whose flushes are failing** in interval mode, ten intervals running.
   In that mode a write is acknowledged before it reaches the kernel, so persistent flush
   failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
-  Escalation counts *failures*, not elapsed time, so one slow fsync on a contended volume
-  cannot take the process down.
+  Escalation needs consecutive *failures*, not just elapsed time, so one slow fsync on a
+  contended volume cannot take the process down — with a much longer deadline on top, so a
+  flusher that dies without ever returning an error is still caught.
 
 It also publishes `rocksdb_oldest_write_seconds` and `rocksdb_wal_flush_age_seconds`.
 
@@ -285,9 +290,11 @@ one-line "it's just a KV store".
 
 **Uniqueness is detected, not enforced.** `ConflictStrategy::Error` costs nothing in a
 B-tree, which gets it from a primary key *inside the transaction*; an LSM silently
-shadows an existing key instead. It is checked here with one batched, bloom-filtered
-point get per row written — but before the batch, not inside it, so two concurrent
-writes naming the same key can both probe clean and both apply. That is weaker than
+shadows an existing key instead. It is checked here with one batched point get per row
+written — but before the batch, not inside it, so two concurrent writes naming the same
+key can both probe clean and both apply. Nor is it free: document keys are
+bloom-filtered, but `idx` deliberately carries no filter (its reads are range scans), so
+every index entry written costs a filterless negative lookup. That is weaker than
 Postgres. It holds on the path that matters for a reason outside this crate: commits are
 serialized through one committer assigning strictly increasing timestamps, so no two can
 name the same `(ts, id)`. On the commit path that check is redundant — commit timestamps strictly
@@ -306,8 +313,10 @@ simpler and stronger than an advisory row, but it has consequences:
 - There is no failover through a shared database and no read replica. Recovery is
   restore-from-backup plus the WAL, not promote-a-follower.
 - A standalone reader (`connect_persistence_reader`) opens a RocksDB *secondary*
-  instance beside the primary, which reads its files without taking the write
-  lock and catches up on demand.
+  instance beside the primary, which reads its files without taking the write lock and
+  catches up on demand. It reads without an engine snapshot, because RocksDB rejects one
+  on a secondary; that costs nothing, since a secondary's view only advances when it is
+  told to catch up, which happens once at the start of a page and never during one.
 
 ## Durability and recovery
 

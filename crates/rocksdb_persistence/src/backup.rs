@@ -207,13 +207,19 @@ fn info_of(engine: &BackupEngine) -> Vec<BackupInfo> {
 /// Lists the generations in a backup directory. Safe to call while the database
 /// that produced them is running.
 pub fn list(dir: &Path) -> anyhow::Result<Vec<BackupInfo>> {
+    // Deliberately not `create_dir_all`: `list /typo` should say the directory
+    // does not exist, not create it and report an empty chain.
+    anyhow::ensure!(dir.exists(), "no backup directory at {}", dir.display());
     Ok(info_of(&open_locked_engine(dir)?.engine))
 }
 
 /// Checks that a generation's files are present and the size RocksDB expects.
 ///
-/// This is a checksum, not a rehearsal: it says the files are intact, not that
-/// a database restored from them opens. Use [`rehearse`] for that.
+/// **Not a checksum.** The C API's `VerifyBackup` defaults
+/// `verify_with_checksum` to false and the binding exposes no way to turn it
+/// on, so this compares existence and byte length only. Bit rot on the
+/// destination, or a filesystem that padded rather than truncated, passes.
+/// [`rehearse`] is the check that reads the bytes back.
 pub fn verify(dir: &Path, backup_id: u32) -> anyhow::Result<()> {
     open_locked_engine(dir)?
         .engine
@@ -256,14 +262,28 @@ fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Re
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
     let opts = RestoreOptions::default();
-    match backup_id {
+    let result = match backup_id {
         Some(id) => engine
             .restore_from_backup(db_dir, db_dir, &opts, id)
             .with_context(|| format!("failed to restore backup {id}")),
         None => engine
             .restore_from_latest_backup(db_dir, db_dir, &opts)
             .context("failed to restore the latest backup"),
+    };
+    if result.is_err() {
+        // A restore that failed part-way — disk full, killed — leaves a
+        // populated directory, which the emptiness precondition would then
+        // refuse on the retry, wedging the operator at the worst moment.
+        // Clearing it is safe: it was empty before this call, so nothing here
+        // predates the attempt.
+        if let Err(e) = std::fs::remove_dir_all(db_dir) {
+            tracing::warn!(
+                "could not clear {} after a failed restore: {e}. Remove it before retrying.",
+                db_dir.display(),
+            );
+        }
     }
+    result
 }
 
 /// Restores a generation into a scratch directory and opens it.
@@ -368,8 +388,16 @@ impl RocksDbPersistence {
 fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<BackupInfo> {
     anyhow::ensure!(!inner.secondary, "a secondary instance cannot take backups");
     let timer = metrics::backup_timer();
+    // Ownership first, before a read-write engine is opened: opening one can
+    // run RocksDB's own garbage collection over a directory that turns out to
+    // belong to a different database.
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create backup directory {}", dir.display()))?;
+    let identity = inner.identity()?;
+    let _claim_lock = DirLock::acquire(dir)?;
+    claim_directory(dir, &identity)?;
+    drop(_claim_lock);
     let mut locked = open_locked_engine(dir)?;
-    claim_directory(dir, &inner.identity())?;
     let engine = &mut locked.engine;
     if let Err(e) = engine.create_new_backup_flush(&inner.db, true) {
         timer.finish_developer_error();
@@ -383,6 +411,11 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
     // `Ok` says RocksDB wrote the files; it does not say the destination kept
     // them. Pruning on the strength of an unverified generation is how the last
     // known-good ones age out behind a silently bad new one.
+    //
+    // This is a weaker gate than it looks: `verify_backup` checks sizes, not
+    // checksums (see `verify`). It catches a truncated or missing file, which
+    // is the common destination failure, and not a corrupted one. A scheduled
+    // `rehearse` is what covers the rest.
     if let Err(e) = engine.verify_backup(latest.backup_id) {
         timer.finish_developer_error();
         return Err(anyhow::Error::from(e).context(format!(
@@ -493,7 +526,18 @@ impl BackupWorker {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        let _ = signal.wake.wait_timeout(guard, config.interval);
+                        // Re-checked under the mutex: waiting without a
+                        // predicate lets a `stop()` that lands before this
+                        // thread parks be missed entirely, and the thread then
+                        // sleeps out a full backup interval — an hour by
+                        // default — with `stop()` blocked in `join`.
+                        let (guard, _) = signal
+                            .wake
+                            .wait_timeout_while(guard, config.interval, |_| {
+                                !signal.stopped.load(Ordering::Relaxed)
+                            })
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        drop(guard);
                     }
                     if signal.stopped.load(Ordering::Relaxed) {
                         break;
@@ -542,7 +586,17 @@ impl BackupWorker {
 
     /// Stop the thread and wait for it. Idempotent.
     pub(crate) fn stop(&self) {
-        self.stop.stopped.store(true, Ordering::Relaxed);
+        {
+            // Set under the same mutex the waiter re-checks the flag beneath,
+            // so the notification cannot be issued into the gap before it
+            // parks.
+            let guard = match self.stop.lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.stop.stopped.store(true, Ordering::Relaxed);
+            drop(guard);
+        }
         self.stop.wake.notify_all();
         let handle = match self.handle.lock() {
             Ok(mut guard) => guard.take(),

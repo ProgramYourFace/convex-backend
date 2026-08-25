@@ -86,7 +86,19 @@ impl WalFlusher {
                             // no state to be inconsistent, so carry on.
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        let _ = signal.wake.wait_timeout(guard, interval);
+                        // The flag is re-checked *under* the mutex. Waiting
+                        // without a predicate leaves a window where `stop()`
+                        // sets it and notifies before this thread parks, the
+                        // notification lands on nobody, and the thread sleeps
+                        // out the whole interval — up to an hour for the backup
+                        // worker — with `stop()` blocked in `join` behind it.
+                        let (guard, _) = signal
+                            .wake
+                            .wait_timeout_while(guard, interval, |_| {
+                                !signal.stopped.load(Ordering::Relaxed)
+                            })
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        drop(guard);
                     }
                     if signal.stopped.load(Ordering::Relaxed) {
                         break;
@@ -142,7 +154,17 @@ impl WalFlusher {
     /// flush cannot race the close, and `Drop` calls it again for the paths
     /// that never reach `shutdown`.
     pub(crate) fn stop(&self) {
-        self.stop.stopped.store(true, Ordering::Relaxed);
+        {
+            // Set under the same mutex the waiter re-checks the flag beneath,
+            // so the notification cannot be issued into the gap before it
+            // parks.
+            let guard = match self.stop.lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.stop.stopped.store(true, Ordering::Relaxed);
+            drop(guard);
+        }
         self.stop.wake.notify_all();
         let handle = match self.handle.lock() {
             Ok(mut guard) => guard.take(),

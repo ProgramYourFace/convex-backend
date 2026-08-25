@@ -131,6 +131,10 @@ use keys::{
 
 pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
 
+/// Key under which a database's backup identity lives in the `globals` column
+/// family. Namespaced away from every `PersistenceGlobalKey`.
+const IDENTITY_KEY: &[u8] = b"__convex_rocksdb_backup_identity";
+
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadCheck {
@@ -435,14 +439,45 @@ impl Inner {
     /// A stable name for this database, for tying a backup directory to the
     /// database that produced it.
     ///
-    /// RocksDB maintains a `DB ID` in its `IDENTITY` file, generated at
-    /// creation and preserved across a backup and restore — which is exactly
-    /// the property wanted here, since a restored database should still
-    /// recognise its own backup chain.
-    pub(crate) fn identity(&self) -> String {
-        std::fs::read_to_string(self.path.join("IDENTITY"))
+    /// Stored in the `globals` column family rather than taken from RocksDB's
+    /// `IDENTITY` file, because `IDENTITY` is **not** among the files a backup
+    /// captures: `GetLiveFilesStorageInfo` never lists it, so a restored
+    /// database mints a fresh UUID on its first open. Using it would lock a
+    /// restored database out of its own backup chain — every backup failing
+    /// from the moment of recovery onward, which is exactly when a deployment
+    /// can least afford to stop taking them. A key in `globals` is copied with
+    /// the rest of the data and comes back unchanged.
+    ///
+    /// The key is namespaced so it cannot collide with a
+    /// `PersistenceGlobalKey`, and Convex only ever reads globals by known
+    /// key, so it stays invisible above the trait.
+    pub(crate) fn identity(&self) -> anyhow::Result<String> {
+        let globals = self.cf(CF_GLOBALS)?;
+        if let Some(bytes) = self.db.get_cf(&globals, IDENTITY_KEY)? {
+            return Ok(String::from_utf8(bytes)?);
+        }
+        // First call on this database: mint one and keep it. Derived from the
+        // engine's own id when it has one, so two databases created in the same
+        // instant cannot collide.
+        let minted = std::fs::read_to_string(self.path.join("IDENTITY"))
             .map(|id| id.trim().to_string())
-            .unwrap_or_else(|_| format!("path:{}", self.path.display()))
+            .unwrap_or_else(|_| format!("path:{}", self.path.display()));
+        self.db.put_cf(&globals, IDENTITY_KEY, minted.as_bytes())?;
+        Ok(minted)
+    }
+
+    /// A snapshot to read a whole page against, or `None` on a secondary.
+    ///
+    /// RocksDB rejects `ReadOptions::snapshot` on a secondary instance outright
+    /// — `NewErrorIterator(Status::NotSupported("snapshot not supported in
+    /// secondary mode"))` — so passing one turns every paged read into an
+    /// error. Nothing is lost by omitting it there: a secondary's view of the
+    /// primary's files only advances when `try_catch_up_with_primary` is
+    /// called, which [`Inner::refresh`] does once at the start of a page and
+    /// never during one. The view is therefore already frozen for the page's
+    /// duration, which is the property the snapshot buys on a primary.
+    pub(crate) fn read_snapshot(&self) -> Option<rocksdb::SnapshotWithThreadMode<'_, Db>> {
+        (!self.secondary).then(|| self.db.snapshot())
     }
 
     /// Bring a secondary instance up to date with its primary. A no-op on the
@@ -651,6 +686,7 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
+            let _guard = inner.write_watch.begin();
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
@@ -679,6 +715,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
+                let _guard = inner.write_watch.begin();
                 let idx = inner.cf(CF_IDX)?;
 
                 // Retention deletes every version of a key at or before a
@@ -736,6 +773,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
+                let _guard = inner.write_watch.begin();
                 // Same collapse as `delete_index_entries`: one document can be
                 // named more than once, and each revision must count once.
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
@@ -767,6 +805,7 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
+            let _guard = inner.write_watch.begin();
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
 
@@ -808,6 +847,11 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
+            let _guard = inner.write_watch.begin();
+            // `atomic_flush` routes any single-family flush through
+            // `AtomicFlushMemTables` over all of them, so the first call does
+            // the work and the rest are near-no-ops. Kept as a loop only
+            // because the binding exposes no multi-family flush.
             for name in ALL_COLUMN_FAMILIES {
                 inner.db.flush_cf(&inner.cf(name)?)?;
             }

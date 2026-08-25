@@ -1647,6 +1647,166 @@ async fn a_backup_directory_belongs_to_one_database() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A key whose newest version at the read timestamp is a tombstone advances the
+/// scan without producing a row, so a page bounded only by rows could walk an
+/// entire index in one blocking call. The budget that prevents that must still
+/// resume correctly — stopping early with an empty page and no cursor would
+/// report a scan as finished when it was not.
+#[tokio::test]
+async fn index_scan_over_many_tombstones_makes_progress_and_resumes() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    // 400 keys, every one deleted at ts 20, then one live key past them all.
+    for i in 0..400u32 {
+        let key = format!("k{i:04}");
+        f.persistence
+            .write(
+                &[entry(1, i, 10, "v", None)?],
+                &[index_entry(1, key.as_bytes(), 10, Some(doc_id(1, i)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        f.persistence
+            .write(
+                &[],
+                &[index_entry(1, key.as_bytes(), 20, None)],
+                ConflictStrategy::Error,
+            )
+            .await?;
+    }
+    f.persistence
+        .write(
+            &[entry(1, 9999, 10, "live", None)?],
+            &[index_entry(1, b"zzzz", 10, Some(doc_id(1, 9999)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    // One row requested, so the budget is small — the scan must still reach the
+    // live key past 400 tombstones rather than reporting an empty result.
+    let rows: Vec<_> = f
+        .persistence
+        .reader()
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(20),
+            &interval(b"", None),
+            Order::Asc,
+            1,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the live key past the tombstones must be found"
+    );
+    assert_eq!(rows[0].0 .0, b"zzzz".to_vec());
+    Ok(())
+}
+
+/// A secondary instance is the only way to read a database another process has
+/// open, and RocksDB rejects `ReadOptions::snapshot` on one outright. Every
+/// paged read has to work through it, which nothing checked before.
+#[tokio::test]
+async fn a_secondary_instance_can_actually_read() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    let primary = RocksDbPersistence::new(&path)?;
+    let id = doc_id(1, 1);
+    primary
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(id))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    let secondary = RocksDbPersistence::new_secondary(&path, &dir.path().join("secondary"))?;
+    let reader = secondary.reader();
+
+    let documents: Vec<_> = reader
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(
+        documents.len(),
+        1,
+        "load_documents must work on a secondary"
+    );
+
+    let from_table: Vec<_> = reader
+        .load_documents_from_table(tablet(1), TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(from_table.len(), 1, "load_documents_from_table must work");
+
+    let rows: Vec<_> = reader
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(10),
+            &interval(b"", None),
+            Order::Asc,
+            8,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(rows.len(), 1, "index_scan must work on a secondary");
+
+    let previous = reader
+        .previous_revisions(BTreeSet::from([(id, ts(10))]), validator())
+        .await?;
+    assert!(previous.is_empty(), "no earlier revision exists");
+
+    assert_eq!(reader.max_ts().await?, Some(ts(10)));
+    Ok(())
+}
+
+/// A restored database has to be able to keep backing up into the chain it came
+/// from. RocksDB's own `IDENTITY` is not carried by a backup, so anything keyed
+/// on it locks the restored database out at exactly the moment it is
+/// recovering.
+#[tokio::test]
+async fn a_restored_database_can_continue_its_backup_chain() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    {
+        let original = RocksDbPersistence::new(&dir.path().join("original"))?;
+        original
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        original.backup(&backup_dir, 8)?;
+        original.shutdown().await?;
+    }
+
+    let restored_path = dir.path().join("restored");
+    backup::restore(&backup_dir, &restored_path, None)?;
+    let restored = RocksDbPersistence::new(&restored_path)?;
+    restored
+        .write(
+            &[entry(1, 2, 20, "v2", None)?],
+            &[index_entry(1, b"k2", 20, Some(doc_id(1, 2)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    // The whole point: this must not be refused as "a different database".
+    restored.backup(&backup_dir, 8)?;
+    assert_eq!(
+        backup::list(&backup_dir)?.len(),
+        2,
+        "the restored database must extend its own chain"
+    );
+    Ok(())
+}
+
 /// The environment resolves to exactly one mode, and an explicit interval wins
 /// over `ROCKSDB_SYNC_WRITES` rather than the two silently fighting.
 #[test]

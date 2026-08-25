@@ -108,13 +108,26 @@ struct IndexPage {
 /// its own version run. Failing loudly beats buffering without bound.
 const MAX_INDEX_ENTRY_GROUP: usize = 65_536;
 
+/// How many index keys one page may examine per row it is asked to produce.
+///
+/// Tombstoned keys advance the iterator without producing a row, so without a
+/// ceiling a page over a mass-deleted table is a scan of the whole index on one
+/// blocking thread. Generous enough that ordinary tombstone density never
+/// truncates a page early; the cursor makes an early return correct anyway.
+const KEYS_PER_ROW_BUDGET: usize = 64;
+
 /// `ReadOptions` pinned to `snapshot`, for resolving document bodies at the
 /// same point in time the scan's iterator is walking.
+///
+/// `None` — a secondary instance, which RocksDB does not let take snapshots —
+/// yields plain options. See [`crate::Inner::read_snapshot`].
 fn snapshot_read_opts(
-    snapshot: &rocksdb::SnapshotWithThreadMode<'_, crate::Db>,
+    snapshot: Option<&rocksdb::SnapshotWithThreadMode<'_, crate::Db>>,
 ) -> rocksdb::ReadOptions {
     let mut opts = rocksdb::ReadOptions::default();
-    opts.set_snapshot(snapshot);
+    if let Some(snapshot) = snapshot {
+        opts.set_snapshot(snapshot);
+    }
     opts
 }
 
@@ -155,9 +168,8 @@ impl Inner {
         // walks, and the bodies resolved for them afterwards. See
         // `multi_get_documents` for what reading them at two different points
         // in time does.
-        let snapshot = self.db.snapshot();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_snapshot(&snapshot);
+        let snapshot = self.read_snapshot();
+        let mut read_opts = snapshot_read_opts(snapshot.as_ref());
         read_opts.set_iterate_lower_bound(lower.clone());
         read_opts.set_iterate_upper_bound(upper);
         let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
@@ -220,7 +232,8 @@ impl Inner {
         let entries = if tablet_id.is_none() {
             inline
         } else {
-            let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
+            let bodies =
+                multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
             coordinates
                 .iter()
                 .map(|(ts, id)| {
@@ -272,9 +285,8 @@ impl Inner {
 
         // One snapshot for the index walk and the body resolution that follows
         // it — see `multi_get_documents`.
-        let snapshot = self.db.snapshot();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_snapshot(&snapshot);
+        let snapshot = self.read_snapshot();
+        let mut read_opts = snapshot_read_opts(snapshot.as_ref());
         read_opts.set_iterate_lower_bound(lower.clone());
         if !upper.is_empty() {
             read_opts.set_iterate_upper_bound(upper.clone());
@@ -293,8 +305,20 @@ impl Inner {
         let mut resolved: Vec<(IndexKeyBytes, Timestamp, InternalDocumentId)> =
             Vec::with_capacity(limit);
         let mut last_prefix = None;
-        while iter.valid() && resolved.len() < limit {
+        // Bounded by keys *examined* as well as rows produced. A key whose
+        // newest version at `read_timestamp` is a tombstone advances the
+        // iterator without producing a row, so a limit on rows alone lets one
+        // page walk an entire index — a table that has just been mass-deleted
+        // is exactly that shape. That would hold a blocking thread for the
+        // length of the whole scan and skip the retention validator for all of
+        // it. The relational backends batch on rows fetched, deletes included.
+        let mut examined = 0;
+        while iter.valid()
+            && resolved.len() < limit
+            && examined < limit.saturating_mul(KEYS_PER_ROW_BUDGET)
+        {
             let Some(key) = iter.key() else { break };
+            examined += 1;
             anyhow::ensure!(
                 key.len() > keys::TS_LEN,
                 "malformed index key of {} bytes",
@@ -339,7 +363,8 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = resolved.iter().map(|(_, ts, id)| (*ts, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut rows = Vec::with_capacity(resolved.len());
         for (index_key, ts, document_id) in resolved {
             let (value, prev_ts) = bodies.get(&(ts, document_id)).cloned().ok_or_else(|| {
@@ -351,11 +376,12 @@ impl Inner {
             rows.push((index_key, LatestDocument { ts, value, prev_ts }));
         }
 
-        let cursor = if rows.len() < limit {
-            None
-        } else {
-            last_prefix
-        };
+        // Whether to resume is "did the iterator run out", not "did the page
+        // fill". Those coincided while rows were the only bound; with the
+        // examined-key budget above, a page can stop early with room to spare,
+        // and reporting `None` there would tell the caller the scan was
+        // finished when it was not.
+        let cursor = iter.valid().then_some(last_prefix).flatten();
         Ok(IndexPage { rows, cursor })
     }
 
@@ -475,10 +501,10 @@ impl Inner {
         self.refresh()?;
         let docs = self.cf(CF_DOCS)?;
         // One snapshot across the revision walk and the body resolution below.
-        let snapshot = self.db.snapshot();
+        let snapshot = self.read_snapshot();
         let mut iter = self
             .db
-            .raw_iterator_cf_opt(&docs, snapshot_read_opts(&snapshot));
+            .raw_iterator_cf_opt(&docs, snapshot_read_opts(snapshot.as_ref()));
 
         // Locate each predecessor first, then fetch all the bodies at once.
         let mut located = Vec::with_capacity(ids.len());
@@ -501,7 +527,8 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = located.iter().map(|(id, _, prev)| (*prev, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut out = BTreeMap::new();
         for (id, ts, prev_ts) in located {
             let (value, prev_prev_ts) = bodies.get(&(prev_ts, id)).cloned().ok_or_else(|| {
@@ -528,8 +555,9 @@ impl Inner {
         self.refresh()?;
         let queries: Vec<_> = ids.into_iter().collect();
         let coordinates: Vec<_> = queries.iter().map(|q| (q.prev_ts, q.id)).collect();
-        let snapshot = self.db.snapshot();
-        let bodies = multi_get_documents(self, &coordinates, &snapshot_read_opts(&snapshot))?;
+        let snapshot = self.read_snapshot();
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut out = BTreeMap::new();
         for query in queries {
             let Some((value, prev_prev_ts)) = bodies.get(&(query.prev_ts, query.id)).cloned()

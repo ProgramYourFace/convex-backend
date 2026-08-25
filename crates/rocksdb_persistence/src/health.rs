@@ -59,6 +59,10 @@ use crate::{
 /// contract this mode advertises is no longer being met.
 const FLUSH_FAILURE_INTERVALS: u32 = 10;
 
+/// Multiple of the failure budget after which a flusher that has simply gone
+/// quiet — no successes, no failures — is treated as dead.
+const FLUSH_SILENCE_MULTIPLIER: u32 = 6;
+
 pub(crate) struct HealthMonitor {
     stop: Arc<Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -83,6 +87,7 @@ impl HealthMonitor {
         });
         let signal = stop.clone();
         let interval = *options::HEALTH_POLL_INTERVAL;
+        let started = Instant::now();
         let handle = std::thread::Builder::new()
             .name("rocksdb-health".to_string())
             .spawn(move || loop {
@@ -91,7 +96,16 @@ impl HealthMonitor {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    let _ = signal.wake.wait_timeout(guard, interval);
+                    // Re-checked under the mutex; see the same pattern in
+                    // `wal_flush`. Without it a `stop()` racing the park is
+                    // lost and the caller blocks for a full poll interval.
+                    let (guard, _) = signal
+                        .wake
+                        .wait_timeout_while(guard, interval, |_| {
+                            !signal.stopped.load(Ordering::Relaxed)
+                        })
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    drop(guard);
                 }
                 if signal.stopped.load(Ordering::Relaxed) {
                     break;
@@ -99,7 +113,7 @@ impl HealthMonitor {
                 let Some(inner) = db.upgrade() else {
                     break;
                 };
-                check(&inner, &shutdown, backup_dir.as_deref());
+                check(&inner, &shutdown, backup_dir.as_deref(), started);
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?;
         Ok(Self {
@@ -109,7 +123,17 @@ impl HealthMonitor {
     }
 
     pub(crate) fn stop(&self) {
-        self.stop.stopped.store(true, Ordering::Relaxed);
+        {
+            // Set under the same mutex the waiter re-checks the flag beneath,
+            // so the notification cannot be issued into the gap before it
+            // parks.
+            let guard = match self.stop.lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.stop.stopped.store(true, Ordering::Relaxed);
+            drop(guard);
+        }
         self.stop.wake.notify_all();
         let handle = match self.handle.lock() {
             Ok(mut guard) => guard.take(),
@@ -134,7 +158,12 @@ impl Drop for HealthMonitor {
     }
 }
 
-fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path::Path>) {
+fn check(
+    inner: &Inner,
+    shutdown: &ShutdownSignal,
+    backup_dir: Option<&std::path::Path>,
+    started: Instant,
+) {
     // A write that cannot make progress does not fail — it blocks. On a full
     // volume RocksDB stalls the writer indefinitely rather than returning an
     // error, so the counter above stays at zero for as long as the write never
@@ -172,19 +201,27 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
     {
         let since = flusher.since_last_success();
         metrics::log_wal_flush_age(since.as_secs_f64());
-        // Escalate only when flushes are *failing*. A single fsync that takes
-        // longer than the budget is ordinary on a contended volume — at a
-        // 100 ms interval the budget is one second — and killing the process
-        // for a slow disk would be a self-inflicted outage. Consecutive
-        // failures are what mean the mode's loss bound has stopped holding.
+        // Two ways this ends badly, and they need different thresholds.
+        //
+        // Flushes *failing*: escalate once several in a row have failed. A
+        // single fsync slower than the budget is ordinary on a contended volume
+        // — at a 100 ms interval the budget is one second — so time alone would
+        // be a self-inflicted outage.
+        //
+        // Flushes *stopping*: a thread that panicked, or is wedged inside
+        // `flush_wal`, never increments the failure count, so the conjunction
+        // above would stay silent forever while the mode kept acknowledging
+        // writes that never reach the kernel. A much longer deadline catches
+        // that without being trippable by a slow disk.
         let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
-        if since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS {
+        let failing = since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS;
+        let stopped = since > budget.saturating_mul(FLUSH_SILENCE_MULTIPLIER);
+        if failing || stopped {
             shutdown.signal(anyhow::anyhow!(
-                "the RocksDB write-ahead log has not been flushed for {:?}, past {} intervals; \
-                 acknowledged writes are accumulating unwritten, so stopping rather than \
-                 continuing to acknowledge them",
-                since,
-                FLUSH_FAILURE_INTERVALS,
+                "the RocksDB write-ahead log has not been flushed for {since:?} ({} failures \
+                 since the last success); acknowledged writes are accumulating unwritten, so \
+                 stopping rather than continuing to acknowledge them",
+                flusher.consecutive_failures(),
             ));
             return;
         }
@@ -196,9 +233,18 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal, backup_dir: Option<&std::path
     // during exactly the backups worth watching.
     if backup_dir.is_some()
         && let Some(worker) = inner.backup_worker.get()
-        && let Some(newest) = worker.newest_backup_unix_secs()
     {
-        metrics::log_backup_age(backup::age_seconds(newest));
+        // Emitted even when no generation exists yet, measured from process
+        // start. A deployment whose backups have *never* worked — wrong path,
+        // unwritable volume, a rejected ownership claim — is the case most
+        // worth alerting on, and it is precisely the case where waiting for a
+        // first generation would leave the series absent. An alert on a level
+        // that is missing does not fire.
+        let age = match worker.newest_backup_unix_secs() {
+            Some(newest) => backup::age_seconds(newest),
+            None => started.elapsed().as_secs_f64(),
+        };
+        metrics::log_backup_age(age);
     }
 }
 
@@ -275,9 +321,16 @@ impl WriteWatch {
     /// write that panics or is cancelled does not leave a phantom stall.
     pub(crate) fn begin(&self) -> WriteGuard<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut guard) = self.in_flight.lock() {
-            guard.insert(id, Instant::now());
-        }
+        // Recover from poisoning rather than skipping: a skipped *insert* is
+        // merely a write this cannot see, but a skipped *remove* leaves an
+        // entry that ages forever and eventually trips the stall shutdown on a
+        // healthy process. Both halves recover, so neither can happen.
+        let mut guard = match self.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(id, Instant::now());
+        drop(guard);
         WriteGuard { watch: self, id }
     }
 
@@ -287,7 +340,11 @@ impl WriteWatch {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // Ids increase, so the first entry is the earliest write still running.
+        // Ids are handed out before the timestamp is taken, so the lowest id is
+        // not *strictly* the earliest instant. The skew is the width of one
+        // `fetch_add`, which is irrelevant against a stall timeout measured in
+        // minutes, and taking the minimum over every value would make this
+        // O(n) on the health path for no gain.
         guard.values().next().map(Instant::elapsed)
     }
 }
@@ -299,8 +356,10 @@ pub(crate) struct WriteGuard<'a> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.watch.in_flight.lock() {
-            guard.remove(&self.id);
-        }
+        let mut guard = match self.watch.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.remove(&self.id);
     }
 }

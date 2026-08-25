@@ -125,6 +125,12 @@ fn run() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("backup needs --db <db-dir>"))?;
             // No background work: this is a one-shot tool, and attaching a
             // periodic worker or a health monitor to it would be surprising.
+            anyhow::ensure!(
+                db_dir.join("CURRENT").exists(),
+                "{} is not a RocksDB database. Refusing to create one — a mistyped --db would \
+                 otherwise back up an empty database over a real chain.",
+                db_dir.display(),
+            );
             let persistence = rocksdb_persistence::RocksDbPersistence::open_with(
                 &db_dir,
                 rocksdb_persistence::OpenOptions {
@@ -172,7 +178,7 @@ fn run() -> anyhow::Result<()> {
             let id = resolve_id(&args.dir, args.id)?;
             backup::verify(&args.dir, id)?;
             println!("backup {id} verified: every file present and the expected size");
-            println!("note: this is a checksum, not a restore. Run `rehearse` for that.");
+            println!("note: sizes, not checksums, and not a restore. Run `rehearse` for both.");
         },
         "rehearse" => {
             let scratch = args

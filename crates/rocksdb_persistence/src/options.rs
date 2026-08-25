@@ -153,11 +153,14 @@ pub static BLOCK_CACHE_BYTES: LazyLock<usize> = LazyLock::new(|| {
     match crate::memory::container_limit_bytes() {
         Some(limit) => {
             let derived = ((limit / 100) * *BLOCK_CACHE_PERCENT) as usize;
-            // The floor is a floor, not an override: clamping *up* past the
-            // container's own limit is how a 128 MiB container ends up with a
-            // 64 MiB cache — half its total memory — and a 64 MiB one with all
-            // of it. Cap the floor by the limit first.
-            let floor = MIN_DERIVED_CACHE_BYTES.min(limit as usize);
+            // The floor may only raise the cache toward the configured share,
+            // never past it. Capping the floor by the *limit* is not enough:
+            // a 128 MiB container derives 32 MiB, and a 64 MiB floor would
+            // still take half its memory — the very outcome this is meant to
+            // prevent. Capping the floor by the derived value means the floor
+            // applies where it helps (a large host whose 25 % is tiny) and
+            // never overrides the percentage on a small one.
+            let floor = MIN_DERIVED_CACHE_BYTES.min(derived);
             let clamped = derived.clamp(floor, MAX_DERIVED_CACHE_BYTES);
             tracing::info!(
                 "rocksdb block cache: {} MiB ({}% of a {} MiB memory limit)",
