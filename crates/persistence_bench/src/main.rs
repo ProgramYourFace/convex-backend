@@ -8,10 +8,15 @@
 //! layer are all in the measurement.
 //!
 //! What is *not* in the measurement: the V8 isolate, the sync worker, and HTTP.
-//! A real mutation pays those on top, identically on both backends, so they
+//! A real mutation pays those on top, identically on every backend, so they
 //! would compress the ratio without changing which backend is faster. Treat the
 //! numbers here as the storage-attributable difference, not as end-to-end
 //! mutation latency.
+//!
+//! `--backends postgres` needs a server the benchmark does not manage; point
+//! `--pg-url` (or `PERSISTENCE_BENCH_PG_URL`) at one and the run clears its
+//! `public` schema first, the way the embedded backends start by deleting their
+//! directory.
 //!
 //! # Workload
 //!
@@ -26,7 +31,8 @@
 //! ```text
 //! persistence-bench [--docs N] [--batch N] [--merge-percent N] [--devices N]
 //!                   [--reads N] [--pin table,table]
-//!                   [--backends sqlite,rocksdb] [--dir PATH]
+//!                   [--backends sqlite,rocksdb,postgres] [--pg-url URL]
+//!                   [--dir PATH]
 //! ```
 
 use std::{
@@ -47,6 +53,7 @@ use common::{
     persistence::Persistence,
     runtime::new_rate_limiter,
     shutdown::ShutdownSignal,
+    types::PersistenceVersion,
 };
 use database::Database;
 use governor::Quota;
@@ -80,6 +87,9 @@ struct Config {
     /// `TABLES_TO_LOAD_IN_MEMORY` pins them in a real deployment. Reads against
     /// a pinned table's indexes never reach persistence.
     pin: Vec<String>,
+    /// Connection URL for the `postgres` backend. Required to run it, since
+    /// unlike the embedded backends the benchmark cannot create the server.
+    pg_url: Option<String>,
     dir: PathBuf,
     backends: Vec<String>,
 }
@@ -93,6 +103,7 @@ impl Default for Config {
             devices: workload::DEFAULT_DEVICES,
             reads: 2_000,
             pin: Vec::new(),
+            pg_url: std::env::var("PERSISTENCE_BENCH_PG_URL").ok(),
             dir: PathBuf::from("/tmp/persistence-bench"),
             backends: vec!["sqlite".to_string(), "rocksdb".to_string()],
         }
@@ -117,6 +128,56 @@ fn percentile(sorted: &[u64], p: f64) -> Duration {
     }
     let i = (((sorted.len() - 1) as f64) * p).round() as usize;
     Duration::from_nanos(sorted[i])
+}
+
+/// Where a backend's bytes live, so the run can report a comparable on-disk
+/// size. The embedded backends own a path; Postgres owns a database inside a
+/// server that also holds unrelated files, so it is asked directly.
+enum DiskUsage {
+    Path(PathBuf),
+    PostgresDatabase(String),
+}
+
+impl DiskUsage {
+    async fn measure(&self) -> u64 {
+        match self {
+            Self::Path(path) => dir_size(path),
+            // `pg_database_size` counts the database's relations and their
+            // indexes — the same thing `dir_size` counts for the others. It
+            // excludes the WAL, which is cluster-wide and would otherwise
+            // charge this workload for the whole server.
+            Self::PostgresDatabase(url) => pg_database_size(url).await.unwrap_or(0),
+        }
+    }
+}
+
+async fn pg_database_size(url: &str) -> anyhow::Result<u64> {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await?;
+    let handle = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT pg_database_size(current_database())", &[])
+        .await;
+    drop(client);
+    handle.abort();
+    Ok(row?.get::<_, i64>(0).max(0) as u64)
+}
+
+/// Drops and recreates the public schema so a Postgres run starts from the same
+/// clean slate the embedded backends get from deleting their directory.
+async fn reset_pg_schema(url: &str) -> anyhow::Result<()> {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await?;
+    let handle = tokio::spawn(connection);
+    let result: anyhow::Result<()> = async {
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS public CASCADE")
+            .await?;
+        client.batch_execute("CREATE SCHEMA public").await?;
+        Ok(())
+    }
+    .await;
+    drop(client);
+    handle.abort();
+    result
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -144,7 +205,7 @@ async fn run_backend(
     runtime: ProdRuntime,
     backend: &'static str,
     persistence: Arc<dyn Persistence>,
-    data_path: PathBuf,
+    disk: DiskUsage,
     cfg: &Config,
 ) -> anyhow::Result<Report> {
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -252,7 +313,7 @@ async fn run_backend(
         commit_p50: percentile(&commit_latencies, 0.50),
         commit_p99: percentile(&commit_latencies, 0.99),
         reads_per_s: read_count as f64 / read_elapsed,
-        disk_bytes: dir_size(&data_path),
+        disk_bytes: disk.measure().await,
     })
 }
 
@@ -284,6 +345,7 @@ fn parse_config() -> anyhow::Result<Config> {
                     .filter(|s| !s.is_empty())
                     .collect()
             },
+            "--pg-url" => cfg.pg_url = Some(value),
             "--dir" => cfg.dir = PathBuf::from(value),
             "--backends" => cfg.backends = value.split(',').map(|s| s.trim().to_string()).collect(),
             other => anyhow::bail!("unknown flag {other}"),
@@ -317,7 +379,7 @@ fn main() -> anyhow::Result<()> {
             let _ = std::fs::remove_dir_all(&cfg_ref.dir);
             std::fs::create_dir_all(&cfg_ref.dir)?;
 
-            let (backend, persistence, data_path): (&'static str, Arc<dyn Persistence>, PathBuf) =
+            let (backend, persistence, disk): (&'static str, Arc<dyn Persistence>, DiskUsage) =
                 match name.as_str() {
                     "sqlite" => {
                         let path = cfg_ref.dir.join("convex.sqlite3");
@@ -326,7 +388,7 @@ fn main() -> anyhow::Result<()> {
                             Arc::new(sqlite::SqlitePersistence::new(
                                 path.to_str().expect("non-utf8 path"),
                             )?),
-                            path,
+                            DiskUsage::Path(path),
                         )
                     },
                     "rocksdb" => {
@@ -334,7 +396,36 @@ fn main() -> anyhow::Result<()> {
                         (
                             "rocksdb",
                             Arc::new(rocksdb_persistence::RocksDbPersistence::new(&path)?),
-                            path,
+                            DiskUsage::Path(path),
+                        )
+                    },
+                    // Unlike the embedded backends this talks to a server the
+                    // benchmark does not own, so the run starts by clearing the
+                    // schema rather than by deleting a directory.
+                    "postgres" => {
+                        let url = cfg_ref
+                            .pg_url
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("--backends postgres needs --pg-url"))?;
+                        reset_pg_schema(&url).await?;
+                        let (pg_shutdown_tx, _pg_shutdown_rx) = tokio::sync::oneshot::channel();
+                        let persistence = postgres::PostgresPersistence::new(
+                            &url,
+                            postgres::PostgresOptions {
+                                allow_read_only: false,
+                                version: PersistenceVersion::V5,
+                                schema: None,
+                                instance_name: "persistence-bench".into(),
+                                multitenant: false,
+                                skip_index_creation: false,
+                            },
+                            ShutdownSignal::new(pg_shutdown_tx),
+                        )
+                        .await?;
+                        (
+                            "postgres",
+                            Arc::new(persistence),
+                            DiskUsage::PostgresDatabase(url),
                         )
                     },
                     other => anyhow::bail!("unknown backend {other}"),
@@ -342,7 +433,7 @@ fn main() -> anyhow::Result<()> {
 
             eprint!("running {backend} ... ");
             let started = Instant::now();
-            let report = run_backend(rt.clone(), backend, persistence, data_path, cfg_ref).await?;
+            let report = run_backend(rt.clone(), backend, persistence, disk, cfg_ref).await?;
             eprintln!("{:.1}s", started.elapsed().as_secs_f64());
             reports.push(report);
         }
@@ -392,7 +483,8 @@ persistence-bench — compare persistence backends through the real Convex commi
   --reads N           latest-location lookups     (default 2000)
   --pin a,b           tables to hold in memory, as TABLES_TO_LOAD_IN_MEMORY
                       does in a deployment        (default none)
-  --backends a,b    subset of sqlite,rocksdb      (default both)
+  --backends a,b    subset of sqlite,rocksdb,postgres (default sqlite,rocksdb)
+  --pg-url URL      postgres connection URL, or PERSISTENCE_BENCH_PG_URL
   --dir PATH        scratch directory             (default /tmp/persistence-bench)
 
 Covers the committer, conflict checking, the index registry and cache, the write

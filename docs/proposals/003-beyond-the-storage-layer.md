@@ -28,6 +28,7 @@ devices, 30 % RLE merges, RocksDB backend, 4-core VM):
 | §6 | Writes never batch across the isolate boundary; sequential reads don't either | `async_syscall.rs:244` | one round trip per `db.*` call | app-side restructure |
 | §7 | OCC backoff is sized for interactive OLTP | `UDF_EXECUTOR_OCC_INITIAL_BACKOFF_MS` | 100 ms per conflict | config change |
 | §8 | Subscription invalidation is proportional to writes × subscribers | `subscription.rs:492` | depends on live queries | measure first |
+| §10 | Postgres baseline: what the client-server boundary itself costs | — | **2.9× vs the stack above** | measured |
 
 Each row adds one change to the row above it:
 
@@ -40,6 +41,11 @@ rocksdb  stock                   1244       19.4    49.97    69.13      6078
 rocksdb  verify=0                1208       18.9    50.37    82.02     10606
 rocksdb  verify=0 + pinned       1590       24.8    39.55    58.68    111058
 ```
+
+§10 adds a Postgres baseline, measured against a real server configured exactly as the
+reference deployment's sidecar is. Against that baseline the whole stack — engine swap
+plus §1 plus §2 — is **2.9× the write throughput at 2.9× lower commit latency in 2.9×
+less disk**.
 
 Commit p50 on RocksDB goes 50.0 ms → 39.6 ms and p99 69.1 ms → 58.7 ms, on top of the
 101.97 ms → 57.28 ms that the engine swap already bought. Reads against the pinned
@@ -372,3 +378,76 @@ Reasoned from the source, not measured: §3–§8. §5 and §6 in particular sit
 benchmark's boundary, so their effect on end-to-end mutation latency is unquantified
 here. They are listed because the code says the cost is there, not because a number
 says how big it is.
+
+---
+
+## 10. Postgres, measured
+
+The reference deployment runs Convex cells with a colocated Postgres sidecar, so the
+question "how much of this is the engine and how much is the client-server boundary?"
+has a concrete answer rather than an estimate. `persistence_bench` gained a `postgres`
+backend; the server below is PostgreSQL 16.13 on the same host, started with the
+sidecar's exact flags — `synchronous_commit=off`, `shared_buffers=2GB`,
+`max_wal_size=4GB`, `checkpoint_completion_target=0.9`, `effective_cache_size=4GB`,
+`random_page_cost=1.1`, `wal_compression=on` — over loopback TCP.
+
+```
+                            events/s  commits/s   p50 ms   p99 ms   reads/s   disk MB
+--- stock Convex knobs ---
+postgres  (4 cpu)                536        8.4   114.71   165.01      2397      38.9
+postgres  (1 cpu)                537        8.4   116.46   179.38      2207      39.1
+sqlite                           990       15.5    62.33    95.91      5232      19.4
+rocksdb                         1108       17.3    55.71    89.88      5433      13.3
+--- verify=0 + deviceLatestLocations pinned ---
+postgres  (4 cpu)                656       10.2    95.82   147.49     96325      39.0
+postgres  (1 cpu)                747       11.7    85.62   109.86    108812      39.3
+sqlite                          1166       18.2    55.84    82.42     94968      19.4
+rocksdb                         1572       24.6    40.02    56.26     97645      13.3
+```
+
+Three things fall out of this.
+
+**SQLite really is faster than Postgres here — 1.85× — and the reason is not the
+engine.** Both are B-trees doing the same page maintenance. What separates them is that
+one is a function call and the other is a socket. `pg_stat_database.xact_commit` over
+the 8 000-event ingest phase counts **25 254 transactions**: 24 000 index reads (three
+per event), 125 commits, and setup. Every one of those index reads is a round trip that
+SQLite and RocksDB resolve in-process.
+
+**Postgres is not CPU-bound at this rate.** Pinning the server to a single core with
+`taskset` — matching the cell manifest's `limits: { cpu: "1" }` — changed throughput by
+less than 1 % (536 → 537 events/s). The 1-CPU limit is not what is costing you; the
+round-trip count is. That also means the usual reflex of giving the sidecar more CPU
+will not help.
+
+**§1 shows up in the round-trip count directly.** Pinning `deviceLatestLocations` takes
+the ingest phase from 25 254 transactions to **17 244** — almost exactly 8 000 fewer,
+one per event, which is the `by_device` read that no longer leaves the process. On the
+embedded backends pinning removes a function call; on Postgres it removes a network
+round trip, which is why the same knob is worth proportionally more there
+(656/536 = 1.22× vs 1572/1244 = 1.26× — comparable in ratio, but from a much worse
+starting point).
+
+Stacked against the Postgres baseline the deployment runs today, RocksDB with §1 and §2
+is **2.93× the write throughput** (536 → 1572 events/s), **2.87× lower commit p50**
+(114.71 → 40.02 ms), **2.93× lower p99** (165.01 → 56.26 ms) and **2.9× less disk**
+(38.9 → 13.3 MB for the same data).
+
+### One caveat about the measurement
+
+This benchmark issues its reads through the same `PersistenceReader` the backend uses,
+but it does not model a network hop *between* pods, connection-pool saturation under
+many concurrent mutations, or a cold page cache on a real PVC. A cell whose Postgres is
+on a StandardSSD PVC with an 80 % buffer hit rate will do worse than this, not better,
+because the round trips that dominate here also start missing the cache. The direction
+of the result is safe; the multiplier is a floor.
+
+### An unrelated thing worth fixing in the sidecar
+
+The reference cell manifest sets `shared_buffers=2GB` on a container whose
+`limits.memory` is `1536Mi`. Postgres reserves the buffer pool as shared memory at
+startup and the cgroup charges those pages as they are touched, so the container is
+sized 512 Mi below its own buffer pool before any backend, WAL buffer or `work_mem`
+allocation. That is an OOMKill waiting for the pool to fill, not a steady state. Either
+the limit goes above 2 GB with headroom, or `shared_buffers` comes down to roughly a
+quarter of the limit.

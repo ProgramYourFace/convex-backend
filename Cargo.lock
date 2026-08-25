@@ -7337,12 +7337,14 @@ dependencies = [
  "indexing",
  "keybroker",
  "model",
+ "postgres",
  "rocksdb_persistence",
  "runtime",
  "search",
  "sqlite",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "value",
 ]
 

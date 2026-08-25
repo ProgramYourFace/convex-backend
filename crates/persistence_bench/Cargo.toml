@@ -18,12 +18,14 @@ governor = { workspace = true }
 indexing = { workspace = true }
 keybroker = { workspace = true }
 model = { workspace = true }
+postgres = { workspace = true }
 rocksdb_persistence = { workspace = true }
 runtime = { workspace = true }
 search = { workspace = true }
 sqlite = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 value = { workspace = true }
 
 [lints]
