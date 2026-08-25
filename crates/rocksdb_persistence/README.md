@@ -83,8 +83,8 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 |---|---|---|
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
-| `ROCKSDB_BLOCK_CACHE_BYTES` | 512 MiB | shared block cache |
-| `ROCKSDB_WRITE_BUFFER_BYTES` | 512 MiB | ceiling on memtable memory across all column families |
+| `ROCKSDB_BLOCK_CACHE_BYTES` | 512 MiB | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
+| `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
 | `ROCKSDB_MEMTABLE_BYTES` | 64 MiB | per-column-family memtable |
 | `ROCKSDB_BACKGROUND_JOBS` | cores | flush and compaction threads |
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
@@ -94,7 +94,16 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 `ROCKSDB_SYNC_WRITES=false` is the analogue of Postgres's
 `synchronous_commit=off`: it trades a bounded window of recent writes on host
 loss for throughput, and is only safe where an upstream log can replay into
-idempotent appliers.
+idempotent appliers. "An upstream log" has to mean one whose checkpoint cannot
+survive a crash that this store did not: if the checkpoint lives in a *different*
+durability domain it can roll back less than this one does, and the difference is
+lost writes rather than replayed ones. See
+[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §2.
+
+RocksDB does not read cgroup limits, so in a container `ROCKSDB_BLOCK_CACHE_BYTES`
+is the setting that keeps the process inside its memory limit. Compaction buffers,
+iterators and WAL buffers live outside the cache, so size it at roughly half of
+what the container can spare rather than all of it.
 
 ## Configuring a write-heavy deployment
 
@@ -171,6 +180,15 @@ once and only ever removed by retention, which cannot touch anything the
 validator has approved.
 
 ## Not implemented
+
+**Backup and point-in-time restore.** The durability story is the volume and
+nothing else. RocksDB's `Checkpoint::create_checkpoint` hard-links a consistent
+snapshot into a new directory on the same filesystem, near-instantly and at
+near-zero extra space, which is the right primitive to build on — but it is not
+exposed here, and neither is a restore path. A deployment adopting this backend
+needs an answer for data its upstream log cannot replay. See
+[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §6.
+
 
 **Retention via compaction filter.** The largest remaining win, and deliberately
 not attempted here. Convex's retention worker deletes *superseded* versions; it

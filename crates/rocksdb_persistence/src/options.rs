@@ -42,12 +42,25 @@ pub static CHECK_CONFLICTS: LazyLock<bool> =
     LazyLock::new(|| env_config("ROCKSDB_CHECK_CONFLICTS", true));
 
 /// Shared block cache across every column family, in bytes.
+///
+/// This is the backend's memory budget, not just its read cache: memtable
+/// memory is charged against it too (see [`build`]), so cached data, index and
+/// filter blocks and unflushed writes all come out of this one number.
+/// Steady-state usage runs somewhat above it — compaction buffers, iterators
+/// and WAL buffers are outside the cache — so size it at roughly half the
+/// container's memory limit, not all of it.
 pub static BLOCK_CACHE_BYTES: LazyLock<usize> =
     LazyLock::new(|| env_config("ROCKSDB_BLOCK_CACHE_BYTES", 512 << 20));
 
 /// Ceiling on memtable memory across every column family, in bytes.
+///
+/// A share of [`BLOCK_CACHE_BYTES`] rather than memory on top of it, so the
+/// default is a quarter of the cache. Letting memtables grow into the whole
+/// budget would evict every data, index and filter block — including the bloom
+/// filters the uniqueness check depends on — and turn reads into I/O exactly
+/// when writes are heaviest.
 pub static WRITE_BUFFER_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("ROCKSDB_WRITE_BUFFER_BYTES", 512 << 20));
+    LazyLock::new(|| env_config("ROCKSDB_WRITE_BUFFER_BYTES", *BLOCK_CACHE_BYTES / 4));
 
 /// Per-column-family memtable size, in bytes.
 pub static MEMTABLE_BYTES: LazyLock<usize> =
