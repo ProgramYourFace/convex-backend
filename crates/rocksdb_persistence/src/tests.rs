@@ -48,6 +48,11 @@ use common::{
     },
 };
 use futures::TryStreamExt;
+use rocksdb::backup::{
+    BackupEngine,
+    BackupEngineOptions,
+    RestoreOptions,
+};
 use value::{
     DeveloperDocumentId,
     InternalId,
@@ -1030,6 +1035,122 @@ async fn interval_sync_shutdown_flushes_the_tail() -> anyhow::Result<()> {
         .await?;
     assert_eq!(entries.len(), 1, "shutdown must flush the WAL buffer");
     assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"tail\"");
+    Ok(())
+}
+
+/// `BackupEngine` is the mechanism `docs/proposals/005-backup-and-restore.md`
+/// proposes building on, and it rests on two assumptions worth checking rather
+/// than believing: that a backup covers every column family, and that it covers
+/// the blob files that documents above `ROCKSDB_BLOB_THRESHOLD_BYTES` are
+/// stored in. A backup that silently skipped either would restore a database
+/// that opens, reads, and is missing data.
+#[tokio::test]
+async fn backup_engine_round_trips_every_column_family_and_blob_files() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_path = dir.path().join("backup");
+
+    // A document comfortably past the 4 KiB blob threshold, so its body is
+    // stored outside the LSM tree, plus a small one that is not.
+    let big_body = "x".repeat(64 * 1024);
+    {
+        let persistence = RocksDbPersistence::new(&db_path)?;
+        persistence
+            .write(
+                &[
+                    entry(1, 1, 10, &big_body, None)?,
+                    entry(1, 2, 11, "small", None)?,
+                ],
+                &[
+                    index_entry(1, b"big", 10, Some(doc_id(1, 1))),
+                    index_entry(1, b"small", 11, Some(doc_id(1, 2))),
+                ],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::MaxRepeatableTimestamp,
+                serde_json::json!(4321),
+            )
+            .await?;
+
+        let mut engine = BackupEngine::open(
+            &BackupEngineOptions::new(&backup_path)?,
+            &rocksdb::Env::new()?,
+        )?;
+        // `true` flushes memtables first, so the backup does not depend on
+        // replaying a WAL to be complete.
+        engine.create_new_backup_flush(&persistence.inner.db, true)?;
+        let info = engine.get_backup_info();
+        assert_eq!(info.len(), 1, "one backup should have been recorded");
+        engine.verify_backup(info[0].backup_id)?;
+        persistence.shutdown().await?;
+    }
+
+    // Destroy the original, so nothing below can be served by leftovers.
+    std::fs::remove_dir_all(&db_path)?;
+
+    let mut engine = BackupEngine::open(
+        &BackupEngineOptions::new(&backup_path)?,
+        &rocksdb::Env::new()?,
+    )?;
+    engine.restore_from_latest_backup(&db_path, &db_path, &RestoreOptions::default())?;
+
+    let restored = RocksDbPersistence::new(&db_path)?;
+    let reader = restored.reader();
+
+    // `dlog` — including the blob-stored body.
+    let entries: Vec<_> = reader
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(entries.len(), 2, "both documents must survive the restore");
+    assert_eq!(
+        body_of(entries[0].value.as_ref().unwrap()).len(),
+        big_body.len() + 2,
+        "the blob-stored body must come back whole, not truncated or empty"
+    );
+    assert_eq!(body_of(entries[1].value.as_ref().unwrap()), "\"small\"");
+
+    // `idx` — the index entries and their join back into `dlog`.
+    let rows: Vec<_> = reader
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(11),
+            &interval(b"", None),
+            Order::Asc,
+            8,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(rows.len(), 2, "index entries must survive the restore");
+
+    // `docs` — the id-ordered revision index behind `previous_revisions`.
+    let previous = reader
+        .previous_revisions(
+            std::collections::BTreeSet::from([(doc_id(1, 1).into(), ts(11))]),
+            validator(),
+        )
+        .await?;
+    assert_eq!(
+        previous.len(),
+        1,
+        "the revision index must survive the restore"
+    );
+
+    // `globals`. Written as 4321, which is past the log's own maximum, so
+    // `max_ts` returning it proves the global came back rather than being
+    // recomputed from the documents.
+    assert_eq!(
+        reader
+            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+            .await?,
+        Some(serde_json::json!(4321)),
+    );
+    assert_eq!(reader.max_ts().await?, Some(ts(4321)));
     Ok(())
 }
 

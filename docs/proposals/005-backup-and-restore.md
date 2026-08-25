@@ -1,6 +1,6 @@
 # The RocksDB backup and restore path
 
-**Status:** design and runbook — **not implemented.** No code in `rocksdb_persistence` calls either API yet.
+**Status:** design and runbook — **not implemented.** No code in `rocksdb_persistence` calls either API yet, but the mechanism is verified: `backup_engine_round_trips_every_column_family_and_blob_files` in `src/tests.rs` backs up, destroys the database, restores, and checks all five column families and a blob-stored document.
 **Date:** 2026-08-25
 **Follows:** [004-rocksdb-in-kubernetes.md](./004-rocksdb-in-kubernetes.md) §6, which identifies this as the largest gap in adopting the backend
 **Scope:** the persistence layer only. See §6 for what this deliberately does not cover.
@@ -161,25 +161,51 @@ split that governs the sync mode governs restore.
 
 ---
 
-## 5. Why not the logical-export answer
+## 5. How this relates to Convex's own answer
 
-Convex has snapshot export/import above the trait, and it is tempting to call that the
-backup story and stop. SurrealDB — the closest comparable, and also a Rust database
-shipping RocksDB as its default single-node engine — made exactly that choice: `grep` for
-`Checkpoint`, `create_checkpoint`, `BackupEngine` or `backup_engine` across its tree
-returns nothing, and its documented answer is `surreal export` to SurrealQL plus volume
-snapshots, with its own docs stating that point-in-time recovery "is not implicit in a
-single export".
+**Convex's persistence layer implements no backup handling at all.** `backup` does not
+appear anywhere in `crates/postgres`, `crates/mysql` or `crates/sqlite`. Durability below
+the trait is entirely the database's problem, which for a Postgres deployment means
+`pg_dump`, `pg_basebackup`, WAL archiving and PITR, driven by the operator or the cloud
+provider.
 
-The cost shows up in their tracker. Issue #7189 reports **~200 000 records across 69
-tables taking 7+ hours to restore** from an 850 MB export, because restore is sequential
-statement parsing and per-statement execution, so it scales linearly with database size.
-The top-ranked proposal in that issue is storage-engine-level backup and restore.
+What Convex *does* implement is a layer above: snapshot export and import
+(`crates/exports`, `crates/application/src/snapshot_import`). And that is not a
+second-class path — it is what Convex's own managed backups are built on.
+`ExportRequestor` has exactly two variants, `SnapshotExport` and **`CloudBackup`**
+(`crates/model/src/exports/types.rs:365`), and the `deployment:backups:create`,
+`:import`, `:configurePeriodic`, `:disablePeriodic` and `:delete` permissions in
+`crates/roles` are the control-plane surface over the same machinery. Periodic logical
+export *is* the Convex backup product.
 
-A logical export is genuinely better at one thing — it is portable across engines and
-across versions, which a file-level backup is not. That makes it the right tool for a
-migration and the wrong tool for an RPO. The two are complementary, and the engine-level
-path is the one that is missing.
+Two things follow.
+
+**The logical path is faster than the SurrealDB comparison suggests.** SurrealDB made the
+same "export is the backup" choice — `grep` for `Checkpoint`, `create_checkpoint`,
+`BackupEngine` or `backup_engine` across its tree returns nothing — and its tracker
+reports ~200 000 records taking 7+ hours to restore (issue #7189), because its restore is
+sequential SQL statement parsing and per-statement execution. Convex's import is not that
+shape: `import_objects` accumulates documents and commits them in batches bounded by
+`TRANSACTION_MAX_NUM_USER_WRITES / 2` — 8 000 documents per transaction — straight through
+`ImportFacingModel`, with no UDF execution per row. The restore-time argument against
+logical export does not transfer.
+
+**It also covers something a file-level backup cannot.** `ExportFormat::Zip {
+include_storage }` walks `_file_storage` and writes user-uploaded files into the archive
+alongside the data. A RocksDB backup contains none of them (§6). So the two are genuinely
+complementary rather than redundant:
+
+| | Engine backup (this document) | Snapshot export |
+|---|---|---|
+| Cost of taking one | incremental; proportional to what changed | full read of every table, every time |
+| Restore | file copy, then open | re-insert everything through the write path |
+| Covers file storage | no | yes, with `include_storage` |
+| Portable across engines and versions | no | yes |
+| Practical RPO | minutes | hours |
+
+The engine backup is the one that can run often enough to bound an RPO on a
+write-heavy cell. The export is the one that survives an engine change and captures file
+storage. A production cell wants both, on different schedules.
 
 ---
 
@@ -190,8 +216,9 @@ that half-works.
 
 - **File storage.** User-uploaded files live on the `convex-data` volume, outside
   `Persistence`. Nothing in a RocksDB backup contains them, and nothing can rebuild them.
-  They need their own backup — and unlike the database, they are immutable once written,
-  so a plain incremental file sync is sufficient.
+  They need their own backup: either a snapshot export with `include_storage` (§5), or —
+  since files are immutable once written — a plain incremental file sync of the
+  directory, which is cheaper and can run far more often.
 - **Search and vector index segments.** Also outside persistence. Unlike file storage
   these are *derived*: Convex can rebuild them from the document log, so losing them
   costs backfill time rather than data. Worth capturing anyway to avoid the rebuild.
@@ -203,3 +230,55 @@ A "cell backup" is therefore the RocksDB backup plus the file-storage directory 
 cell's `Secret`. Only the first of those is what this document proposes building; the
 other two are ordinary volume and secret backup, and they should be part of the same
 runbook so that nobody discovers the gap during a restore.
+
+---
+
+## 7. What this plan does not make production-ready
+
+§3 is enough to have backups. It is not enough to have a backup *system*, and the
+difference is where people lose data. Each of these is a real gap, not a nice-to-have.
+
+**There is no point-in-time recovery, and there cannot be at this layer.** Postgres gives
+PITR by archiving WAL segments and replaying them onto a base backup, so the recovery
+point is any moment you like. RocksDB's WAL is recycled or deleted once its memtables
+flush — there is nothing to archive, and no `restore_to_timestamp`. The best this design
+can do is RPO = backup interval. That is a genuine capability regression from Postgres,
+and the honest mitigation is that the ingest bus can replay the gap for the data that
+came through it. For anything that did not — user-authored records, anything written by a
+mutation the bus did not drive — the recovery point really is the last backup.
+
+**A backup nobody has restored is not a backup.** The single highest-value thing missing
+from §3 is a scheduled restore rehearsal: take the latest backup, restore it into a
+scratch directory, open it, and assert it reads. Everything else in this document is
+theory until that runs on a cadence. `verify_backup` checks file sizes, not that the
+database opens — it is a checksum, not a rehearsal.
+
+**Nothing measures the backup's age.** A backup worker that dies silently looks exactly
+like one that is working. Production needs the age of the newest backup as a gauge and an
+alert when it exceeds the interval by some margin — the alert is the deliverable, not the
+metric.
+
+**Backups are unencrypted.** RocksDB's backup files are the SSTs, in the clear. Whatever
+holds them off-node needs encryption at rest and access control at least as tight as the
+database's, or the backup becomes the easiest way to read the data. This is a property of
+the destination, not of the backend, but it has to be somebody's job.
+
+**Restore is per-cell and manual.** §4 is a runbook a human executes against one cell.
+A fleet of cells needs that automated, with the cell's identity — `INSTANCE_NAME`, the
+instance secret, the origins — restored alongside the data, because a database restored
+into a deployment configured differently will not behave.
+
+**The retention interaction is unexamined.** Convex's retention worker deletes superseded
+versions on a timer, so a restored database resumes with whatever retention state the
+backup captured. Restoring a backup older than the document retention window into a
+deployment whose relay checkpoint expects a newer state is a case that has not been
+thought through, and it is exactly the case a real incident produces.
+
+**Backup I/O competes with the write path.** `create_new_backup_flush` forces a flush and
+then copies SSTs, on a volume that foreground writes and compaction are already using. On
+a cell at ingest saturation that is a throughput dip on a schedule. It wants rate
+limiting and a measurement, neither of which exists.
+
+None of these are reasons not to build §3 — they are the difference between "we take
+backups" and "we can restore". The order that matters: build §3, then the restore
+rehearsal, then the age alert. The rest can follow.
