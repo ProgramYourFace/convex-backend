@@ -982,6 +982,7 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
             &path,
             SyncMode::Interval(Duration::from_millis(50)),
         )?;
+        assert!(persistence.has_wal_flusher());
         let id = doc_id(1, 1);
         persistence
             .write(
@@ -993,6 +994,24 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
         // Several intervals, so this does not turn into a timing flake on a
         // loaded machine.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Assert the *flusher* did it, not the drop. `has_wal_flusher` cannot
+        // tell those apart — `Inner::drop` flushes unconditionally in interval
+        // mode, so the end state is identical either way. A secondary instance
+        // can: it reads the primary's files but neither its memtables nor its
+        // WAL buffer, so it sees the write only once a flush has moved it.
+        let observer = RocksDbPersistence::new_secondary(&path, &dir.path().join("observer"))?;
+        let seen: Vec<_> = observer
+            .reader()
+            .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+            .try_collect()
+            .await?;
+        assert_eq!(
+            seen.len(),
+            1,
+            "a secondary sees only flushed data, so this proves the flusher ran"
+        );
+        drop(observer);
     }
 
     let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
@@ -1343,14 +1362,24 @@ async fn load_documents_does_not_skip_a_row_when_the_cursor_row_is_deleted() -> 
 #[tokio::test]
 async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow::Result<()> {
     use common::index::MAX_INDEX_KEY_PREFIX_LEN;
+    use value::sha256::Sha256;
 
     let f = Fixture::new()?;
-    // Two keys agreeing on the whole truncated prefix, differing past it.
+    // Two keys agreeing on the whole truncated prefix, differing past it. The
+    // suffixes are not arbitrary: `IndexEntry` breaks the tie on
+    // `sha256(full_key)`, so the pair has to be one where sha256 order
+    // *disagrees* with byte order. Suffixes 1 and 2 do not (this test was
+    // originally written with them and passed vacuously); 1 and 3 do.
     let mut a = vec![b'z'; MAX_INDEX_KEY_PREFIX_LEN];
     let mut b = a.clone();
     a.push(1);
-    b.push(2);
+    b.push(3);
     assert!(a < b, "a is the byte-order-smaller key");
+    assert!(
+        Sha256::hash(&a).as_ref() > Sha256::hash(&b).as_ref(),
+        "the point of this test is a pair whose IndexEntry order is the reverse of storage order; \
+         if this ever stops holding, pick different suffixes rather than deleting the assertion",
+    );
 
     for (i, key) in [a.clone(), b.clone()].into_iter().enumerate() {
         let n = i as u32 + 1;
@@ -1369,17 +1398,24 @@ async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow:
     sorted.sort();
     assert_eq!(all, sorted, "entries must be emitted in IndexEntry order");
 
-    // Paging with the cursor must reach the second entry, whichever of the two
-    // sorts first — the bug dropped it because the filter ran against a stream
-    // that was not in IndexEntry order.
-    let first = f.persistence.load_index_chunk(None, 1).await?;
-    assert_eq!(first.len(), 1);
-    let rest = f
-        .persistence
-        .load_index_chunk(Some(first[0].clone()), 16)
-        .await?;
-    assert_eq!(rest.len(), 1, "paging must not drop the remaining entry");
-    assert_eq!(vec![first[0].clone(), rest[0].clone()], sorted);
+    // Page one entry at a time. The entry that sorts second in `IndexEntry`
+    // order sits *first* in storage, so resuming at the cursor's own storage
+    // position would start past it and it would never be emitted.
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let chunk = f.persistence.load_index_chunk(cursor.clone(), 1).await?;
+        let Some(entry) = chunk.into_iter().next() else {
+            break;
+        };
+        cursor = Some(entry.clone());
+        paged.push(entry);
+        assert!(paged.len() <= 4, "paging is not terminating");
+    }
+    assert_eq!(
+        paged, sorted,
+        "paging one at a time must yield every entry, in IndexEntry order"
+    );
     Ok(())
 }
 
@@ -1392,11 +1428,18 @@ async fn dropping_during_a_flush_tick_does_not_panic() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     for round in 0..200u32 {
         let path = dir.path().join(format!("db{round}"));
+        // `background: true` is the default, and load-bearing here: without a
+        // flusher thread there is no tick for the drop to race, and this test
+        // would assert nothing.
         let persistence = RocksDbPersistence::new_with_sync_mode(
             &path,
             // Short enough that the flusher is very likely mid-tick at drop.
             SyncMode::Interval(Duration::from_micros(200)),
         )?;
+        assert!(
+            persistence.has_wal_flusher(),
+            "no flusher means no tick to race, and this test would pass vacuously"
+        );
         for i in 1..=4u32 {
             persistence
                 .write(
@@ -1564,6 +1607,290 @@ async fn a_rejecting_retention_validator_stops_every_read_path() -> anyhow::Resu
     assert!(
         previous.is_err(),
         "previous_revisions yielded a rejected read"
+    );
+    Ok(())
+}
+
+/// A rehearsal must never delete anything at the path an operator named. The
+/// earlier design marked a scratch directory as "mine to clear", which is a
+/// permanent deletion grant: a directory that hosted a rehearsal once is a
+/// directory the command will empty forever after, live database and all.
+/// It now works inside a directory it names itself and removes only that.
+#[tokio::test]
+async fn rehearse_leaves_everything_at_the_scratch_path_alone() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+        persistence.shutdown().await?;
+    }
+
+    // Stand in for a data volume: a live-looking database and a user file.
+    let volume = dir.path().join("volume");
+    std::fs::create_dir_all(volume.join("db"))?;
+    std::fs::create_dir_all(volume.join("file_storage"))?;
+    std::fs::write(volume.join("db/CURRENT"), "live")?;
+    std::fs::write(volume.join("file_storage/blob1"), "user upload")?;
+
+    // Rehearse into it twice — the second run is the one the old marker scheme
+    // turned into a deletion.
+    backup::rehearse(&backup_dir, &volume, None)?;
+    backup::rehearse(&backup_dir, &volume, None)?;
+
+    assert_eq!(
+        std::fs::read_to_string(volume.join("db/CURRENT"))?,
+        "live",
+        "the rehearsal must not have touched the database at that path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(volume.join("file_storage/blob1"))?,
+        "user upload",
+        "nor anything else under it"
+    );
+    // And it cleans up after itself rather than accumulating.
+    let leftovers: Vec<_> = std::fs::read_dir(&volume)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("convex-rehearsal-"))
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    Ok(())
+}
+
+/// `is_fresh` decides whether the caller runs `Database::initialize`. RocksDB
+/// writes `CURRENT` as the *last* step of creating a database, before Convex
+/// has written a row, so deriving freshness from the directory means a process
+/// killed anywhere inside initialization reopens to "not fresh" and an empty
+/// database — skipping initialization forever and failing on the missing
+/// bootstrap tables, with no recovery but deleting the volume.
+#[tokio::test]
+async fn an_empty_database_is_still_fresh_after_a_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        // Created, then killed before writing anything — an OOM or an eviction
+        // partway through initialization.
+        let persistence = RocksDbPersistence::new(&path)?;
+        assert!(persistence.is_fresh());
+    }
+    assert!(path.join("CURRENT").exists(), "the directory now exists");
+
+    let reopened = RocksDbPersistence::new(&path)?;
+    assert!(
+        reopened.is_fresh(),
+        "an empty database must still be fresh, or initialization never runs"
+    );
+
+    // One row is enough to stop being fresh.
+    reopened
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    reopened.shutdown().await?;
+    drop(reopened);
+    assert!(
+        !RocksDbPersistence::new(&path)?.is_fresh(),
+        "a database with data is not fresh"
+    );
+    Ok(())
+}
+
+/// Two databases sharing one backup directory interleave their generations,
+/// so retention prunes the wrong ones and a restore returns whichever wrote
+/// last. Silent until someone restores, so it is refused at backup time.
+#[tokio::test]
+async fn a_backup_directory_belongs_to_one_database() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+
+    let first = RocksDbPersistence::new(&dir.path().join("a"))?;
+    first
+        .write(&[entry(1, 1, 10, "a", None)?], &[], ConflictStrategy::Error)
+        .await?;
+    first.backup(&backup_dir, 4)?;
+
+    let second = RocksDbPersistence::new(&dir.path().join("b"))?;
+    second
+        .write(&[entry(1, 2, 20, "b", None)?], &[], ConflictStrategy::Error)
+        .await?;
+    let err = second
+        .backup(&backup_dir, 4)
+        .expect_err("a second database must not write into the same chain");
+    assert!(format!("{err:#}").contains("different database"), "{err:#}");
+
+    // The first database is still free to keep using it.
+    first.backup(&backup_dir, 4)?;
+    assert_eq!(backup::list(&backup_dir)?.len(), 2);
+    Ok(())
+}
+
+/// A key whose newest version at the read timestamp is a tombstone advances the
+/// scan without producing a row, so a page bounded only by rows could walk an
+/// entire index in one blocking call. The budget that prevents that must still
+/// resume correctly — stopping early with an empty page and no cursor would
+/// report a scan as finished when it was not.
+#[tokio::test]
+async fn index_scan_over_many_tombstones_makes_progress_and_resumes() -> anyhow::Result<()> {
+    let f = Fixture::new()?;
+    // 400 keys, every one deleted at ts 20, then one live key past them all.
+    for i in 0..400u32 {
+        let key = format!("k{i:04}");
+        f.persistence
+            .write(
+                &[entry(1, i, 10, "v", None)?],
+                &[index_entry(1, key.as_bytes(), 10, Some(doc_id(1, i)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        f.persistence
+            .write(
+                &[],
+                &[index_entry(1, key.as_bytes(), 20, None)],
+                ConflictStrategy::Error,
+            )
+            .await?;
+    }
+    f.persistence
+        .write(
+            &[entry(1, 9999, 10, "live", None)?],
+            &[index_entry(1, b"zzzz", 10, Some(doc_id(1, 9999)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    // One row requested, so the budget is small — the scan must still reach the
+    // live key past 400 tombstones rather than reporting an empty result.
+    let rows: Vec<_> = f
+        .persistence
+        .reader()
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(20),
+            &interval(b"", None),
+            Order::Asc,
+            1,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the live key past the tombstones must be found"
+    );
+    assert_eq!(rows[0].0 .0, b"zzzz".to_vec());
+    Ok(())
+}
+
+/// A secondary instance is the only way to read a database another process has
+/// open, and RocksDB rejects `ReadOptions::snapshot` on one outright. Every
+/// paged read has to work through it, which nothing checked before.
+#[tokio::test]
+async fn a_secondary_instance_can_actually_read() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    let primary = RocksDbPersistence::new(&path)?;
+    let id = doc_id(1, 1);
+    primary
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(id))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    let secondary = RocksDbPersistence::new_secondary(&path, &dir.path().join("secondary"))?;
+    let reader = secondary.reader();
+
+    let documents: Vec<_> = reader
+        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(
+        documents.len(),
+        1,
+        "load_documents must work on a secondary"
+    );
+
+    let from_table: Vec<_> = reader
+        .load_documents_from_table(tablet(1), TimestampRange::all(), Order::Asc, 8, validator())
+        .try_collect()
+        .await?;
+    assert_eq!(from_table.len(), 1, "load_documents_from_table must work");
+
+    let rows: Vec<_> = reader
+        .index_scan(
+            index_id(1),
+            tablet(1),
+            ts(10),
+            &interval(b"", None),
+            Order::Asc,
+            8,
+            validator(),
+        )
+        .try_collect()
+        .await?;
+    assert_eq!(rows.len(), 1, "index_scan must work on a secondary");
+
+    let previous = reader
+        .previous_revisions(BTreeSet::from([(id, ts(10))]), validator())
+        .await?;
+    assert!(previous.is_empty(), "no earlier revision exists");
+
+    assert_eq!(reader.max_ts().await?, Some(ts(10)));
+    Ok(())
+}
+
+/// A restored database has to be able to keep backing up into the chain it came
+/// from. RocksDB's own `IDENTITY` is not carried by a backup, so anything keyed
+/// on it locks the restored database out at exactly the moment it is
+/// recovering.
+#[tokio::test]
+async fn a_restored_database_can_continue_its_backup_chain() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backup_dir = dir.path().join("backup");
+    {
+        let original = RocksDbPersistence::new(&dir.path().join("original"))?;
+        original
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        original.backup(&backup_dir, 8)?;
+        original.shutdown().await?;
+    }
+
+    let restored_path = dir.path().join("restored");
+    backup::restore(&backup_dir, &restored_path, None)?;
+    let restored = RocksDbPersistence::new(&restored_path)?;
+    restored
+        .write(
+            &[entry(1, 2, 20, "v2", None)?],
+            &[index_entry(1, b"k2", 20, Some(doc_id(1, 2)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    // The whole point: this must not be refused as "a different database".
+    restored.backup(&backup_dir, 8)?;
+    assert_eq!(
+        backup::list(&backup_dir)?.len(),
+        2,
+        "the restored database must extend its own chain"
     );
     Ok(())
 }

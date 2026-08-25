@@ -140,6 +140,20 @@ fn default_instance_label(path: &Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
+/// Key under which a database's backup identity lives in the `globals` column
+/// family. Namespaced away from every `PersistenceGlobalKey`.
+const IDENTITY_KEY: &[u8] = b"__convex_rocksdb_backup_identity";
+
+/// Key under which the on-disk layout version lives, in the same column family.
+const FORMAT_VERSION_KEY: &[u8] = b"__convex_rocksdb_format_version";
+
+/// Version of the on-disk layout this build writes and understands.
+///
+/// The key encodings in [`keys`] — the escaping, the descending-timestamp
+/// convention, the set of column families — are a format, and a format with no
+/// version is one that opens an incompatible directory cleanly and returns
+/// wrong answers. Bump this whenever any of them changes.
+const FORMAT_VERSION: u64 = 1;
 
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
@@ -156,7 +170,12 @@ pub struct ReadCheck {
 /// database's background work, and how this database shares the process with
 /// any others — and an `open(path, true, false, None)` at a call site says none
 /// of that.
-#[derive(Default)]
+///
+/// `Default` is written out rather than derived: `background` must default to
+/// **true**, and a derive would give it `false` — which is not merely
+/// un-optimised but strictly less durable than `SyncMode::Never`, since the
+/// database is then opened with `manual_wal_flush` and nothing moves the
+/// buffer.
 pub struct OpenOptions {
     /// Durability mode. `None` takes it from the environment.
     pub sync: Option<options::SyncMode>,
@@ -164,9 +183,20 @@ pub struct OpenOptions {
     /// that has stopped accepting writes keeps the process alive.
     pub shutdown: Option<ShutdownSignal>,
     /// Whether to run background work — the interval WAL flusher, the periodic
-    /// backup worker and the health monitor. False for short-lived opens such
-    /// as a restore rehearsal, which must not attach either to the production
-    /// backup chain or to a shutdown signal.
+    /// backup worker and the health monitor.
+    ///
+    /// Defaults to **true**, because `SyncMode::Interval` without a flusher is
+    /// not merely un-optimised, it is *less* durable than `Never`: the database
+    /// is opened with `manual_wal_flush`, so acknowledged writes sit in
+    /// RocksDB's own buffer with nothing to move them. A default of false made
+    /// every caller that did not think about it — including this crate's own
+    /// tests and the benchmark — silently opt out of the durability mode they
+    /// asked for.
+    ///
+    /// Set it false only for a short-lived open that must not touch shared
+    /// state: a restore rehearsal, which would otherwise attach a backup worker
+    /// to a scratch database and write generations of it into the production
+    /// chain.
     pub background: bool,
     /// Which deployment this database belongs to, used to label the
     /// per-database gauges (backup age, WAL flush age).
@@ -188,6 +218,22 @@ pub struct OpenOptions {
     /// Per-database RocksDB knobs. Defaults defer to the environment, which is
     /// what a single-tenant backend wants; see [`options::DbTuning`].
     pub tuning: options::DbTuning,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            sync: None,
+            shutdown: None,
+            background: true,
+            // The multi-database fields all default to "behave exactly as a
+            // single-tenant backend did": no explicit label, no per-database
+            // backup directory, and tuning that defers to the environment.
+            instance: None,
+            backup_dir: None,
+            tuning: options::DbTuning::default(),
+        }
+    }
 }
 
 /// An embedded RocksDB [`Persistence`].
@@ -220,6 +266,8 @@ pub(crate) struct Inner {
     /// Present on any primary opened with a shutdown signal. Same `Weak`
     /// reasoning.
     health: std::sync::OnceLock<health::HealthMonitor>,
+    /// In-flight write durations, so a stalled write is visible as a level.
+    pub(crate) write_watch: health::WriteWatch,
 }
 
 impl RocksDbPersistence {
@@ -252,6 +300,16 @@ impl RocksDbPersistence {
         Self::open(path, true, opts)
     }
 
+    /// Whether an interval WAL flusher is running.
+    ///
+    /// Exists so a test about the flusher can assert that one exists: the
+    /// difference between "the flusher made this durable" and "`Inner::drop`
+    /// did" is invisible in the result, and a test that cannot tell them apart
+    /// is not testing what it claims.
+    pub fn has_wal_flusher(&self) -> bool {
+        self.inner.wal_flusher.get().is_some()
+    }
+
     /// Open a read-only view of a database another process has open for
     /// writing.
     ///
@@ -278,6 +336,7 @@ impl RocksDbPersistence {
         let db = Db::open_cf_descriptors_as_secondary(&shared.db, path, secondary_path, cfs)
             .with_context(|| format!("failed to open RocksDB secondary at {}", path.display()))?;
         db.try_catch_up_with_primary()?;
+        check_format_version(&db, path, false)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -292,6 +351,7 @@ impl RocksDbPersistence {
                 wal_flusher: std::sync::OnceLock::new(),
                 backup_worker: std::sync::OnceLock::new(),
                 health: std::sync::OnceLock::new(),
+                write_watch: health::WriteWatch::default(),
             }),
         })
     }
@@ -302,8 +362,8 @@ impl RocksDbPersistence {
         // database, so its absence is the reliable "nothing here yet" signal —
         // more so than the directory existing, which a mount or a failed
         // earlier attempt can also produce.
-        let newly_created = !path.join("CURRENT").exists();
-        if newly_created && !create_if_missing {
+        let directory_is_new = !path.join("CURRENT").exists();
+        if directory_is_new && !create_if_missing {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
 
@@ -316,10 +376,35 @@ impl RocksDbPersistence {
         let db = Db::open_cf_descriptors(&shared.db, path, cfs)
             .with_context(|| format!("failed to open RocksDB at {}", path.display()))?;
 
+        // Freshness is a property of the *data*, not of the directory. RocksDB
+        // writes `CURRENT` as the last step of creating a database, before
+        // Convex has written a single row, so a process killed anywhere inside
+        // `Database::initialize` — an OOM, an eviction, a node reboot — would
+        // reopen to a directory that exists and a database that is empty. Its
+        // caller would then skip initialization and fail forever on the missing
+        // bootstrap tables, with no way out but deleting the volume. Postgres
+        // asks the same question of the data (`SELECT 1 FROM documents LIMIT
+        // 1`), and recovers from this automatically.
+        let newly_created = {
+            let dlog = db
+                .cf_handle(CF_DLOG)
+                .context("missing column family dlog just after opening")?;
+            let mut iter = db.raw_iterator_cf(&dlog);
+            iter.seek_to_first();
+            iter.status()?;
+            !iter.valid()
+        };
+
+        check_format_version(&db, path, create_if_missing)?;
+
         tracing::info!(
             "opened RocksDB persistence at {} ({})",
             path.display(),
-            if newly_created { "fresh" } else { "existing" },
+            match (directory_is_new, newly_created) {
+                (true, _) => "created",
+                (false, true) => "existing but empty; will be initialized",
+                (false, false) => "existing",
+            },
         );
 
         let inner = Arc::new(Inner {
@@ -337,6 +422,7 @@ impl RocksDbPersistence {
             wal_flusher: std::sync::OnceLock::new(),
             backup_worker: std::sync::OnceLock::new(),
             health: std::sync::OnceLock::new(),
+            write_watch: health::WriteWatch::default(),
         });
 
         if opts.background
@@ -385,8 +471,15 @@ impl RocksDbPersistence {
 /// `Persistence::shutdown` is the intended teardown, but nothing in the tree
 /// calls it: `Database::shutdown` stops the committer and its workers and
 /// returns, and no relational backend overrides `shutdown` either, so the hook
-/// was never wired up. Dropping the handle is therefore the path production
-/// actually takes, and it has to be the safe one. Without this, `db` — the
+/// was never wired up. Dropping the handle is the closest thing to a teardown
+/// that runs, so it has to be the safe one.
+///
+/// It is not guaranteed to run either. `local_backend` installs no SIGTERM
+/// handler, so a Kubernetes pod stop terminates the process with no destructor
+/// executing at all — which under `SyncMode::Interval` costs up to one interval
+/// on every rolling restart. Under the default `SyncMode::Every` nothing is
+/// lost. Wiring a signal handler to `Persistence::shutdown` is an upstream gap
+/// affecting every backend, not just this one. Without this, `db` — the
 /// first field — would close while the workers were still running, and in
 /// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
 impl Drop for Inner {
@@ -409,6 +502,40 @@ impl Drop for Inner {
             tracing::error!("failed to flush the RocksDB WAL while closing: {e}");
         }
     }
+}
+
+/// Refuses a directory whose on-disk layout this build does not understand, and
+/// stamps the version on one that has none.
+///
+/// Shared by the primary and secondary open paths: a secondary reads the same
+/// files with the same encodings, and `connect_persistence_reader` is exactly
+/// where a stale binary is most likely to be pointed at a newer volume.
+fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow::Result<()> {
+    let globals = db
+        .cf_handle(CF_GLOBALS)
+        .context("missing column family globals just after opening")?;
+    match db.get_cf(&globals, FORMAT_VERSION_KEY)? {
+        Some(raw) => {
+            let found: u64 = String::from_utf8_lossy(&raw)
+                .trim()
+                .parse()
+                .with_context(|| format!("unreadable format version in {}", path.display()))?;
+            anyhow::ensure!(
+                found == FORMAT_VERSION,
+                "{} was written in RocksDB layout version {found}, and this build understands \
+                 {FORMAT_VERSION}. Opening it would read the data with the wrong key encodings.",
+                path.display(),
+            );
+        },
+        // Absent on a database just created, and on one written before
+        // versioning existed — the same layout, so stamping it is correct
+        // rather than a migration. A secondary never writes.
+        None if stamp_if_missing => {
+            db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
+        },
+        None => {},
+    }
+    Ok(())
 }
 
 impl Inner {
@@ -468,6 +595,50 @@ impl Inner {
              and scans perfectly, so this is reported as a failure rather than a pass.",
         );
         Ok(check)
+    }
+
+    /// A stable name for this database, for tying a backup directory to the
+    /// database that produced it.
+    ///
+    /// Stored in the `globals` column family rather than taken from RocksDB's
+    /// `IDENTITY` file, because `IDENTITY` is **not** among the files a backup
+    /// captures: `GetLiveFilesStorageInfo` never lists it, so a restored
+    /// database mints a fresh UUID on its first open. Using it would lock a
+    /// restored database out of its own backup chain — every backup failing
+    /// from the moment of recovery onward, which is exactly when a deployment
+    /// can least afford to stop taking them. A key in `globals` is copied with
+    /// the rest of the data and comes back unchanged.
+    ///
+    /// The key is namespaced so it cannot collide with a
+    /// `PersistenceGlobalKey`, and Convex only ever reads globals by known
+    /// key, so it stays invisible above the trait.
+    pub(crate) fn identity(&self) -> anyhow::Result<String> {
+        let globals = self.cf(CF_GLOBALS)?;
+        if let Some(bytes) = self.db.get_cf(&globals, IDENTITY_KEY)? {
+            return Ok(String::from_utf8(bytes)?);
+        }
+        // First call on this database: mint one and keep it. Derived from the
+        // engine's own id when it has one, so two databases created in the same
+        // instant cannot collide.
+        let minted = std::fs::read_to_string(self.path.join("IDENTITY"))
+            .map(|id| id.trim().to_string())
+            .unwrap_or_else(|_| format!("path:{}", self.path.display()));
+        self.db.put_cf(&globals, IDENTITY_KEY, minted.as_bytes())?;
+        Ok(minted)
+    }
+
+    /// A snapshot to read a whole page against, or `None` on a secondary.
+    ///
+    /// RocksDB rejects `ReadOptions::snapshot` on a secondary instance outright
+    /// — `NewErrorIterator(Status::NotSupported("snapshot not supported in
+    /// secondary mode"))` — so passing one turns every paged read into an
+    /// error. Nothing is lost by omitting it there: a secondary's view of the
+    /// primary's files only advances when `try_catch_up_with_primary` is
+    /// called, which [`Inner::refresh`] does once at the start of a page and
+    /// never during one. The view is therefore already frozen for the page's
+    /// duration, which is the property the snapshot buys on a primary.
+    pub(crate) fn read_snapshot(&self) -> Option<rocksdb::SnapshotWithThreadMode<'_, Db>> {
+        (!self.secondary).then(|| self.db.snapshot())
     }
 
     /// Bring a secondary instance up to date with its primary. A no-op on the
@@ -656,6 +827,12 @@ impl Persistence for RocksDbPersistence {
         let write = PendingWrite::encode(documents, indexes)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write", move || {
+            // Timed from inside the blocking task, because the thing being
+            // watched for is a write that never returns: RocksDB stalls a
+            // writer it cannot make progress for instead of failing it, and a
+            // parked writer holds this thread until the volume recovers or the
+            // process is stopped.
+            let _guard = inner.write_watch.begin();
             inner.apply_write(write, conflict_strategy)
         })
         .await
@@ -670,6 +847,7 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
+            let _guard = inner.write_watch.begin();
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
@@ -698,6 +876,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
+                let _guard = inner.write_watch.begin();
                 let idx = inner.cf(CF_IDX)?;
 
                 // Retention deletes every version of a key at or before a
@@ -755,6 +934,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
+                let _guard = inner.write_watch.begin();
                 // Same collapse as `delete_index_entries`: one document can be
                 // named more than once, and each revision must count once.
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
@@ -786,6 +966,7 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
+            let _guard = inner.write_watch.begin();
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
 
@@ -827,6 +1008,11 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
+            let _guard = inner.write_watch.begin();
+            // `atomic_flush` routes any single-family flush through
+            // `AtomicFlushMemTables` over all of them, so the first call does
+            // the work and the rest are near-no-ops. Kept as a loop only
+            // because the binding exposes no multi-family flush.
             for name in ALL_COLUMN_FAMILIES {
                 inner.db.flush_cf(&inner.cf(name)?)?;
             }
@@ -893,7 +1079,12 @@ impl RocksDbPersistence {
                     table_name: name.to_string(),
                     data_bytes: property("rocksdb.live-sst-files-size")
                         + property("rocksdb.total-blob-file-size"),
-                    index_bytes: property("rocksdb.estimate-table-readers-mem"),
+                    // An LSM has no separable index structure to measure — the
+                    // index and filter blocks are inside the SST files already
+                    // counted above. Reporting anything here would be
+                    // double-counting; this used to report
+                    // `estimate-table-readers-mem`, which is memory, not disk.
+                    index_bytes: 0,
                     row_count: Some(property("rocksdb.estimate-num-keys")),
                 });
             }
@@ -914,9 +1105,21 @@ impl RocksDbPersistence {
 /// `index_scan` and the `previous_revisions` family all resolve a list of
 /// document coordinates into bodies; batching turns what would be one point get
 /// per row into a single `multi_get`.
+/// Resolves document bodies for coordinates an index or table scan produced.
+///
+/// `read_opts` must carry the *same* snapshot the scan's iterator used.
+/// Without it the two phases read two different points in time: the iterator
+/// pins a sequence number for its lifetime, a default-options `multi_get` reads
+/// the latest state, and a retention delete landing between them removes the
+/// body of a row the iterator had already returned. The scan then fails with
+/// "missing its body" or "dangling index reference" — for data that was
+/// perfectly consistent at the snapshot it claimed to be reading. The
+/// relational backends cannot hit this because they resolve the body in the
+/// same statement, at one MVCC snapshot.
 pub(crate) fn multi_get_documents(
     inner: &Inner,
     coordinates: &[(Timestamp, InternalDocumentId)],
+    read_opts: &rocksdb::ReadOptions,
 ) -> anyhow::Result<
     BTreeMap<(Timestamp, InternalDocumentId), (Option<ResolvedDocument>, Option<Timestamp>)>,
 > {
@@ -930,7 +1133,7 @@ pub(crate) fn multi_get_documents(
         .collect();
     let results = inner
         .db
-        .multi_get_cf(encoded.iter().map(|key| (&dlog, &key[..])));
+        .multi_get_cf_opt(encoded.iter().map(|key| (&dlog, &key[..])), read_opts);
 
     let mut out = BTreeMap::new();
     for ((ts, id), result) in coordinates.iter().zip(results) {

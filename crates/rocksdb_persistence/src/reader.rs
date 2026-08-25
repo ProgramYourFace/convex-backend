@@ -102,11 +102,38 @@ struct IndexPage {
     cursor: Option<Vec<u8>>,
 }
 
-/// Ceiling on how many index entries may share one truncated key prefix before
-/// [`Inner::load_index_chunk`] gives up. Reaching it needs many distinct index
-/// keys that agree on their first `MAX_INDEX_KEY_PREFIX_LEN` bytes, each with
-/// its own version run. Failing loudly beats buffering without bound.
+/// Ceiling on how many index entries may share one `key_prefix` before
+/// [`Inner::load_index_chunk`] gives up.
+///
+/// For any key short enough to be its own prefix — which is nearly all of
+/// them — a group is one key's *version run*, so the real trigger is a single
+/// index key rewritten this many times inside the retention window, not a
+/// prefix collision. Failing loudly beats buffering without bound, but it is a
+/// hard error, so the ceiling is set far above any plausible run.
 const MAX_INDEX_ENTRY_GROUP: usize = 65_536;
+
+/// How many index keys one page may examine per row it is asked to produce.
+///
+/// Tombstoned keys advance the iterator without producing a row, so without a
+/// ceiling a page over a mass-deleted table is a scan of the whole index on one
+/// blocking thread. Generous enough that ordinary tombstone density never
+/// truncates a page early; the cursor makes an early return correct anyway.
+const KEYS_PER_ROW_BUDGET: usize = 64;
+
+/// `ReadOptions` pinned to `snapshot`, for resolving document bodies at the
+/// same point in time the scan's iterator is walking.
+///
+/// `None` — a secondary instance, which RocksDB does not let take snapshots —
+/// yields plain options. See [`crate::Inner::read_snapshot`].
+fn snapshot_read_opts(
+    snapshot: Option<&rocksdb::SnapshotWithThreadMode<'_, crate::Db>>,
+) -> rocksdb::ReadOptions {
+    let mut opts = rocksdb::ReadOptions::default();
+    if let Some(snapshot) = snapshot {
+        opts.set_snapshot(snapshot);
+    }
+    opts
+}
 
 impl Inner {
     /// Read a page of the document log, ordered by timestamp.
@@ -141,7 +168,12 @@ impl Inner {
         };
         let cf = self.cf(cf_name)?;
 
-        let mut read_opts = rocksdb::ReadOptions::default();
+        // One snapshot for both phases of this page: the keys the iterator
+        // walks, and the bodies resolved for them afterwards. See
+        // `multi_get_documents` for what reading them at two different points
+        // in time does.
+        let snapshot = self.read_snapshot();
+        let mut read_opts = snapshot_read_opts(snapshot.as_ref());
         read_opts.set_iterate_lower_bound(lower.clone());
         read_opts.set_iterate_upper_bound(upper);
         let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
@@ -204,7 +236,8 @@ impl Inner {
         let entries = if tablet_id.is_none() {
             inline
         } else {
-            let bodies = multi_get_documents(self, &coordinates)?;
+            let bodies =
+                multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
             coordinates
                 .iter()
                 .map(|(ts, id)| {
@@ -254,7 +287,10 @@ impl Inner {
             End::Unbounded => keys::idx_upper_bound(index_id, None),
         };
 
-        let mut read_opts = rocksdb::ReadOptions::default();
+        // One snapshot for the index walk and the body resolution that follows
+        // it — see `multi_get_documents`.
+        let snapshot = self.read_snapshot();
+        let mut read_opts = snapshot_read_opts(snapshot.as_ref());
         read_opts.set_iterate_lower_bound(lower.clone());
         if !upper.is_empty() {
             read_opts.set_iterate_upper_bound(upper.clone());
@@ -273,8 +309,20 @@ impl Inner {
         let mut resolved: Vec<(IndexKeyBytes, Timestamp, InternalDocumentId)> =
             Vec::with_capacity(limit);
         let mut last_prefix = None;
-        while iter.valid() && resolved.len() < limit {
+        // Bounded by keys *examined* as well as rows produced. A key whose
+        // newest version at `read_timestamp` is a tombstone advances the
+        // iterator without producing a row, so a limit on rows alone lets one
+        // page walk an entire index — a table that has just been mass-deleted
+        // is exactly that shape. That would hold a blocking thread for the
+        // length of the whole scan and skip the retention validator for all of
+        // it. The relational backends batch on rows fetched, deletes included.
+        let mut examined = 0;
+        while iter.valid()
+            && resolved.len() < limit
+            && examined < limit.saturating_mul(KEYS_PER_ROW_BUDGET)
+        {
             let Some(key) = iter.key() else { break };
+            examined += 1;
             anyhow::ensure!(
                 key.len() > keys::TS_LEN,
                 "malformed index key of {} bytes",
@@ -319,7 +367,8 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = resolved.iter().map(|(_, ts, id)| (*ts, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut rows = Vec::with_capacity(resolved.len());
         for (index_key, ts, document_id) in resolved {
             let (value, prev_ts) = bodies.get(&(ts, document_id)).cloned().ok_or_else(|| {
@@ -331,11 +380,12 @@ impl Inner {
             rows.push((index_key, LatestDocument { ts, value, prev_ts }));
         }
 
-        let cursor = if rows.len() < limit {
-            None
-        } else {
-            last_prefix
-        };
+        // Whether to resume is "did the iterator run out", not "did the page
+        // fill". Those coincided while rows were the only bound; with the
+        // examined-key budget above, a page can stop early with room to spare,
+        // and reporting `None` there would tell the caller the scan was
+        // finished when it was not.
+        let cursor = iter.valid().then_some(last_prefix).flatten();
         Ok(IndexPage { rows, cursor })
     }
 
@@ -348,15 +398,22 @@ impl Inner {
         let idx = self.cf(CF_IDX)?;
         let mut iter = self.db.raw_iterator_cf(&idx);
         match &cursor {
-            // Start at the cursor's own key: later versions of it may still be
-            // ahead of the cursor in `IndexEntry` order.
-            Some(entry) => {
-                let mut full_key = entry.key_prefix.clone();
-                if let Some(suffix) = &entry.key_suffix {
-                    full_key.extend_from_slice(suffix);
-                }
-                iter.seek(keys::idx_key_prefix(entry.index_id, &full_key));
-            },
+            // Resume at the start of the cursor's *prefix group*, not at the
+            // cursor's own key.
+            //
+            // Within a group, `IndexEntry` order is `sha256(full_key)` order,
+            // which has no relationship to storage order. So an entry that
+            // belongs after the cursor in `IndexEntry` order — and therefore
+            // still owes the caller an appearance — can sit *before* the
+            // cursor's key in storage. Seeking to the cursor's own key would
+            // start past it and it would never be emitted at all. Seeking to
+            // the group start rescans the group and the `entry > cursor` filter
+            // below picks up exactly what is still owed.
+            //
+            // `idx_lower_bound` on the truncated prefix is at or before every
+            // key in the group, so at worst this rescans a little more than
+            // needed; the filter makes that free of duplicates.
+            Some(entry) => iter.seek(keys::idx_lower_bound(entry.index_id, &entry.key_prefix)),
             None => iter.seek_to_first(),
         }
 
@@ -377,6 +434,11 @@ impl Inner {
         let mut out = Vec::with_capacity(chunk_size);
         let mut group: Vec<IndexEntry> = Vec::new();
         let mut group_prefix: Option<Vec<u8>> = None;
+        // Draining stops as soon as `out` is full, and whatever is left in the
+        // group is simply dropped — which is correct only because the resume
+        // above rescans the whole group. Emitting a prefix of the sorted group
+        // and letting the next call re-derive the rest is what keeps the two
+        // halves consistent.
         let flush = |group: &mut Vec<IndexEntry>, out: &mut Vec<IndexEntry>| {
             group.sort();
             for entry in group.drain(..) {
@@ -442,7 +504,11 @@ impl Inner {
     ) -> anyhow::Result<BTreeMap<(InternalDocumentId, Timestamp), DocumentLogEntry>> {
         self.refresh()?;
         let docs = self.cf(CF_DOCS)?;
-        let mut iter = self.db.raw_iterator_cf(&docs);
+        // One snapshot across the revision walk and the body resolution below.
+        let snapshot = self.read_snapshot();
+        let mut iter = self
+            .db
+            .raw_iterator_cf_opt(&docs, snapshot_read_opts(snapshot.as_ref()));
 
         // Locate each predecessor first, then fetch all the bodies at once.
         let mut located = Vec::with_capacity(ids.len());
@@ -465,7 +531,8 @@ impl Inner {
         iter.status()?;
 
         let coordinates: Vec<_> = located.iter().map(|(id, _, prev)| (*prev, *id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut out = BTreeMap::new();
         for (id, ts, prev_ts) in located {
             let (value, prev_prev_ts) = bodies.get(&(prev_ts, id)).cloned().ok_or_else(|| {
@@ -492,7 +559,9 @@ impl Inner {
         self.refresh()?;
         let queries: Vec<_> = ids.into_iter().collect();
         let coordinates: Vec<_> = queries.iter().map(|q| (q.prev_ts, q.id)).collect();
-        let bodies = multi_get_documents(self, &coordinates)?;
+        let snapshot = self.read_snapshot();
+        let bodies =
+            multi_get_documents(self, &coordinates, &snapshot_read_opts(snapshot.as_ref()))?;
         let mut out = BTreeMap::new();
         for query in queries {
             let Some((value, prev_prev_ts)) = bodies.get(&(query.prev_ts, query.id)).cloned()

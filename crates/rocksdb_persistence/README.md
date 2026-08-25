@@ -84,7 +84,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
 | `ROCKSDB_SYNC_INTERVAL_MS` | `0` (off) | flush and fsync the WAL on a timer instead of per write; overrides `ROCKSDB_SYNC_WRITES` |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
-| `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | the whole memory budget: cached data, index and filter blocks *and* memtable charge all come out of it |
+| `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | cached data, index and filter blocks *and* memtable charge; the largest, but not the only, consumer |
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
 | `ROCKSDB_WRITE_BUFFER_BYTES` | ¼ of the cache | ceiling on memtable memory across all column families — a share of the cache, not memory on top of it |
 | `ROCKSDB_MEMTABLE_BYTES` | 64 MiB | per-column-family memtable |
@@ -93,7 +93,9 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
-| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled WAL flush |
+| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled write |
+| `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS` | 120 | how long one write may be in flight, with no stall reported, before the process is stopped |
+| `ROCKSDB_MIN_FLUSH_SILENCE_SECONDS` | 120 | floor on how long the WAL may go unflushed before the flusher is presumed dead |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -116,19 +118,24 @@ What it buys depends entirely on the commit rate, because RocksDB already coales
 concurrent writers into one write group and fsyncs once for the group. Measured on the
 device-location workload (`crates/persistence_bench`, fsync p50 0.17 ms on the test VM):
 
-| events per commit | commits/s | every | interval=100ms | gain |
+| events per commit | every | interval=100ms | never | interval's gain |
 |--:|--:|--:|--:|--:|
-| 1 | 494 | 494 ev/s | 618 ev/s | **+25 %** |
-| 4 | 225 | 901 ev/s | 1047 ev/s | **+16 %** |
-| 16 | 79 | 1271 ev/s | 1464 ev/s | **+15 %** |
-| 64 | 25 | 1574 ev/s | 1669 ev/s | +6 %, within noise |
+| 1 | 403 ev/s | 532 ev/s | 549 ev/s | **+32 %** |
+| 4 | 682 ev/s | 829 ev/s | 940 ev/s | **+22 %** |
+| 16 | 1111 ev/s | 1202 ev/s | 1076 ev/s | +8 % |
+| 64 | 1159 ev/s | 1291 ev/s | 1279 ev/s | +11 % |
 
-Interval mode captures essentially all of what `never` offers while keeping the loss
-window bounded, so there is no reason to prefer `never` over a short interval. But the
-gain is a function of how many commits per second reach the disk: batch writes into
-larger transactions and the fsync stops mattering, which is the cheaper fix. Note that
-these ratios are a floor for slower storage — on a network-attached volume where an
-fsync costs milliseconds rather than 0.17 ms, the same commit rate pays more for it.
+Interval mode captures most of what `never` offers while keeping the loss window bounded,
+so there is little reason to prefer `never` over a short interval. But the gain is a
+function of how many commits per second reach the disk: batch writes into larger
+transactions and the fsync stops mattering, which is the cheaper fix. These ratios are a
+floor for slower storage — on a network-attached volume where an fsync costs milliseconds
+rather than 0.17 ms, the same commit rate pays more for it.
+
+(An earlier version of this table reported larger gains. It was measured through a code
+path that opened the database with `manual_wal_flush` and *no flusher thread*, so the
+"interval" column was `never` plus buffering and never fsynced at all. The default now
+runs background work, and these numbers are from a configuration that actually flushes.)
 
 `ROCKSDB_SYNC_WRITES=false` is the analogue of Postgres's
 `synchronous_commit=off`: it trades a bounded window of recent writes on host
@@ -149,10 +156,15 @@ memory. `ROCKSDB_BLOCK_CACHE_PERCENT` (default 25) is the share taken, clamped t
 [64 MiB, 4 GiB]. The chosen size and where it came from are logged at startup.
 
 A quarter rather than a half because the backend hosting this crate also runs V8
-isolates, whose heaps are the other large consumer in the process, and RocksDB's
-compaction buffers, iterators and WAL buffers sit outside the cache. Raise it on a
+isolates, whose heaps are the other large consumer in the process. Raise it on a
 deployment whose working set matters more than its isolate headroom; set
 `ROCKSDB_BLOCK_CACHE_BYTES` to override the derivation entirely.
+
+**The cache is the budget's largest term, not the whole of it.** Outside it: compaction
+buffers (one set per background job, defaulting to the core count), the table readers
+kept open by `max_open_files` (unlimited by default), blob file readers, and the batches retention builds
+before writing. Size the container with headroom over the cache rather than treating the
+cache as a ceiling.
 
 ## Several databases in one process
 
@@ -226,6 +238,7 @@ column family, so a backup can never hold an index entry whose document it misse
 `rocksdb-backup`, a separate binary in this crate, is the operator side:
 
 ```sh
+rocksdb-backup backup   /convex/backup --db /convex/data/db   # only while stopped
 rocksdb-backup list     /convex/backup
 rocksdb-backup verify   /convex/backup [--id N]      # checksum the files
 rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
@@ -238,8 +251,16 @@ restoring for — it belongs in an init container or a one-shot job. `restore` r
 non-empty target: move the old directory aside instead, so a live database is never
 written underneath and the current one stays recoverable.
 
-**`verify` is a checksum; `rehearse` is the test.** Verification says the files are
-present and the right size. Rehearsal restores into a scratch directory, opens the
+`rehearse` never deletes anything at the path you give it. It restores into a
+uniquely-named subdirectory it creates and removes only that, leaving the rest of the
+directory exactly as found — so `rehearse --scratch /convex/data/db` cannot destroy the live database. A backup directory also records which database owns it
+and refuses a second one, since interleaved generations mean retention prunes the wrong
+ones and a restore returns whichever wrote last.
+
+**`verify` checks sizes; `rehearse` is the test.** RocksDB's `VerifyBackup` defaults to
+size-and-presence rather than checksums, and the binding exposes no way to change that, so
+verification catches a truncated or missing file — the common destination failure — and
+not a corrupted one. Rehearsal restores into a scratch directory, opens the
 database, and **decodes** every document and index entry it finds — not just iterating,
 which would pass on bytes that no longer parse. It fails on an empty result, because a
 backup of an empty database restores and scans perfectly and is exactly the false pass a
@@ -263,7 +284,9 @@ replicating that directory off-node is an external job. A backup directory on th
 volume as the database protects against a bad migration, not against losing the volume.
 
 Watch `rocksdb_backup_age_seconds`. It is a gauge, published by the health monitor on its
-own short timer rather than by the backup worker — a level that keeps rising says "no
+own short timer rather than by the backup worker, and emitted from process start rather
+than from the first generation — a deployment whose backups have never worked is the case
+most worth alerting on, and waiting for a first backup would leave the series absent — a level that keeps rising says "no
 backup has landed", where a distribution that stops receiving samples says nothing at
 all, and the case worth catching is precisely the one where the backup worker is the
 thing that died.
@@ -283,20 +306,36 @@ stays that way. Every subsequent write fails, the process keeps serving, and not
 crashes. A Postgres deployment gets a pod that dies and a database another node can take
 over; an embedded one would fail every mutation indefinitely with no signal.
 
+**And the real symptom is a stall, not an error.** Measured against a full volume: writes
+stop returning entirely rather than failing, each one parking a blocking-pool thread, so
+nothing errors, nothing crashes, and no error counter moves. Only duration changes.
+
 So a health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
-on either of:
+on any of:
 
-- **a latched background error**, so the deployment restarts or fails over rather than
-  serving a database that cannot accept writes;
-- **a write-ahead log that has stopped being flushed** in interval mode, past ten
-  intervals. In that mode a write is acknowledged before it reaches the kernel, so a
-  persistently failing flush is acknowledged data accumulating unwritten — the loss is
-  unbounded, not "one interval", and stopping beats continuing to acknowledge writes that
-  are not being kept.
+- **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`** *and* no write
+  stall reported by the engine. RocksDB also blocks writers deliberately, as
+  backpressure — `allow_stall` on the write buffer manager, the L0 slowdown triggers —
+  and that drains as compaction catches up. Separating the two takes more than
+  `rocksdb.is-write-stopped`, which is the *write controller* and does not cover the
+  write-buffer-manager stall this backend enables — running flushes and compactions are
+  the signal that the engine is working through a backlog rather than stuck;
+- **a latched background error**, read from the `default` column family. That detail
+  matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
+  increments it on `default`, so polling the five families this backend defines returns a
+  permanent zero. Measured on a full filesystem: those five read `0` while `default` read
+  `3`.
+- **a write-ahead log whose flushes are failing** in interval mode, ten intervals running.
+  In that mode a write is acknowledged before it reaches the kernel, so persistent flush
+  failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
+  Escalation needs consecutive *failures*, not just elapsed time, so one slow fsync on a
+  contended volume cannot take the process down. A separate, much longer deadline —
+  `max(interval × 60, ROCKSDB_MIN_FLUSH_SILENCE_SECONDS)` — catches a flusher that died
+  without ever returning an error. The floor matters: without it, a 100 ms interval would
+  make that deadline six seconds.
 
-It also publishes `rocksdb_wal_flush_age_seconds`, which is the direct measurement of how
-much acknowledged data is currently at risk.
+It also publishes `rocksdb_oldest_write_seconds` and `rocksdb_wal_flush_age_seconds`.
 
 ## Semantics that differ from the relational backends
 
@@ -305,9 +344,11 @@ one-line "it's just a KV store".
 
 **Uniqueness is detected, not enforced.** `ConflictStrategy::Error` costs nothing in a
 B-tree, which gets it from a primary key *inside the transaction*; an LSM silently
-shadows an existing key instead. It is checked here with one batched, bloom-filtered
-point get per row written — but before the batch, not inside it, so two concurrent
-writes naming the same key can both probe clean and both apply. That is weaker than
+shadows an existing key instead. It is checked here with one batched point get per row
+written — but before the batch, not inside it, so two concurrent writes naming the same
+key can both probe clean and both apply. Nor is it free: document keys are
+bloom-filtered, but `idx` deliberately carries no filter (its reads are range scans), so
+every index entry written costs a filterless negative lookup. That is weaker than
 Postgres. It holds on the path that matters for a reason outside this crate: commits are
 serialized through one committer assigning strictly increasing timestamps, so no two can
 name the same `(ts, id)`. On the commit path that check is redundant — commit timestamps strictly
@@ -326,8 +367,10 @@ simpler and stronger than an advisory row, but it has consequences:
 - There is no failover through a shared database and no read replica. Recovery is
   restore-from-backup plus the WAL, not promote-a-follower.
 - A standalone reader (`connect_persistence_reader`) opens a RocksDB *secondary*
-  instance beside the primary, which reads its files without taking the write
-  lock and catches up on demand.
+  instance beside the primary, which reads its files without taking the write lock and
+  catches up on demand. It reads without an engine snapshot, because RocksDB rejects one
+  on a secondary; that costs nothing, since a secondary's view only advances when it is
+  told to catch up, which happens once at the start of a page and never during one.
 
 ## Durability and recovery
 
@@ -352,9 +395,12 @@ thread, as the Postgres backend also does.
 Reads are paged: a page is fetched on a blocking thread, the retention validator
 is consulted, and only then are its rows yielded — the same order Postgres uses,
 so a snapshot that falls out of retention mid-scan is never handed to the caller.
-Paging without an engine snapshot is safe because a `(ts, id)` row is written
-once and only ever removed by retention, which cannot touch anything the
-validator has approved.
+Each page reads against one engine snapshot, so the index walk and the document bodies
+it resolves see the same instant. Rows *can* disappear between pages — retention removes
+them continuously, and `delete_tablet_documents` does so with no reference to the
+retention window at all — and what makes that safe is that every cursor is a value rather
+than a position: a resume seeks to the cursor's key and steps past it only if the seek
+landed on it.
 
 ## Not implemented
 

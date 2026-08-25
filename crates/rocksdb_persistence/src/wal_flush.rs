@@ -23,6 +23,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicU32,
             Ordering,
         },
         Arc,
@@ -49,6 +50,10 @@ pub(crate) struct WalFlusher {
     /// acknowledged writes in RocksDB's buffer, so this — not the presence of
     /// error logs — is the measurement of whether the mode's loss bound holds.
     clock: Arc<FlushClock>,
+    /// Flushes that have failed since the last success. Distinguishes "the disk
+    /// is slow" from "the disk is broken", which the elapsed clock alone
+    /// cannot.
+    failures: Arc<AtomicU32>,
 }
 
 struct Signal {
@@ -67,6 +72,8 @@ impl WalFlusher {
         let signal = stop.clone();
         let clock = Arc::new(FlushClock::new());
         let thread_clock = clock.clone();
+        let failures = Arc::new(AtomicU32::new(0));
+        let thread_failures = failures.clone();
         let handle = std::thread::Builder::new()
             .name("rocksdb-wal-flusher".to_string())
             .spawn(move || {
@@ -79,7 +86,19 @@ impl WalFlusher {
                             // no state to be inconsistent, so carry on.
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        let _ = signal.wake.wait_timeout(guard, interval);
+                        // The flag is re-checked *under* the mutex. Waiting
+                        // without a predicate leaves a window where `stop()`
+                        // sets it and notifies before this thread parks, the
+                        // notification lands on nobody, and the thread sleeps
+                        // out the whole interval — up to an hour for the backup
+                        // worker — with `stop()` blocked in `join` behind it.
+                        let (guard, _) = signal
+                            .wake
+                            .wait_timeout_while(guard, interval, |_| {
+                                !signal.stopped.load(Ordering::Relaxed)
+                            })
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        drop(guard);
                     }
                     if signal.stopped.load(Ordering::Relaxed) {
                         break;
@@ -93,9 +112,11 @@ impl WalFlusher {
                     match inner.db.flush_wal(true) {
                         Ok(()) => {
                             thread_clock.record_success();
+                            thread_failures.store(0, Ordering::Relaxed);
                             timer.finish();
                         },
                         Err(e) => {
+                            thread_failures.fetch_add(1, Ordering::Relaxed);
                             timer.finish_developer_error();
                             // Log rather than crash *here*: one failed flush is
                             // a transient, the next tick retries, and the
@@ -115,7 +136,13 @@ impl WalFlusher {
             stop,
             handle: Mutex::new(Some(handle)),
             clock,
+            failures,
         })
+    }
+
+    /// Flushes that have failed since the last success.
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
     }
 
     /// How long since the log was last written through to disk.
@@ -127,7 +154,17 @@ impl WalFlusher {
     /// flush cannot race the close, and `Drop` calls it again for the paths
     /// that never reach `shutdown`.
     pub(crate) fn stop(&self) {
-        self.stop.stopped.store(true, Ordering::Relaxed);
+        {
+            // Set under the same mutex the waiter re-checks the flag beneath,
+            // so the notification cannot be issued into the gap before it
+            // parks.
+            let guard = match self.stop.lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.stop.stopped.store(true, Ordering::Relaxed);
+            drop(guard);
+        }
         self.stop.wake.notify_all();
         let handle = match self.handle.lock() {
             Ok(mut guard) => guard.take(),
@@ -141,7 +178,10 @@ impl WalFlusher {
             // `join` panics). Signalling is enough in that case: the loop is
             // already unwinding.
             if handle.thread().id() == std::thread::current().id() {
-                std::mem::forget(handle);
+                // Dropping the handle here would detach the thread, which is
+                // fine — it is this thread, and it is already unwinding out of
+                // the loop. Joining it would deadlock.
+                drop(handle);
             } else {
                 let _ = handle.join();
             }

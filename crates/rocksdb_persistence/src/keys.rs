@@ -263,7 +263,8 @@ pub fn escape_into(key: &[u8], out: &mut Vec<u8>) {
 /// below it and the escaped form of `key` itself, which is what makes it a
 /// correct inclusive lower bound and exclusive upper bound.
 fn escape_body_into(key: &[u8], out: &mut Vec<u8>) {
-    out.reserve(key.len());
+    // A `0x00` byte becomes two, so the worst case is twice the input.
+    out.reserve(key.len() * 2);
     for &b in key {
         out.push(b);
         if b == 0 {

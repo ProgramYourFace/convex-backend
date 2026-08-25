@@ -111,15 +111,57 @@ pub fn log_wal_flush_age(instance: &str, seconds: f64) {
     );
 }
 
-register_convex_counter!(
+register_convex_gauge!(
+    ROCKSDB_OLDEST_WRITE_SECONDS,
+    "How long the oldest in-flight write has been running",
+    &[INSTANCE_LABEL],
+);
+/// The signal a stall actually produces. A write RocksDB cannot make progress
+/// for blocks rather than failing, so no error counter moves and no `Result` is
+/// ever returned — only this number grows.
+///
+/// Published by the per-database health monitor, so it carries the label for
+/// the reason [`INSTANCE_LABEL`] gives: unlabelled, N monitors would each
+/// overwrite the last and the series would report whichever polled most
+/// recently rather than the database that is actually stuck.
+pub fn log_oldest_write(instance: &str, seconds: f64) {
+    log_gauge_with_labels(
+        &ROCKSDB_OLDEST_WRITE_SECONDS,
+        seconds,
+        vec![instance_label(instance)],
+    );
+}
+
+register_convex_gauge!(
     ROCKSDB_BACKGROUND_ERRORS_TOTAL,
     "Latched RocksDB background errors, which stop the database accepting writes",
     &[INSTANCE_LABEL],
 );
+/// A gauge, not a counter: the property is the *total* latched so far, so
+/// adding it to a counter on every poll would multiply one error by the poll
+/// rate. Being a level, it is also per database — see [`INSTANCE_LABEL`].
 pub fn log_background_errors(instance: &str, count: u64) {
-    log_counter_with_labels(
+    log_gauge_with_labels(
         &ROCKSDB_BACKGROUND_ERRORS_TOTAL,
-        count,
+        count as f64,
+        vec![instance_label(instance)],
+    );
+}
+
+register_convex_gauge!(
+    ROCKSDB_WRITE_STOPPED_TOTAL,
+    "Whether RocksDB is deliberately stalling writers as backpressure",
+    &[INSTANCE_LABEL],
+);
+/// Tells a deliberate stall apart from a hang — the difference between an
+/// ingest burst and a volume that has stopped accepting writes.
+///
+/// One database's deliberate backpressure says nothing about its neighbours',
+/// so this is labelled even though the unlabelled form would be cheaper.
+pub fn log_write_stopped(instance: &str, stopped: bool) {
+    log_gauge_with_labels(
+        &ROCKSDB_WRITE_STOPPED_TOTAL,
+        if stopped { 1.0 } else { 0.0 },
         vec![instance_label(instance)],
     );
 }
