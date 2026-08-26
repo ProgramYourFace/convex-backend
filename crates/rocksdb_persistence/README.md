@@ -92,6 +92,22 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
+| `ROCKSDB_WRITE_FAILURES_TO_ESCALATE` | 5 | consecutive failed engine writes before the process stops itself; `0` disables |
+| `ROCKSDB_REQUIRE_EXISTING` | `false` | refuse to start rather than create a database that is not there — see below |
+
+`ROCKSDB_REQUIRE_EXISTING` is worth setting on any cell whose volume already holds
+data. Without it a volume that fails to mount — an unbound PVC, a mistyped `subPath`,
+a re-provisioned claim — leaves an empty directory, RocksDB creates a fresh database
+in it, `Database::initialize` runs, and the cell comes up **healthy and empty**. Every
+probe passes, because there is nothing wrong with the process; the data is simply
+somewhere else. With it set, that is a refusal to start.
+
+Values are validated where getting them wrong would be silent: `0` disables the write
+escalation rather than making it fire on the first failure, a negative
+`ROCKSDB_BACKGROUND_JOBS` is warned about and treated as auto (RocksDB floors the
+derived counts at 1, so `-1` would otherwise mean one flush and one compaction thread),
+and the two memtable sizes are floored away from zero, where RocksDB reads `0` on the
+write-buffer manager as *disabled* and silently clamps a zero memtable up to 64 KiB.
 
 ### The two sync modes
 
