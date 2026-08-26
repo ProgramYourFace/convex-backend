@@ -490,6 +490,16 @@ impl RouteMapper for NoopRouteMapper {
 pub struct ConvexHttpService {
     router: Router,
     meta_routes_enabled: bool,
+    /// Extra routes served ALONGSIDE `/version` and `/metrics`, i.e. ahead of
+    /// any middleware `serve_with_middleware` installs.
+    ///
+    /// For routes that are a property of the PROCESS rather than of whatever
+    /// the middleware resolves per request. A multi-tenant host's cell-wide
+    /// administration is the motivating case: those requests carry no routable
+    /// `Host`, so a resolving middleware would fail them closed before they
+    /// reached a handler. Empty by default, so single-tenant behaviour is
+    /// unchanged.
+    extra_meta_routes: Option<Router>,
     version: String,
     service_name: &'static str,
     _concurrency_gauge: Option<PullingGauge>,
@@ -549,6 +559,7 @@ impl ConvexHttpService {
             _concurrency_gauge: Some(concurrency_gauge),
             service_name,
             meta_routes_enabled: true,
+            extra_meta_routes: None,
         }
     }
 
@@ -557,11 +568,27 @@ impl ConvexHttpService {
     }
 
     /// Routes not handled by the passed-in router.
+    /// Serve `router` ahead of the middleware, next to `/version`.
+    ///
+    /// Additive and opt-in: a service that never calls this is byte-identical
+    /// in behaviour to one from before this existed.
+    pub fn with_extra_meta_routes(mut self, router: Router) -> Self {
+        self.extra_meta_routes = Some(match self.extra_meta_routes {
+            Some(existing) => existing.merge(router),
+            None => router,
+        });
+        self
+    }
+
     fn meta_routes(&self) -> Router {
         let version = self.version.clone();
-        Router::new()
+        let base = Router::new()
             .route("/version", get(move || async move { version }))
-            .route("/metrics", get(metrics))
+            .route("/metrics", get(metrics));
+        match &self.extra_meta_routes {
+            Some(extra) => base.merge(extra.clone()),
+            None => base,
+        }
     }
 
     pub async fn serve<F: Future<Output = ()> + Send + 'static>(

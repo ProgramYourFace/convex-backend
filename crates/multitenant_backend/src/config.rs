@@ -92,6 +92,14 @@ pub struct MultitenantConfig {
     /// Backup root. Each instance gets `<root>/<instance>`; sharing one
     /// directory between databases would interleave their backup chains.
     pub backup_dir: Option<PathBuf>,
+    /// Bearer token for the cell-wide fleet endpoints (`crate::fleet`).
+    ///
+    /// `None` means those routes are NOT MOUNTED. Absence is the safe default:
+    /// a cell never configured for fleet operations should not answer them at
+    /// all, rather than answer 401 and invite guessing. This authorises an
+    /// operation across every hosted instance, so it must not be any single
+    /// instance's admin key.
+    pub admin_token: Option<String>,
     pub max_instances: usize,
     pub boot_concurrency: usize,
     pub isolate_percent_per_client: usize,
@@ -133,6 +141,10 @@ impl std::fmt::Debug for MultitenantConfig {
             .field("poll_interval", &self.poll_interval)
             .field("data_dir", &self.data_dir)
             .field("backup_dir", &self.backup_dir)
+            .field(
+                "admin_token",
+                &self.admin_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("max_instances", &self.max_instances)
             .field("boot_concurrency", &self.boot_concurrency)
             .field(
@@ -204,6 +216,14 @@ impl MultitenantConfig {
             optional("MULTITENANT_DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()),
         );
         let backup_dir = optional("MULTITENANT_BACKUP_DIR").map(PathBuf::from);
+        let admin_token = optional("MULTITENANT_ADMIN_TOKEN");
+        if let Some(token) = &admin_token {
+            anyhow::ensure!(
+                token.len() >= 32,
+                "MULTITENANT_ADMIN_TOKEN must be at least 32 characters; it authorises a \
+                 cell-wide operation"
+            );
+        }
 
         let max_instances = parse_or("MULTITENANT_MAX_INSTANCES", DEFAULT_MAX_INSTANCES)?;
         anyhow::ensure!(max_instances > 0, "MULTITENANT_MAX_INSTANCES must be > 0");
@@ -268,6 +288,7 @@ impl MultitenantConfig {
             poll_interval,
             data_dir,
             backup_dir,
+            admin_token,
             max_instances,
             boot_concurrency,
             isolate_percent_per_client,

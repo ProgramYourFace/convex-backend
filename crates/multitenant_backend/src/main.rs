@@ -66,6 +66,7 @@ use local_backend::{
 };
 use multitenant_backend::{
     config::MultitenantConfig,
+    fleet,
     host::{
         hosted_from_map,
         inject_resolved_hostname,
@@ -188,6 +189,14 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         hosted_from_map(state.instances.clone()),
     );
 
+    let fleet_routes = config.admin_token.as_ref().map(|token| {
+        fleet::router(fleet::FleetState {
+            instances: state.instances.clone(),
+            group: config.group.as_str().into(),
+            token: token.as_str().into(),
+        })
+    });
+
     let http_service = ConvexHttpService::new(
         router(state),
         "multitenant-backend",
@@ -196,6 +205,29 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );
+
+    // MOUNTED AHEAD OF THE RESOLVING MIDDLEWARE, next to `/version`.
+    //
+    // These are cell-wide operations: they carry no routable `Host` and name
+    // their instances in the body. Merged into the normal route table they are
+    // rejected by `inject_resolved_hostname` before reaching a handler —
+    // correctly, since it fails closed on a Host it cannot resolve. That is not
+    // a guess: the first cut mounted them there and answered `unknown_instance`
+    // to every one of them.
+    //
+    // Unset token => not mounted at all, so a cell never configured for fleet
+    // operations does not answer these at all rather than 401.
+    let http_service = match fleet_routes {
+        Some(routes) => {
+            tracing::info!("cell fleet endpoints mounted at /api/cell/*");
+            http_service.with_extra_meta_routes(routes)
+        },
+        None => {
+            tracing::info!("cell fleet endpoints NOT mounted (MULTITENANT_ADMIN_TOKEN unset)");
+            http_service
+        },
+    };
+
     let mut api_shutdown_rx = shutdown_rx.clone();
     let serve_api = http_service.serve_with_middleware(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, API_PORT)),

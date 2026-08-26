@@ -41,11 +41,13 @@ bytes = { workspace = true }
 clusters = { workspace = true }
 cmd_util = { workspace = true }
 common = { workspace = true }
+database = { workspace = true }
 db_connection = { workspace = true }
 errors = { workspace = true }
 file_storage = { workspace = true }
 function_runner = { workspace = true }
 futures = { workspace = true }
+json_trait = { workspace = true }
 headers = { workspace = true }
 http = { workspace = true }
 indexing = { workspace = true }

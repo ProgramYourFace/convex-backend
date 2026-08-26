@@ -93,6 +93,7 @@ use crate::api::MultitenantApplicationApi;
 
 pub mod api;
 pub mod config;
+pub mod fleet;
 pub mod host;
 pub mod instance;
 pub mod naming;
