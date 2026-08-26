@@ -187,9 +187,14 @@ rather than one RocksDB maintains, set generously enough that no legitimate inge
 reaches it.
 
 So the honest number for the manifest: **a wedged volume leaves the cell unavailable for
-up to twenty minutes.** Postgres's lease is faster. Tighten the ceiling if the cell's
-write latency has a known bound, but keep it clear of bulk imports, which hold a write
-guard across their flush.
+up to twenty minutes.** Postgres's lease is faster.
+
+Worse on an idle cell. The watchdog only sees a write that is in flight, and a cell
+serving reads without mutations issues persistence writes only from the committer's idle
+timestamp bump — randomised up to an hour. So an idle-but-serving cell can sit **one to
+two hours** with every read hanging before the twenty-minute clock starts. A cell taking
+steady relay ingest, which is the case here, does not have this gap; a cell that has gone
+quiet does.
 
 **A liveness probe does not close this gap, and the obvious one is a trap.** An earlier
 revision of this proposal recommended `livenessProbe` on `/version` as a replacement for
@@ -208,10 +213,14 @@ What is worth configuring now:
 
 - Keep the existing **readiness** probe on `/version` — it correctly answers "is this
   process up and routing".
-- Alert on **`rocksdb_oldest_write_seconds`**, published every poll before any call into
-  RocksDB. Sustained growth means writers are parked, and it is the earliest signal
-  available — minutes before the ceiling fires. It cannot tell you *why*: a backpressured
-  burst and a dead volume look identical in it.
+- Alert on **`rocksdb_oldest_write_seconds`**, published by a watchdog thread that never
+  calls into RocksDB. Sustained growth means writers are parked, and it is the earliest
+  signal available — minutes before the ceiling fires. It cannot tell you *why*: a
+  backpressured burst and a dead volume look identical in it.
+- Alert on **`rocksdb_health_poll_age_seconds`** too. The polling thread can block inside
+  RocksDB, and a Prometheus gauge that stops being written still scrapes its last sample,
+  so this is what distinguishes "everything is fine" from "the monitor died and its
+  gauges froze looking fine".
 - Keep §4's generous **startup** probe. Recovery still has to open and load the database
   before the port binds, and a liveness probe without a startup probe in front of it will
   CrashLoopBackOff a large cell during boot.

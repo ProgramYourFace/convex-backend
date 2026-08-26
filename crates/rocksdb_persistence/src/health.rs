@@ -70,13 +70,45 @@ const FLUSH_SILENCE_INTERVAL_FLOOR: u32 = 3;
 
 pub(crate) struct HealthMonitor {
     stop: Arc<Signal>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    /// Two threads, and the split is the point. See [`HealthMonitor::spawn`].
+    handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 struct Signal {
     stopped: AtomicBool,
     lock: Mutex<()>,
     wake: Condvar,
+}
+
+/// Records when the polling thread last completed a pass, so that a thread
+/// which has blocked inside RocksDB is itself a measurable level rather than an
+/// absence of one.
+pub(crate) struct PollClock {
+    last: Mutex<Instant>,
+}
+
+impl PollClock {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn completed(&self) {
+        let mut guard = match self.last.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Instant::now();
+    }
+
+    fn since_last(&self) -> Duration {
+        let guard = match self.last.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.elapsed()
+    }
 }
 
 impl HealthMonitor {
@@ -90,42 +122,74 @@ impl HealthMonitor {
             lock: Mutex::new(()),
             wake: Condvar::new(),
         });
-        let signal = stop.clone();
         let interval = *options::HEALTH_POLL_INTERVAL;
         let started = Instant::now();
-        let handle = std::thread::Builder::new()
-            .name("rocksdb-health".to_string())
-            .spawn(move || {
-                loop {
-                    {
-                        let guard = match signal.lock.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        // Re-checked under the mutex; see the same pattern in
-                        // `wal_flush`. Without it a `stop()` racing the park is
-                        // lost and the caller blocks for a full poll interval.
-                        let (guard, _) = signal
-                            .wake
-                            .wait_timeout_while(guard, interval, |_| {
-                                !signal.stopped.load(Ordering::Relaxed)
-                            })
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        drop(guard);
+        let poll_clock = Arc::new(PollClock::new());
+
+        // Two threads, because one cannot do this job.
+        //
+        // Everything except the stall check has to ask RocksDB a question, and
+        // `DBImpl::GetIntProperty` takes the engine's `mutex_`. A poller that
+        // blocks in there stops polling — not for one pass, but permanently:
+        // the loop is serial, so the next iteration never begins. The stall
+        // ceiling needs roughly eighty consecutive polls to elapse at the
+        // defaults, so a poller that parks on its first RocksDB call after a
+        // volume wedges will never reach it. An earlier revision tried to fix
+        // this by evaluating the stall check *first* in the pass, which buys
+        // exactly one poll and no additional escalation opportunities.
+        //
+        // So the check that must survive a wedged engine runs on a thread that
+        // never touches the engine. It reads `WriteWatch`, which is wall-clock
+        // over a guard this crate takes and drops around each write, and the
+        // flush clock, which the flusher stamps. Neither can block on I/O.
+        //
+        // The watchdog also publishes how long it has been since the poller
+        // completed a pass, which is what makes a parked poller visible from
+        // outside — the same argument the backup age makes, applied to the
+        // monitor itself. The poller cannot publish that: a thread that has
+        // stopped cannot report having stopped.
+        let watchdog = {
+            let signal = stop.clone();
+            let db = db.clone();
+            let shutdown = shutdown.clone();
+            let poll_clock = poll_clock.clone();
+            std::thread::Builder::new()
+                .name("rocksdb-watchdog".to_string())
+                .spawn(move || loop {
+                    if park(&signal, interval) {
+                        break;
                     }
-                    if signal.stopped.load(Ordering::Relaxed) {
+                    let Some(inner) = db.upgrade() else {
+                        break;
+                    };
+                    metrics::log_health_poll_age(poll_clock.since_last().as_secs_f64());
+                    if watch_writes(&inner, &shutdown) {
+                        break;
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB watchdog: {e}"))?
+        };
+
+        let poller = {
+            let signal = stop.clone();
+            std::thread::Builder::new()
+                .name("rocksdb-health".to_string())
+                .spawn(move || loop {
+                    if park(&signal, interval) {
                         break;
                     }
                     let Some(inner) = db.upgrade() else {
                         break;
                     };
                     check(&inner, &shutdown, backup_dir.as_deref(), started);
-                }
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?;
+                    poll_clock.completed();
+                })
+                .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?
+        };
+
         Ok(Self {
             stop,
-            handle: Mutex::new(handle.into()),
+            handles: Mutex::new(vec![watchdog, poller]),
         })
     }
 
@@ -142,11 +206,11 @@ impl HealthMonitor {
             drop(guard);
         }
         self.stop.wake.notify_all();
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+        let handles = match self.handles.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
-        if let Some(handle) = handle {
+        for handle in handles {
             if handle.thread().id() == std::thread::current().id() {
                 // Dropping the handle here would detach the thread, which is
                 // fine — it is this thread, and it is already unwinding out of
@@ -165,44 +229,47 @@ impl Drop for HealthMonitor {
     }
 }
 
-fn check(
-    inner: &Inner,
-    shutdown: &ShutdownSignal,
-    backup_dir: Option<&std::path::Path>,
-    started: Instant,
-) {
-    // A write that cannot make progress does not fail — it blocks. On a full
-    // volume or a hung mount RocksDB stalls the writer indefinitely rather than
-    // returning an error, so no counter moves and each stalled write parks a
-    // blocking-pool thread. The oldest in-flight write is the signal that does
-    // move.
-    //
-    // Measured and escalated FIRST, before any RocksDB call below, for two
-    // reasons. `DBImpl::GetIntProperty` takes the engine's `mutex_`, so if a
-    // wedged engine ever holds that across its hung I/O, the poll would park
-    // before publishing and the one gauge an operator is told to alert on would
-    // freeze at its last value instead of climbing. And this is the escalation
-    // that has to survive a wedge, so it must not sit behind a call into the
-    // thing that is wedged.
+/// Waits one interval, or until stopped. Returns whether the caller should
+/// exit.
+fn park(signal: &Signal, interval: Duration) -> bool {
+    {
+        let guard = match signal.lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Re-checked under the mutex; see the same pattern in `wal_flush`.
+        // Without it a `stop()` racing the park is lost and the caller blocks
+        // for a full poll interval.
+        let (guard, _) = signal
+            .wake
+            .wait_timeout_while(guard, interval, |_| !signal.stopped.load(Ordering::Relaxed))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(guard);
+    }
+    signal.stopped.load(Ordering::Relaxed)
+}
+
+/// The one check that has to survive a wedged engine, so it asks the engine
+/// nothing.
+///
+/// A write that cannot make progress does not fail — it blocks. On a full
+/// volume or a hung mount RocksDB stalls the writer indefinitely rather than
+/// returning an error, so no counter moves and each stalled write parks a
+/// blocking-pool thread. Duration is the only signal that keeps moving, and
+/// `WriteWatch` measures it on a clock this crate owns: a guard taken and
+/// dropped around each write, which RocksDB never touches and therefore cannot
+/// latch, unlike every engine property that was tried before it.
+///
+/// Deliberately no attempt to tell backpressure from a hang. Five review rounds
+/// each produced a new defect trying, because every property that could
+/// distinguish them is updated by the machinery that has stopped. The ceiling
+/// is instead set generously enough that real backpressure drains well inside
+/// it.
+///
+/// Returns whether the caller should stop.
+fn watch_writes(inner: &Inner, shutdown: &ShutdownSignal) -> bool {
     let oldest = inner.write_watch.oldest_in_flight();
     metrics::log_oldest_write(oldest.map_or(0.0, |d| d.as_secs_f64()));
-
-    // Four review rounds each found a *new* defect in trying to classify this
-    // stall as deliberate backpressure or a hang, because every RocksDB signal
-    // that could tell them apart — the write controller's stop and delay
-    // tokens, `num-running-flushes`, `num-running-compactions`, the
-    // superversion number — is updated by the machinery that has stopped, and
-    // so latches in exactly the failure being detected. That classification is
-    // gone, and with it the attempt to escalate quickly.
-    //
-    // What remains is duration alone, at a ceiling generous enough that no
-    // legitimate backpressure reaches it. This predicate reads no engine
-    // property: the clock is `WriteGuard`'s, taken and dropped by this crate,
-    // which RocksDB never touches and therefore cannot latch. Deliberate
-    // throttling drains long before the ceiling; a hung volume does not, and
-    // running on past it is worse than restarting, because every writer is
-    // parked and the deployment's recovery cannot begin while the process still
-    // answers probes.
     if let Some(waiting) = oldest
         && waiting > *options::WRITE_STALL_CEILING
     {
@@ -211,9 +278,40 @@ fn check(
              engine blocks rather than failing when it cannot make progress — a full volume or a \
              hung mount looks exactly like this — so stopping beats parking every writer forever"
         ));
-        return;
+        return true;
     }
+    false
+}
 
+/// How long the write-ahead log may go unflushed — no successes and no failures
+/// — before the flusher is presumed dead.
+///
+/// Bounded at both ends, and the upper bound is itself floored by the interval
+/// it bounds. A healthy flusher waits the whole interval before each tick, so
+/// the time since its last success climbs to about one interval every cycle; a
+/// ceiling below that would read the healthy steady state as a dead flusher and
+/// restart the pod onto the same configuration, forever.
+fn silence_deadline(interval: Duration) -> Duration {
+    interval
+        .saturating_mul(FLUSH_FAILURE_INTERVALS)
+        .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
+        .max(*options::MIN_FLUSH_SILENCE)
+        .min(
+            (*options::MAX_FLUSH_SILENCE)
+                .max(*options::MIN_FLUSH_SILENCE)
+                .max(interval.saturating_mul(FLUSH_SILENCE_INTERVAL_FLOOR)),
+        )
+}
+
+/// The checks that need to ask RocksDB something, on the thread that is allowed
+/// to block doing it. The stall ceiling is deliberately not among them — see
+/// [`watch_writes`] and the note in [`HealthMonitor::spawn`].
+fn check(
+    inner: &Inner,
+    shutdown: &ShutdownSignal,
+    backup_dir: Option<&std::path::Path>,
+    started: Instant,
+) {
     // Published on every poll, failing or not. A series that only appears once
     // the process is already being shut down is not something an alert can
     // watch — the same argument `log_backup_age` makes, applied here.
@@ -265,14 +363,7 @@ fn check(
         // interval every cycle — a ceiling below that would read the healthy
         // steady state as a dead flusher and restart the pod onto the same
         // configuration, forever.
-        let silence_deadline = budget
-            .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
-            .max(*options::MIN_FLUSH_SILENCE)
-            .min(
-                (*options::MAX_FLUSH_SILENCE)
-                    .max(*options::MIN_FLUSH_SILENCE)
-                    .max(interval.saturating_mul(FLUSH_SILENCE_INTERVAL_FLOOR)),
-            );
+        let silence_deadline = silence_deadline(interval);
         let stopped = since > silence_deadline;
         if failing || stopped {
             shutdown.signal(anyhow::anyhow!(
@@ -428,25 +519,10 @@ mod escalation_tests {
     use std::time::Duration;
 
     use super::{
+        silence_deadline,
         FLUSH_FAILURE_INTERVALS,
-        FLUSH_SILENCE_INTERVAL_FLOOR,
         FLUSH_SILENCE_MULTIPLIER,
     };
-    use crate::options;
-
-    /// The silence deadline as `check` computes it, so the test exercises the
-    /// arithmetic rather than a copy of it.
-    fn silence_deadline(interval: Duration) -> Duration {
-        interval
-            .saturating_mul(FLUSH_FAILURE_INTERVALS)
-            .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
-            .max(*options::MIN_FLUSH_SILENCE)
-            .min(
-                (*options::MAX_FLUSH_SILENCE)
-                    .max(*options::MIN_FLUSH_SILENCE)
-                    .max(interval.saturating_mul(FLUSH_SILENCE_INTERVAL_FLOOR)),
-            )
-    }
 
     /// A healthy flusher waits the whole interval before each tick, so the time
     /// since its last success climbs to about one interval every cycle. A
@@ -482,6 +558,101 @@ mod escalation_tests {
         assert!(
             deadline < unbounded,
             "the ceiling must still cut the multiplied budget down"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use std::time::Duration;
+
+    use common::shutdown::ShutdownSignal;
+    use tokio::sync::oneshot;
+
+    use super::{
+        watch_writes,
+        WriteWatch,
+    };
+    use crate::{
+        options,
+        RocksDbPersistence,
+    };
+
+    /// The escalation this module exists for, end to end through the real
+    /// predicate: a write held past the ceiling stops the backend.
+    ///
+    /// Six review rounds found a defect in this code path and none of them had
+    /// a test to catch the seventh, so this covers the predicate directly
+    /// rather than the arithmetic around it.
+    #[test]
+    fn a_write_held_past_the_ceiling_escalates() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+        let (tx, mut rx) = oneshot::channel();
+        let shutdown = ShutdownSignal::new(tx);
+
+        // Nothing in flight: nothing to say.
+        assert!(!watch_writes(&persistence.inner, &shutdown));
+        assert!(rx.try_recv().is_err(), "an idle backend must not escalate");
+
+        // A write in flight, but inside the ceiling. This is the case five
+        // rounds kept getting wrong in the other direction — a busy backend
+        // must not be stopped for being busy.
+        let guard = persistence.inner.write_watch.begin();
+        assert!(
+            !watch_writes(&persistence.inner, &shutdown),
+            "a write that has only just begun is not a stall"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a write inside the ceiling must not escalate"
+        );
+        drop(guard);
+
+        Ok(())
+    }
+
+    /// And the ceiling itself, on the clock rather than by waiting twenty
+    /// minutes for it.
+    #[test]
+    fn the_watch_reports_the_oldest_write_not_the_newest() {
+        let watch = WriteWatch::default();
+        assert!(watch.oldest_in_flight().is_none());
+
+        let first = watch.begin();
+        std::thread::sleep(Duration::from_millis(30));
+        let second = watch.begin();
+
+        // The oldest, which is what the ceiling is compared against — reporting
+        // the newest would reset the clock on every incoming write and mean a
+        // wedged backend under continuous load never escalated at all.
+        let oldest = watch.oldest_in_flight().expect("a write is in flight");
+        assert!(
+            oldest >= Duration::from_millis(30),
+            "expected the age of the first write, got {oldest:?}"
+        );
+
+        drop(first);
+        let after = watch.oldest_in_flight().expect("one write still in flight");
+        assert!(
+            after < Duration::from_millis(30),
+            "after the first write finished the second is the oldest, got {after:?}"
+        );
+
+        drop(second);
+        assert!(
+            watch.oldest_in_flight().is_none(),
+            "no writes in flight once every guard has dropped"
+        );
+    }
+
+    /// The ceiling has to clear anything that legitimately holds a write for a
+    /// long time, or it becomes the round-5 failure again in a new place.
+    #[test]
+    fn the_ceiling_is_generous_enough_to_be_a_backstop() {
+        assert!(
+            *options::WRITE_STALL_CEILING >= Duration::from_secs(60),
+            "a ceiling this tight would stop backends for ordinary backpressure"
         );
     }
 }

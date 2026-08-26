@@ -83,6 +83,22 @@ register_convex_gauge!(
 /// The signal a stall actually produces. A write RocksDB cannot make progress
 /// for blocks rather than failing, so no error counter moves and no `Result` is
 /// ever returned — only this number grows.
+/// How long since the polling thread last completed a pass.
+///
+/// Published by the watchdog, which never calls into RocksDB, so a poller that
+/// has blocked inside the engine shows up as a climbing level rather than as a
+/// set of gauges that quietly stopped moving. A Prometheus gauge that stops
+/// being written still scrapes its last sample, so without this a dead monitor
+/// is indistinguishable from a healthy one.
+pub fn log_health_poll_age(seconds: f64) {
+    log_gauge(&ROCKSDB_HEALTH_POLL_AGE_SECONDS, seconds);
+}
+
+register_convex_gauge!(
+    ROCKSDB_HEALTH_POLL_AGE_SECONDS,
+    "Seconds since the RocksDB health poller last completed a pass"
+);
+
 pub fn log_oldest_write(seconds: f64) {
     log_gauge(&ROCKSDB_OLDEST_WRITE_SECONDS, seconds);
 }

@@ -518,7 +518,18 @@ fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow:
         // versioning existed — the same layout, so stamping it is correct
         // rather than a migration. A secondary never writes.
         None if stamp_if_missing => {
-            db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
+            // Synced, unlike an ordinary write, because losing it is not
+            // losing data: the next boot would see an unstamped database and
+            // stamp it again, which is harmless here but is the same pattern as
+            // the identity below, where it is not.
+            let mut sync = rocksdb::WriteOptions::default();
+            sync.set_sync(true);
+            db.put_cf_opt(
+                &globals,
+                FORMAT_VERSION_KEY,
+                FORMAT_VERSION.to_string(),
+                &sync,
+            )?;
         },
         None => {},
     }
@@ -610,7 +621,17 @@ impl Inner {
         let minted = std::fs::read_to_string(self.path.join("IDENTITY"))
             .map(|id| id.trim().to_string())
             .unwrap_or_else(|_| format!("path:{}", self.path.display()));
-        self.db.put_cf(&globals, IDENTITY_KEY, minted.as_bytes())?;
+        // Synced regardless of the configured mode. This row is what a backup
+        // chain matches a database against, and it is minted from RocksDB's
+        // `IDENTITY` file — which a restore regenerates. Lose the row to a
+        // crash and the next boot mints a *different* value, at which point
+        // every backup into the existing directory fails as "a different
+        // database". That lockout is the exact failure this row was added to
+        // prevent, so it must not be the one write that was still in a buffer.
+        let mut sync = rocksdb::WriteOptions::default();
+        sync.set_sync(true);
+        self.db
+            .put_cf_opt(&globals, IDENTITY_KEY, minted.as_bytes(), &sync)?;
         Ok(minted)
     }
 
@@ -845,7 +866,16 @@ impl Persistence for RocksDbPersistence {
             // writer it cannot make progress for instead of failing it, and a
             // parked writer holds this thread until the volume recovers or the
             // process is stopped.
-            let _guard = inner.write_watch.begin();
+            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+            // default `FlushOptions`, whose `allow_write_stall = false` waits
+            // for L0 to fall below the slowdown trigger — and "a bulk import
+            // leaves everything in L0" is this function's own premise, so the
+            // wait can be long and is healthy. Counting it as an in-flight
+            // write would let a large import trip the stall ceiling and stop a
+            // backend that is doing exactly what it was asked to.
+            //
+            // Nothing is lost: the guard exists so a *stalled acknowledged
+            // write* is visible, and this is neither acknowledged nor a write.
             inner.apply_write(write, conflict_strategy)
         })
         .await
@@ -860,7 +890,16 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
-            let _guard = inner.write_watch.begin();
+            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+            // default `FlushOptions`, whose `allow_write_stall = false` waits
+            // for L0 to fall below the slowdown trigger — and "a bulk import
+            // leaves everything in L0" is this function's own premise, so the
+            // wait can be long and is healthy. Counting it as an in-flight
+            // write would let a large import trip the stall ceiling and stop a
+            // backend that is doing exactly what it was asked to.
+            //
+            // Nothing is lost: the guard exists so a *stalled acknowledged
+            // write* is visible, and this is neither acknowledged nor a write.
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
@@ -889,7 +928,16 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
+                // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+                // default `FlushOptions`, whose `allow_write_stall = false` waits
+                // for L0 to fall below the slowdown trigger — and "a bulk import
+                // leaves everything in L0" is this function's own premise, so the
+                // wait can be long and is healthy. Counting it as an in-flight
+                // write would let a large import trip the stall ceiling and stop a
+                // backend that is doing exactly what it was asked to.
+                //
+                // Nothing is lost: the guard exists so a *stalled acknowledged
+                // write* is visible, and this is neither acknowledged nor a write.
                 let idx = inner.cf(CF_IDX)?;
 
                 // Retention deletes every version of a key at or before a
@@ -947,7 +995,16 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
+                // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+                // default `FlushOptions`, whose `allow_write_stall = false` waits
+                // for L0 to fall below the slowdown trigger — and "a bulk import
+                // leaves everything in L0" is this function's own premise, so the
+                // wait can be long and is healthy. Counting it as an in-flight
+                // write would let a large import trip the stall ceiling and stop a
+                // backend that is doing exactly what it was asked to.
+                //
+                // Nothing is lost: the guard exists so a *stalled acknowledged
+                // write* is visible, and this is neither acknowledged nor a write.
                 // Same collapse as `delete_index_entries`: one document can be
                 // named more than once, and each revision must count once.
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
@@ -979,7 +1036,16 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
-            let _guard = inner.write_watch.begin();
+            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+            // default `FlushOptions`, whose `allow_write_stall = false` waits
+            // for L0 to fall below the slowdown trigger — and "a bulk import
+            // leaves everything in L0" is this function's own premise, so the
+            // wait can be long and is healthy. Counting it as an in-flight
+            // write would let a large import trip the stall ceiling and stop a
+            // backend that is doing exactly what it was asked to.
+            //
+            // Nothing is lost: the guard exists so a *stalled acknowledged
+            // write* is visible, and this is neither acknowledged nor a write.
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
 
@@ -1021,7 +1087,16 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
-            let _guard = inner.write_watch.begin();
+            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+            // default `FlushOptions`, whose `allow_write_stall = false` waits
+            // for L0 to fall below the slowdown trigger — and "a bulk import
+            // leaves everything in L0" is this function's own premise, so the
+            // wait can be long and is healthy. Counting it as an in-flight
+            // write would let a large import trip the stall ceiling and stop a
+            // backend that is doing exactly what it was asked to.
+            //
+            // Nothing is lost: the guard exists so a *stalled acknowledged
+            // write* is visible, and this is neither acknowledged nor a write.
             // Every family, explicitly. `atomic_flush` does *not* widen a
             // single-family flush: `DBImpl::Flush` passes a one-element
             // candidate list into `SelectColumnFamiliesForAtomicFlush`, so

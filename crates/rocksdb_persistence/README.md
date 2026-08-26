@@ -330,10 +330,34 @@ and escalated before any other work in the poll, so a health thread that later b
 inside `DBImpl::GetIntProperty` — which takes the engine's mutex — cannot stop the
 escalation or freeze the gauge below.
 
-The cost of that generosity is honest: **a wedged volume is unavailable for up to twenty
-minutes before the process stops itself.** Tighten `ROCKSDB_WRITE_STALL_CEILING_SECONDS`
-if your workload has a known write-latency bound, but keep it clear of `finish_loading`,
-which holds a write guard across a bulk import's flush.
+It runs on its own thread — `rocksdb-watchdog` — which touches nothing but `WriteWatch`
+and the flush clock. That separation is the point rather than tidiness: every other check
+has to ask RocksDB a question, and `DBImpl::GetIntProperty` takes the engine's `mutex_`.
+A single thread doing both would, on blocking inside that call, stop polling *permanently*
+— the loop is serial, so the next pass never begins — and the ceiling needs about eighty
+consecutive polls to elapse at the defaults. An earlier revision tried to fix that by
+evaluating the stall check first in the pass, which buys exactly one poll and no
+additional chances to escalate.
+
+The watchdog also publishes `rocksdb_health_poll_age_seconds`, the time since the polling
+thread last completed a pass. A Prometheus gauge that stops being written still scrapes
+its last sample, so without this a dead monitor is indistinguishable from a healthy one —
+and the poller cannot report its own death. **Alert on this**: if it climbs past a few
+poll intervals, the background-error and WAL escalations are no longer running even though
+their gauges still look fine.
+
+The cost of the ceiling's generosity is honest: **a wedged volume is unavailable for up to
+twenty minutes before the process stops itself.** Tighten
+`ROCKSDB_WRITE_STALL_CEILING_SECONDS` if your workload has a known write-latency bound.
+
+And a sharper limit, worth knowing before relying on the number: the watchdog can only see
+a write that is *in flight*. A deployment serving reads but taking no mutations issues
+persistence writes only from the committer's idle timestamp bump, whose interval is
+randomised up to `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` (3600 s), and retention's
+checkpoint writes stop with it. So on an idle-but-serving cell a wedged volume can go
+**one to two hours with no in-flight write at all** — every read hanging the whole time —
+before the twenty-minute clock even starts. A cell taking steady mutations, which is the
+ingest case this backend was built for, does not have this gap.
 
 ### Liveness probes
 
@@ -353,7 +377,9 @@ it says nothing about whether storage works.
 Nothing else currently exposed performs a storage round-trip on the blocking pool, so
 there is no HTTP endpoint that a probe can use to detect a wedge today. Until one exists,
 **the in-process ceiling above is the backstop**, and the probe is not a substitute for
-it.
+it. An endpoint that did a small read through persistence, inside the timeout layer, would
+both beat the twenty-minute ceiling and close the idle-deployment gap above — it is the
+single highest-value follow-up here.
 
 For alerting rather than restarting, watch **`rocksdb_oldest_write_seconds`** — the age of
 the oldest in-flight write, published on every poll before any call into RocksDB, whether

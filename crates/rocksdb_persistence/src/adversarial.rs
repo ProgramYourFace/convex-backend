@@ -1418,14 +1418,24 @@ async fn writes_deletes_and_reads_can_all_run_at_once() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Health monitor: how often is the stall escalation masked?
+// Health monitor: why the engine's own properties cannot classify a stall
 // ---------------------------------------------------------------------------
 
-/// `health::check` only escalates a stalled write when
-/// `engine_is_applying_backpressure` is false, and that predicate includes
-/// `num-running-flushes > 0 || num-running-compactions > 0`. This measures how
-/// often those are non-zero on an ordinary busy database, because that is the
-/// fraction of the time the stall detector cannot fire.
+/// The measurement behind removing the stall *classifier* from the health
+/// monitor.
+///
+/// Five review rounds tried to separate "deliberately backpressured" from
+/// "wedged" using `num-running-flushes` and `num-running-compactions`, and each
+/// attempt was wrong in a new way. This shows why that was not four coding
+/// mistakes: on a database being written to continuously, the engine reports a
+/// background job open only a fraction of the time, so an instantaneous reading
+/// of those properties says very little about whether it is working.
+///
+/// Not a correctness test. It samples properties this crate no longer reads,
+/// and a failure would mean a design argument was weaker than believed rather
+/// than that anything is broken. It also costs six seconds of real I/O, so it
+/// is opt-in: `cargo test -p rocksdb_persistence -- --ignored`.
+#[ignore = "a measurement supporting a design decision, not a correctness check"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_backpressure_predicate_is_true_under_ordinary_load() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
