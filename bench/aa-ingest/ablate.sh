@@ -49,4 +49,9 @@ L0SLOW=$(count "Level-0 flush table"); L0SLOW=${L0SLOW:-0}
 SIZE=$(du -sm "$WORK/db" 2>/dev/null | cut -f1)
 
 kill $PID 2>/dev/null; wait $PID 2>/dev/null
+# The database is 222 MiB at 200k events and the stats above are everything we
+# want from it. Leaving them behind filled the disk mid-sweep and took the
+# harness's own output with it.
+KEEP=${ABLATE_KEEP:-0}
+if [ "$KEEP" = "0" ]; then rm -rf "$WORK"; fi
 echo "$LABEL $RESULT rocksdb={\"compactions\":$COMPACTIONS,\"flushes\":$FLUSHES,\"stalls\":$STALLS,\"stops\":$STOPS,\"l0_tables\":$L0SLOW,\"db_mb\":$SIZE}"
