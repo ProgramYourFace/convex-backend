@@ -406,11 +406,6 @@ mod tests {
         // The driver appends the database name it derives from `name()`; the
         // URL must therefore still have an empty path here.
         assert_eq!(cfg.db_spec, "postgresql://postgres:pw@localhost:5432");
-        assert_eq!(
-            naming::db_name(&cfg.name()),
-            "i_0068a1f39c2b4d5e6f708192",
-            "the database the driver will derive"
-        );
     }
 
     #[test]

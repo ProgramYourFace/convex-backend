@@ -63,7 +63,14 @@ use std::{
 use application::deploy_config::ModuleJson;
 use arc_swap::ArcSwap;
 use axum::{
-    extract::State,
+    extract::{
+        Request,
+        State,
+    },
+    middleware::{
+        self,
+        Next,
+    },
     routing::{
         get,
         post,
@@ -94,6 +101,8 @@ use sha2::{
     Sha256,
 };
 use value::TableNamespace;
+
+use crate::naming;
 
 /// How long to wait for an instance's `SchemaWorker` to move a submitted schema
 /// off `Pending`.
@@ -145,13 +154,9 @@ pub struct CommitRequest {
 fn fingerprint(schema: &DatabaseSchema) -> anyhow::Result<String> {
     // `json_serialize` consumes the schema; clone rather than thread ownership
     // through, since this runs once per instance per rollout.
-    Ok(hex(&Sha256::digest(
+    Ok(naming::hex_encode(&Sha256::digest(
         schema.clone().json_serialize()?.as_bytes(),
     )))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One instance's answer.
@@ -207,6 +212,10 @@ impl InstanceOutcome {
         self
     }
 
+    fn is_active(&self) -> bool {
+        self.state == "active"
+    }
+
     fn is_validated(&self) -> bool {
         // `active` counts: an instance that already holds this schema is
         // converged, not a straggler, and a retry after a partial commit must
@@ -239,6 +248,21 @@ pub fn router(state: FleetState) -> Router {
         .route("/api/cell/instances", get(list_instances))
         .route("/api/cell/schema/precheck", post(precheck))
         .route("/api/cell/schema/commit", post(commit))
+        // AUTH AS A LAYER, not as the first line of each handler.
+        //
+        // A handler's body runs only after axum has run its extractors, so an
+        // in-handler check means an unauthenticated caller gets its whole body
+        // buffered and deserialized into a `ModuleJson` before being told no.
+        // These routes are mounted beside `/version`, ahead of the concurrency
+        // limiter, so nothing else bounds how many of those are in flight.
+        // A layer rejects on headers alone, before the body is read.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<FleetState>, request: Request, next: Next| async move {
+                authorize(&state, request.headers())?;
+                Ok::<_, HttpResponseError>(next.run(request).await)
+            },
+        ))
         .with_state(state)
 }
 
@@ -300,9 +324,7 @@ fn select(
 
 async fn list_instances(
     State(state): State<FleetState>,
-    headers: http::HeaderMap,
 ) -> Result<Json<FleetResponse>, HttpResponseError> {
-    authorize(&state, &headers)?;
     let (selected, unknown) = select(&state, None);
     let results = join_all(
         selected
@@ -310,7 +332,7 @@ async fn list_instances(
             .map(|(name, app)| async move { current_state(&name, &app).await }),
     )
     .await;
-    let all_ok = results.iter().all(|r| r.state == "active");
+    let all_ok = all_ok(&results, &[], InstanceOutcome::is_active);
     Ok(Json(FleetResponse {
         cell: state.group.to_string(),
         schema_fingerprint: None,
@@ -330,10 +352,10 @@ async fn current_state(name: &str, app: &LocalAppState) -> InstanceOutcome {
 /// The instance's current schema state, and — whenever one is ACTIVE — that
 /// schema's fingerprint.
 ///
-/// The active fingerprint is read even when the reported state is `validated` or
-/// `pending`: those states describe a rollout IN FLIGHT, while the active schema
-/// is what the instance is serving right now, which is the thing drift is
-/// measured against.
+/// The active fingerprint is read even when the reported state is `validated`
+/// or `pending`: those states describe a rollout IN FLIGHT, while the active
+/// schema is what the instance is serving right now, which is the thing drift
+/// is measured against.
 async fn read_state(app: &LocalAppState) -> anyhow::Result<(String, Option<String>)> {
     let mut tx = app.application.begin(Identity::system()).await?;
     let mut model = SchemaModel::new(&mut tx, TableNamespace::root_component());
@@ -356,10 +378,8 @@ async fn read_state(app: &LocalAppState) -> anyhow::Result<(String, Option<Strin
 /// Phase one. Submit the schema everywhere, activate nowhere.
 async fn precheck(
     State(state): State<FleetState>,
-    headers: http::HeaderMap,
     Json(req): Json<PrecheckRequest>,
 ) -> Result<Json<FleetResponse>, HttpResponseError> {
-    authorize(&state, &headers)?;
     let (selected, unknown) = select(&state, req.instances);
     if selected.is_empty() {
         return Ok(Json(FleetResponse {
@@ -385,7 +405,19 @@ async fn precheck(
         // A bundle that will not evaluate is the CALLER's problem, and this is
         // the endpoint whose entire job is to report problems — so say what
         // went wrong rather than returning an opaque 500 that redacts it.
+        //
+        // But ONLY re-label an error that has no metadata of its own. This runs
+        // in the shared isolate pool under one instance's capacity share, so it
+        // can fail for reasons that have nothing to do with the bundle —
+        // `PerClientWorkerOverloaded` most of all. Blanket-labelling those
+        // `SchemaEvaluationFailed` tells the coordinator the schema is broken,
+        // and `bad-bundle` is in its DO-NOT-RETRY set: a transient overload on
+        // one tenant would abort the whole cluster's rollout and refuse to
+        // retry it.
         .map_err(|e| {
+            if e.downcast_ref::<ErrorMetadata>().is_some() {
+                return e;
+            }
             anyhow::anyhow!(ErrorMetadata::bad_request(
                 "SchemaEvaluationFailed",
                 format!("could not evaluate the schema bundle: {e:#}"),
@@ -404,9 +436,7 @@ async fn precheck(
         }
     }))
     .await;
-    let all_ok = !results.is_empty()
-        && unknown.is_empty()
-        && results.iter().all(InstanceOutcome::is_validated);
+    let all_ok = all_ok(&results, &unknown, InstanceOutcome::is_validated);
     Ok(Json(FleetResponse {
         cell: state.group.to_string(),
         schema_fingerprint: Some(fp),
@@ -414,6 +444,22 @@ async fn precheck(
         all_ok,
         unknown,
     }))
+}
+
+/// The cell-level verdict a coordinator reads as `allOk`.
+///
+/// `!results.is_empty()` is the load-bearing clause, not defensive noise:
+/// `[].iter().all(..)` is TRUE, so without it a cell that selected no instance
+/// reports that everything passed on a run that evaluated nothing — and a
+/// coordinator would commit a rollout against a cell it never checked. Every
+/// endpoint answers by this one rule so the field means the same thing on all
+/// of them.
+fn all_ok(
+    results: &[InstanceOutcome],
+    unknown: &[String],
+    ok: fn(&InstanceOutcome) -> bool,
+) -> bool {
+    !results.is_empty() && unknown.is_empty() && results.iter().all(ok)
 }
 
 fn outcome_from_state(name: &str, state: SchemaState) -> InstanceOutcome {
@@ -483,10 +529,8 @@ async fn precheck_one(app: &LocalAppState, schema: DatabaseSchema) -> anyhow::Re
 /// is by construction the one the precheck submitted.
 async fn commit(
     State(state): State<FleetState>,
-    headers: http::HeaderMap,
     Json(req): Json<CommitRequest>,
 ) -> Result<Json<FleetResponse>, HttpResponseError> {
-    authorize(&state, &headers)?;
     let (selected, unknown) = select(&state, req.instances);
     let wanted = req.schema_fingerprint;
 
@@ -533,8 +577,7 @@ async fn commit(
         }
     }))
     .await;
-    let all_ok =
-        !results.is_empty() && unknown.is_empty() && results.iter().all(|r| r.state == "active");
+    let all_ok = all_ok(&results, &unknown, InstanceOutcome::is_active);
     Ok(Json(FleetResponse {
         cell: state.group.to_string(),
         schema_fingerprint: Some(wanted),
@@ -609,4 +652,148 @@ async fn commit_one(app: &LocalAppState, wanted: &str) -> anyhow::Result<String>
     model.mark_active(id).await?;
     app.application.commit(tx, "fleet_commit").await?;
     Ok("active".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+    };
+
+    use arc_swap::ArcSwap;
+
+    use super::*;
+
+    fn state(token: &str) -> FleetState {
+        FleetState {
+            instances: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            group: "cell-01".into(),
+            token: token.into(),
+        }
+    }
+
+    fn bearer(value: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_verdict_is_false_when_nothing_was_evaluated() {
+        // THE WHOLE POINT of the rule. `[].iter().all(..)` is true, so an empty
+        // cell would otherwise report a clean pass on a run that checked
+        // nothing, and a coordinator would commit against it.
+        assert!(!all_ok(&[], &[], InstanceOutcome::is_validated));
+        assert!(!all_ok(&[], &[], InstanceOutcome::is_active));
+    }
+
+    #[test]
+    fn an_unknown_instance_falsifies_the_verdict() {
+        // A coordinator working from a stale roster must not read "everything I
+        // asked about passed" out of a run that silently skipped some of them.
+        let results = [InstanceOutcome::ok("i-01", "validated")];
+        assert!(all_ok(&results, &[], InstanceOutcome::is_validated));
+        assert!(!all_ok(
+            &results,
+            &["i-02".to_owned()],
+            InstanceOutcome::is_validated
+        ));
+    }
+
+    #[test]
+    fn active_counts_as_validated_but_not_the_reverse() {
+        // A re-run after a partial commit must read an already-active instance
+        // as converged, not as a straggler. Commit is the strict direction:
+        // `validated` is not yet activated.
+        let active = [InstanceOutcome::ok("i-01", "active")];
+        let validated = [InstanceOutcome::ok("i-01", "validated")];
+        assert!(all_ok(&active, &[], InstanceOutcome::is_validated));
+        assert!(all_ok(&active, &[], InstanceOutcome::is_active));
+        assert!(all_ok(&validated, &[], InstanceOutcome::is_validated));
+        assert!(!all_ok(&validated, &[], InstanceOutcome::is_active));
+    }
+
+    #[test]
+    fn every_schema_state_maps_to_the_vocabulary_the_coordinator_classifies() {
+        // The coordinator's `classifyOutcome` splits these into ok / retryable /
+        // hard, and treats anything it does not recognise as HARD. A state that
+        // silently renamed here would abort every rollout in the fleet.
+        let cases = [
+            (SchemaState::Validated, "validated"),
+            (SchemaState::Active, "active"),
+            (SchemaState::Pending, "timedOut"),
+            (SchemaState::Overwritten, "overwritten"),
+        ];
+        for (schema_state, expected) in cases {
+            let outcome = outcome_from_state("i-01", schema_state);
+            assert_eq!(outcome.state, expected);
+            assert!(outcome.error.is_none());
+        }
+    }
+
+    #[test]
+    fn a_failed_state_carries_the_error_and_the_table() {
+        // This is the ONLY channel by which an operator learns which document
+        // violated the schema; dropping either field turns a precise refusal
+        // into "something went wrong somewhere in the fleet".
+        let outcome = outcome_from_state(
+            "i-01",
+            SchemaState::Failed {
+                error: "document does not match".to_owned(),
+                table_name: Some("deviceLocations".to_owned()),
+            },
+        );
+        assert_eq!(outcome.state, "failed");
+        assert_eq!(outcome.error.as_deref(), Some("document does not match"));
+        assert_eq!(outcome.table_name.as_deref(), Some("deviceLocations"));
+    }
+
+    #[test]
+    fn authorize_accepts_only_the_exact_bearer_token() {
+        let st = state(TOKEN);
+        assert!(authorize(&st, &bearer(&format!("Bearer {TOKEN}"))).is_ok());
+        for bad in [
+            "",
+            "Bearer ",
+            &format!("Bearer {TOKEN}x"),
+            &format!("Bearer {}", &TOKEN[..TOKEN.len() - 1]),
+            &format!("bearer {TOKEN}"), // the scheme is case-sensitive here
+            TOKEN,                      // no scheme at all
+        ] {
+            assert!(
+                authorize(&st, &bearer(bad)).is_err(),
+                "accepted {bad:?}, which is not the token"
+            );
+        }
+        assert!(
+            authorize(&st, &http::HeaderMap::new()).is_err(),
+            "accepted a request with no Authorization header"
+        );
+    }
+
+    #[test]
+    fn selecting_names_a_cell_does_not_host_reports_them_rather_than_skipping() {
+        let st = state(TOKEN);
+        let (found, unknown) = select(&st, Some(vec!["i-02".to_owned(), "i-01".to_owned()]));
+        assert!(found.is_empty());
+        // Order is the caller's, which is what makes the message readable.
+        assert_eq!(unknown, vec!["i-02".to_owned(), "i-01".to_owned()]);
+    }
+
+    #[test]
+    fn selecting_nothing_on_an_empty_cell_yields_nothing_rather_than_erroring() {
+        // The empty-cell path: warm pool stock with no tenant yet. It must be a
+        // clean no-op here, and `all_ok` above is what stops it reading as a
+        // pass.
+        let st = state(TOKEN);
+        let (found, unknown) = select(&st, None);
+        assert!(found.is_empty());
+        assert!(unknown.is_empty());
+    }
 }

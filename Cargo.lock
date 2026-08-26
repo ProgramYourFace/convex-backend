@@ -3032,7 +3032,6 @@ dependencies = [
  "postgres",
  "rocksdb_persistence",
  "sqlite",
- "tempfile",
  "tokio-postgres",
  "tracing",
 ]
@@ -6544,7 +6543,6 @@ dependencies = [
  "keybroker",
  "libc",
  "local_backend",
- "metrics",
  "model",
  "node_executor",
  "reqwest",
@@ -6555,7 +6553,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.8",
- "tempfile",
  "tokio",
  "tracing",
  "udf",

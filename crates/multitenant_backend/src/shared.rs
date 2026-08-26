@@ -10,6 +10,14 @@
 //!
 //! What is shared, and what makes it safe to share:
 //!
+//! "Partitioned by" below means one tenant cannot READ another's entries. It
+//! does NOT mean a tenant's entries are reclaimed when it unloads: only the
+//! `IndexCache` has a purge, and [`SharedResources::release`] is the only
+//! caller. Every other row is left to its own size-bounded eviction, so a cell
+//! that churns tenants holds dead entries until LRU pressure removes them.
+//! That is a hit-rate cost on a long-lived cell that relocates tenants often,
+//! not a leak — but it is real, and it is why `release` is not "cleanup".
+//!
 //! | resource            | partitioned by                                            |
 //! |---------------------|-----------------------------------------------------------|
 //! | `IsolateClient`     | `client_id == deployment name`; the worker recreates its V8 isolate whenever the client changes |
@@ -139,6 +147,13 @@ impl SharedResources {
     /// Without this the entries survive until they are evicted by size, which
     /// on a process that churns tenants means the shared cache slowly fills
     /// with intervals nobody can ever read again.
+    /// Release what CAN be released when an instance unloads.
+    ///
+    /// Only the index cache exposes a per-deployment purge. The query cache,
+    /// the funrun module/code caches and the funrun in-memory index cache all
+    /// key on the deployment but offer no eviction API, so a dead tenant's
+    /// entries stay until their own size limits push them out. Adding those
+    /// APIs means changing three upstream crates; see the module doc.
     pub fn release(&self, deployment_id: DeploymentId) {
         self.index_cache.remove_deployment(deployment_id);
     }

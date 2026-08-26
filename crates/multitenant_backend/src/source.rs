@@ -203,6 +203,14 @@ impl InstanceSource {
     pub async fn run(self, tx: watch::Sender<Roster>) {
         if matches!(self.config, SourceConfig::Static { .. }) {
             tracing::info!("instance source is static; not polling");
+            // PARK, rather than return. Returning drops `tx`, which closes the
+            // watch channel; the supervisor reads that as "the source is gone"
+            // and leaves its select loop, taking the shutdown and fault arms
+            // with it. The process would then exit without closing a single
+            // store, and an instance that faulted would never be unloaded.
+            // A static source has nothing to poll but must still hold the
+            // channel open for the life of the process.
+            std::future::pending::<()>().await;
             return;
         }
         let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
@@ -319,6 +327,7 @@ enum Fetched {
 }
 
 /// The file shape, for documentation and for tests.
+#[cfg(test)]
 pub fn example_roster_file() -> &'static str {
     r#"{
   "group": "cell-01",

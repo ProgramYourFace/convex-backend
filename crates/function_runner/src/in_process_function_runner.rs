@@ -179,33 +179,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         fetch_client: Arc<dyn FetchClient>,
     ) -> anyhow::Result<Self> {
         // InProcessFunctionRunner is single tenant and thus can use the full capacity.
-        Self::new_with_capacity(
-            deployment,
-            keybroker,
-            convex_origin,
-            rt,
-            persistence_reader,
-            storage,
-            database,
-            fetch_client,
-            100,
-        )
-    }
-
-    /// Like [`InProcessFunctionRunner::new`], but bounds the share of the
-    /// (privately owned) isolate pool this runner may occupy.
-    pub fn new_with_capacity(
-        deployment: DeploymentMetadata,
-        keybroker: FunctionRunnerKeyBroker,
-        convex_origin: ConvexOrigin,
-        rt: RT,
-        persistence_reader: Arc<dyn PersistenceReader>,
-        storage: DeploymentStorage,
-        database: Database<RT>,
-        fetch_client: Arc<dyn FetchClient>,
-        max_percent_per_client: usize,
-    ) -> anyhow::Result<Self> {
-        let (core, concurrency_logger) = new_shared_core(rt, max_percent_per_client)?;
+        let (core, concurrency_logger) = new_shared_core(rt, 100)?;
         Ok(Self::build(
             core.with_storage(storage),
             deployment,

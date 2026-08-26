@@ -115,19 +115,15 @@ pub struct MultitenantState {
     /// shared, because it resolves per call rather than per construction.
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
-    /// The header name that selects an instance, for the extraction paths that
-    /// do not go through the pre-routing middleware. See [`state`].
-    pub instance_header: Arc<str>,
 }
 
 impl MultitenantState {
-    pub fn new(runtime: ProdRuntime, instance_header: &str) -> Self {
+    pub fn new(runtime: ProdRuntime) -> Self {
         let instances = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         Self {
             api: Arc::new(MultitenantApplicationApi::new(instances.clone())),
             instances,
             runtime,
-            instance_header: instance_header.to_ascii_lowercase().into(),
         }
     }
 

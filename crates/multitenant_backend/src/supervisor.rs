@@ -27,7 +27,13 @@ use std::{
         BTreeSet,
         HashMap,
     },
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::{
         Duration,
         Instant,
@@ -118,6 +124,15 @@ pub struct Supervisor {
     fault_rx: Option<mpsc::UnboundedReceiver<InstanceFault>>,
     /// Last time a boot failure was logged for a given instance.
     last_boot_error: HashMap<String, Instant>,
+    /// Set once the FIRST reconcile has finished, and never cleared.
+    ///
+    /// This is what `/ready` reports. The listeners bind before any instance
+    /// exists — deliberately, so placement can hand this process its first
+    /// tenant — which means `/version` answers during a window in which every
+    /// instance-scoped request would 404. A readiness probe on `/version`
+    /// therefore puts the pod into the Service's endpoint list while it is
+    /// still opening stores, and a rolling upgrade drops traffic at the seam.
+    ready: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -126,6 +141,7 @@ impl Supervisor {
         config: Arc<MultitenantConfig>,
         shared: Arc<SharedResources>,
         state: MultitenantState,
+        ready: Arc<AtomicBool>,
     ) -> Self {
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         Self {
@@ -137,6 +153,7 @@ impl Supervisor {
             fault_tx,
             fault_rx: Some(fault_rx),
             last_boot_error: HashMap::new(),
+            ready,
         }
     }
 
@@ -158,7 +175,15 @@ impl Supervisor {
         {
             let initial = roster_rx.borrow_and_update().clone();
             self.reconcile(&initial).await;
+            // Only NOW is the pod fit to receive traffic. Note this is set even
+            // when the initial roster was empty or every boot failed: readiness
+            // means "this process has finished trying", not "N instances are
+            // up". A cell that cannot boot its tenants must still answer, so
+            // that the failure is visible as 404s and logs rather than as a pod
+            // that never joins the Service.
+            self.ready.store(true, Ordering::Release);
         }
+        let mut source_live = true;
         loop {
             // Biased so shutdown always wins: during a termination grace period
             // there is no point admitting a new tenant.
@@ -178,14 +203,19 @@ impl Supervisor {
                     };
                     self.handle_fault(fault);
                 },
-                roster = next_roster(&mut roster_rx).fuse() => {
+                roster = next_roster(&mut roster_rx, source_live).fuse() => {
                     let Some(roster) = roster else {
                         // The source is gone. Keep serving what we have rather
-                        // than unloading everything; process shutdown cleans up.
+                        // than unloading everything. Crucially this does NOT
+                        // return: that would abandon the shutdown and fault
+                        // arms too, leaving a process that neither closes its
+                        // stores on SIGTERM nor unloads an instance that
+                        // faults. Disarm just this arm instead.
+                        source_live = false;
                         tracing::error!(
                             "the instance source stopped; continuing with the current instances"
                         );
-                        return;
+                        continue;
                     };
                     self.reconcile(&roster).await;
                 },
@@ -359,7 +389,13 @@ impl Supervisor {
 ///
 /// Split out of the select arm on purpose: the returned future is the only
 /// thing borrowing `roster_rx`, so the arm's body is free to take `&mut self`.
-async fn next_roster(rx: &mut watch::Receiver<Roster>) -> Option<Roster> {
+/// The next published roster, or a future that never completes once the source
+/// has stopped — so that arm stops firing instead of spinning on a closed
+/// channel, while the shutdown and fault arms keep running.
+async fn next_roster(rx: &mut watch::Receiver<Roster>, live: bool) -> Option<Roster> {
+    if !live {
+        std::future::pending::<()>().await;
+    }
     rx.changed().await.ok()?;
     Some(rx.borrow_and_update().clone())
 }
@@ -428,16 +464,5 @@ mod tests {
         assert!(p.evict.is_empty());
         assert!(p.admit.is_empty());
         assert_eq!(p.refused, vec!["d".to_owned()]);
-    }
-
-    #[test]
-    fn an_adopted_and_a_minted_instance_coexist() {
-        let p = plan(
-            &set(&["cell-01"]),
-            &set(&["cell-01", "i-0068a1f39c2b4d5e6f708192"]),
-            200,
-        );
-        assert!(p.evict.is_empty());
-        assert_eq!(p.admit, vec!["i-0068a1f39c2b4d5e6f708192".to_owned()]);
     }
 }

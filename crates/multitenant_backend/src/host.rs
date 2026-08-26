@@ -95,6 +95,7 @@ impl Hosted {
     }
 
     /// A fixed set, for tests.
+    #[cfg(test)]
     pub fn fixed(names: &[&str]) -> Self {
         let owned: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
         Self::new(move |name| owned.iter().any(|n| n == name))
@@ -123,24 +124,22 @@ pub enum ResolveError {
 
 impl ResolveError {
     fn body(&self) -> String {
-        // Hand-built rather than serde: the two shapes are fixed, tiny, and
-        // part of the contract clients and smoke tests match on.
+        // The shapes are fixed and part of the contract clients and smoke tests
+        // match on. The VALUES are attacker-controlled — an unresolved instance
+        // name is echoed back verbatim — so they go through `serde_json`, which
+        // is the crate's existing escaper, rather than a second one here.
         match self {
             ResolveError::UnknownInstance { instance: None } => {
-                r#"{"error":"unknown_instance"}"#.to_owned()
+                serde_json::json!({ "error": "unknown_instance" })
             },
             ResolveError::UnknownInstance {
                 instance: Some(name),
-            } => format!(
-                r#"{{"error":"unknown_instance","instance":{}}}"#,
-                json_string(name)
-            ),
-            ResolveError::Conflict { header, host } => format!(
-                r#"{{"error":"instance_conflict","header":{},"host":{}}}"#,
-                json_string(header),
-                json_string(host)
-            ),
+            } => serde_json::json!({ "error": "unknown_instance", "instance": name }),
+            ResolveError::Conflict { header, host } => {
+                serde_json::json!({ "error": "instance_conflict", "header": header, "host": host })
+            },
         }
+        .to_string()
     }
 
     fn status(&self) -> StatusCode {
@@ -160,27 +159,6 @@ impl IntoResponse for ResolveError {
         )
             .into_response()
     }
-}
-
-/// Minimal JSON string escaping. The only values that reach here are instance
-/// names that FAILED resolution and are echoed back, so they can contain
-/// anything a client sent.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Everything the middleware needs to answer "which instance?".

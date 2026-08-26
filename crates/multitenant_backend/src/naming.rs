@@ -70,17 +70,6 @@ pub fn validate_instance_name(name: &str) -> anyhow::Result<&str> {
     Ok(name)
 }
 
-/// The relational database name the stock driver derives for this instance.
-///
-/// Mirrors `clusters::` — `deployment_name.replace('-', "_")`, set as the
-/// cluster URL's path. Reproduced here only so a host that must `CREATE
-/// DATABASE` first can name the same database the driver will open. Callers
-/// MUST have validated `name`; `-` is the only character in the accepted
-/// charset that is illegal in an unquoted identifier.
-pub fn db_name(instance: &str) -> String {
-    instance.replace('-', "_")
-}
-
 /// Everything one instance owns on disk, under a single directory.
 ///
 /// ```text
@@ -266,7 +255,7 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
@@ -359,12 +348,6 @@ mod tests {
         };
         assert_eq!(t.cloud_origin("cell-01"), "http://cell-01.api.example.com");
         assert_eq!(t.site_origin("cell-01"), "http://cell-01.site.example.com");
-    }
-
-    #[test]
-    fn db_names_are_legal_unquoted_identifiers() {
-        assert_eq!(db_name("cell-01"), "cell_01");
-        assert_eq!(db_name("i-0068a1f3"), "i_0068a1f3");
     }
 
     /// RFC 4231 test cases 1 and 2. If the HMAC construction is wrong, every

@@ -37,10 +37,7 @@ use local_backend::{
     RouterState,
 };
 
-use crate::{
-    naming,
-    MultitenantState,
-};
+use crate::MultitenantState;
 
 impl FromMtState<MultitenantState> for LocalAppState {
     fn from_request_parts(
@@ -62,7 +59,7 @@ impl FromRef<MultitenantState> for RouterState {
 }
 
 fn resolve(parts: &Parts, state: &MultitenantState) -> Result<LocalAppState, HttpResponseError> {
-    let instance = instance_name(parts, &state.instance_header).ok_or_else(|| {
+    let instance = instance_name(parts).ok_or_else(|| {
         HttpResponseError::from(anyhow::anyhow!(ErrorMetadata::not_found(
             "InstanceNotFound",
             "This request could not be resolved to an instance on this backend.",
@@ -80,24 +77,19 @@ fn resolve(parts: &Parts, state: &MultitenantState) -> Result<LocalAppState, Htt
 
 /// The resolved instance for this request.
 ///
-/// Normally the pre-routing middleware has already inserted a
-/// `ResolvedHostname` extension and this is a map lookup. The header fallback
-/// exists for the paths that do not go through that middleware — the site-proxy
-/// hop, and any in-process caller that builds a request directly. It
-/// deliberately does NOT re-parse the `Host` header: doing so would reintroduce
-/// the fail-closed logic that [`crate::host`] owns in a second place, and the
-/// two would drift.
-fn instance_name(parts: &Parts, header: &str) -> Option<String> {
-    if let Some(resolved) = parts.extensions.get::<ResolvedHostname>() {
-        return Some(resolved.deployment_name.clone());
-    }
+/// The ONLY source is the `ResolvedHostname` the pre-routing middleware
+/// inserted. There is deliberately no fallback to reading the selector header
+/// here: [`crate::host`] owns instance selection, and it is what enforces the
+/// `instance_conflict` rule that makes trusting the header safe. A second
+/// selector in this file would bypass that rule, and every route that reaches
+/// this function is behind the middleware anyway — the site-proxy hop re-enters
+/// the API listener, and the meta routes mounted ahead of the middleware do not
+/// extract an app.
+fn instance_name(parts: &Parts) -> Option<String> {
     parts
-        .headers
-        .get(header)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|name| naming::is_valid_instance_name(name))
-        .map(str::to_owned)
+        .extensions
+        .get::<ResolvedHostname>()
+        .map(|resolved| resolved.deployment_name.clone())
 }
 
 #[cfg(test)]
@@ -126,21 +118,26 @@ mod tests {
     }
 
     #[test]
-    fn prefers_the_injected_extension() {
-        let p = parts(&[(DEFAULT_INSTANCE_HEADER, OTHER)], Some(INST));
-        assert_eq!(
-            instance_name(&p, DEFAULT_INSTANCE_HEADER).as_deref(),
-            Some(INST)
-        );
+    fn resolves_from_the_injected_extension() {
+        let p = parts(&[], Some(INST));
+        assert_eq!(instance_name(&p).as_deref(), Some(INST));
     }
 
     #[test]
-    fn falls_back_to_the_header() {
+    fn the_selector_header_alone_resolves_nothing() {
+        // The header is an INPUT to host resolution, never a substitute for it.
+        // `crate::host` is what enforces the `instance_conflict` rule that makes
+        // trusting the header safe; honouring it here would be a second selector
+        // that bypasses that rule — and this crate mounts routes ahead of the
+        // resolving middleware, so the bypass would be reachable.
         let p = parts(&[(DEFAULT_INSTANCE_HEADER, INST)], None);
-        assert_eq!(
-            instance_name(&p, DEFAULT_INSTANCE_HEADER).as_deref(),
-            Some(INST)
-        );
+        assert_eq!(instance_name(&p), None);
+    }
+
+    #[test]
+    fn the_extension_wins_over_a_conflicting_header() {
+        let p = parts(&[(DEFAULT_INSTANCE_HEADER, OTHER)], Some(INST));
+        assert_eq!(instance_name(&p).as_deref(), Some(INST));
     }
 
     #[test]
@@ -152,14 +149,6 @@ mod tests {
             &[("host", "i-0068a1f39c2b4d5e6f708192.cell-01.api.example")],
             None,
         );
-        assert_eq!(instance_name(&p, DEFAULT_INSTANCE_HEADER), None);
-    }
-
-    #[test]
-    fn a_malformed_header_is_ignored() {
-        for bad in ["", "Foo", "../../etc", "a b"] {
-            let p = parts(&[(DEFAULT_INSTANCE_HEADER, bad)], None);
-            assert_eq!(instance_name(&p, DEFAULT_INSTANCE_HEADER), None, "{bad}");
-        }
+        assert_eq!(instance_name(&p), None);
     }
 }

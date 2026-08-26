@@ -41,10 +41,21 @@ use std::{
         Ipv4Addr,
         SocketAddr,
     },
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::Duration,
 };
 
+use axum::{
+    http::StatusCode,
+    routing::get,
+    Router,
+};
 use cmd_util::env::config_service;
 use common::{
     errors::MainError,
@@ -136,13 +147,22 @@ fn main() -> Result<(), MainError> {
 }
 
 async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> anyhow::Result<()> {
-    // One shutdown broadcast for the whole process. Unlike the single-tenant
-    // backend there is no process-wide fatal-error channel: a fatal error
-    // belongs to one instance and unloads that instance. See
-    // `multitenant_backend::instance`.
+    // TWO shutdown broadcasts, and the order between them is the whole point.
+    //
+    // `shutdown_tx` stops the listeners and lets in-flight requests drain.
+    // `supervisor_tx` unloads the instances those requests are still using. A
+    // single channel would wake both at once, and because the supervisor's
+    // select arm is biased first it would close every RocksDB store while the
+    // drain window was still open — turning "finish what you started" into
+    // "fail everything for 30 seconds".
+    //
+    // Unlike the single-tenant backend there is no process-wide fatal-error
+    // channel: a fatal error belongs to one instance and unloads that
+    // instance. See `multitenant_backend::instance`.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
+    let (supervisor_tx, supervisor_rx) = async_broadcast::broadcast(1);
 
-    let state = MultitenantState::new(runtime.clone(), &config.instance_header);
+    let state = MultitenantState::new(runtime.clone());
     let shared = Arc::new(SharedResources::new(&runtime, &config).await?);
 
     // Read the source once, synchronously, before the supervisor starts: a
@@ -167,15 +187,15 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
     };
     let (roster_tx, roster_rx) = watch::channel(initial);
 
+    let ready = Arc::new(AtomicBool::new(false));
     let supervisor = Supervisor::new(
         runtime.clone(),
         config.clone(),
         shared.clone(),
         state.clone(),
+        ready.clone(),
     );
-    let supervisor_shutdown = shutdown_rx.clone();
-    let supervisor_handle =
-        runtime.spawn("supervisor", supervisor.run(roster_rx, supervisor_shutdown));
+    let supervisor_handle = runtime.spawn("supervisor", supervisor.run(roster_rx, supervisor_rx));
     runtime.spawn_background("instance_source", source.run(roster_tx));
 
     let resolver = HostResolver::new(
@@ -185,13 +205,36 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         hosted_from_map(state.instances.clone()),
     );
 
-    let fleet_routes = config.admin_token.as_ref().map(|token| {
-        fleet::router(fleet::FleetState {
+    // `/ready` is a PROCESS property, so it belongs beside `/version` rather
+    // than in the resolving route table — and unlike the fleet routes it is
+    // always mounted.
+    //
+    // It reports whether the supervisor has finished its first reconcile.
+    // `/version` cannot: it answers the moment the socket binds, which is before
+    // any store is open. See `Supervisor::ready`.
+    let mut meta_routes = Router::new().route(
+        "/ready",
+        get(move || {
+            let ready = ready.load(Ordering::Acquire);
+            async move {
+                if ready {
+                    (StatusCode::OK, "ready")
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, "loading instances")
+                }
+            }
+        }),
+    );
+    if let Some(token) = config.admin_token.as_ref() {
+        meta_routes = meta_routes.merge(fleet::router(fleet::FleetState {
             instances: state.instances.clone(),
             group: config.group.as_str().into(),
             token: token.as_str().into(),
-        })
-    });
+        }));
+        tracing::info!("cell fleet endpoints mounted at /api/cell/*");
+    } else {
+        tracing::info!("cell fleet endpoints NOT mounted (MULTITENANT_ADMIN_TOKEN unset)");
+    }
 
     let http_service = ConvexHttpService::new(
         router(state),
@@ -213,16 +256,7 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
     //
     // Unset token => not mounted at all, so a cell never configured for fleet
     // operations does not answer these at all rather than 401.
-    let http_service = match fleet_routes {
-        Some(routes) => {
-            tracing::info!("cell fleet endpoints mounted at /api/cell/*");
-            http_service.with_extra_meta_routes(routes)
-        },
-        None => {
-            tracing::info!("cell fleet endpoints NOT mounted (MULTITENANT_ADMIN_TOKEN unset)");
-            http_service
-        },
-    };
+    let http_service = http_service.with_extra_meta_routes(meta_routes);
 
     let mut api_shutdown_rx = shutdown_rx.clone();
     let serve_api = http_service.serve_with_middleware(
@@ -279,6 +313,9 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
             tracing::warn!("second termination signal; unloading instances now");
         },
     }
+    // The listeners are down and nothing new can arrive, so the instances the
+    // drained requests were using can now be unloaded.
+    let _: Result<_, _> = supervisor_tx.broadcast(()).await;
     supervisor_handle.join().await?;
     tracing::info!("shut down cleanly");
     Ok(())

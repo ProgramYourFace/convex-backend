@@ -23,7 +23,6 @@ testing = [
     "indexing/testing",
     "keybroker/testing",
     "local_backend/testing",
-    "metrics/testing",
     "node_executor/testing",
     "runtime/testing",
     "search/testing",
@@ -54,7 +53,6 @@ indexing = { workspace = true }
 keybroker = { workspace = true }
 libc = { workspace = true }
 local_backend = { workspace = true }
-metrics = { workspace = true }
 model = { workspace = true }
 node_executor = { workspace = true }
 reqwest = { workspace = true }
@@ -74,7 +72,6 @@ value = { workspace = true }
 [dev-dependencies]
 common = { workspace = true, features = ["testing"] }
 errors = { workspace = true, features = ["testing"] }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true
