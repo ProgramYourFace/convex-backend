@@ -381,6 +381,16 @@ impl RocksDbPersistence {
             _secondary_scratch: None,
         });
 
+        // Minted here, by the writer, rather than lazily on the first backup.
+        // A backup taken from a secondary — the supported way to back up a
+        // running deployment — cannot mint it, because a secondary cannot
+        // write. Doing it at open means the row always exists by the time a
+        // scheduled backup looks for it, and it costs one synced put per
+        // process start.
+        inner
+            .identity()
+            .context("failed to establish the database's backup identity")?;
+
         Ok(Self { inner })
     }
 }
@@ -581,6 +591,16 @@ impl Inner {
         if let Some(bytes) = self.db.get_cf(&globals, IDENTITY_KEY)? {
             return Ok(String::from_utf8(bytes)?);
         }
+        // A secondary cannot mint one — it cannot write at all — and must not
+        // guess. Falling back to reading the `IDENTITY` file here would produce
+        // a value the primary might later mint differently, and the backup
+        // directory would then reject the database it was taken from. The
+        // primary mints this at open (see `open`), so an absent row means the
+        // database has never been opened read-write by this build.
+        anyhow::ensure!(
+            !self.secondary,
+            "this database has no backup identity yet, and a read-only instance cannot mint one.              Start the backend against it once, or take the backup with the writer stopped."
+        );
         // First call on this database: mint one and keep it. Derived from the
         // engine's own id when it has one, so two databases created in the same
         // instant cannot collide.

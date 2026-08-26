@@ -1182,12 +1182,24 @@ async fn restore_refuses_a_non_empty_target() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A secondary instance has no WAL and no business writing a backup; saying so
-/// beats producing a subtly incomplete one.
+/// A live backup and a stopped-writer backup share one chain.
+///
+/// This is the ordinary operational mix: a CronJob backs up through a secondary
+/// while the backend runs, and an operator occasionally takes one by hand with
+/// the writer stopped. Both must land in the same directory as successive
+/// generations, because the backup directory is claimed by database identity —
+/// and a secondary cannot mint that identity, so it has to already match.
+///
+/// An earlier revision asserted the opposite of this test: that "a secondary
+/// instance has no WAL and no business writing a backup". The premise was
+/// wrong. A secondary tails the primary's WAL, which is exactly what makes a
+/// live backup complete.
 #[tokio::test]
-async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
+async fn live_and_stopped_backups_share_a_chain() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+
     let primary = RocksDbPersistence::new(&db_path)?;
     primary
         .write(
@@ -1197,11 +1209,19 @@ async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
         )
         .await?;
 
+    // Live, through a secondary, while the primary holds the lock.
     let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
-    let err = secondary
-        .backup(&dir.path().join("backup"), 4)
-        .expect_err("a secondary must refuse");
-    assert!(format!("{err}").contains("secondary"), "{err}");
+    secondary.backup(&backup_dir, 4)?;
+
+    // Stopped, by the writer itself.
+    primary.backup(&backup_dir, 4)?;
+
+    let generations = backup::list(&backup_dir)?;
+    assert_eq!(
+        generations.len(),
+        2,
+        "both backups belong to the same chain, so the directory should hold two generations"
+    );
     Ok(())
 }
 
@@ -1880,4 +1900,67 @@ fn synthetic_engine_error() -> rocksdb::Error {
         "/proc/self/definitely-not-a-database",
     )
     .expect_err("destroying a database under /proc must fail")
+}
+
+/// A backup taken while the primary is live must contain every acknowledged
+/// write, including ones the primary has never flushed.
+///
+/// This is the supported way to back up a running deployment, so it is worth
+/// stating what makes it work. RocksDB allows one writer, so a scheduled job
+/// cannot open the data directory read-write while the backend holds it. A
+/// secondary opens without the lock and tails the primary's write-ahead log —
+/// and under `SyncMode::Every` an acknowledged write is in that log before
+/// `write` returns. So the recovery point is the moment of the backup, not the
+/// moment the secondary opened, and not the last flush.
+///
+/// The writes below are deliberately never flushed: they exist only in the
+/// primary's memtable and its WAL when the backup is taken. Restoring through
+/// the real `restore` path — whose `RestoreOptions` differ from a hand-rolled
+/// one — is the point of the test.
+#[tokio::test]
+async fn a_backup_of_a_live_primary_captures_unflushed_writes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backups");
+    let primary = RocksDbPersistence::new(&db_path)?;
+
+    let batch = |from: u32, n: u32| -> anyhow::Result<Vec<DocumentLogEntry>> {
+        (from..from + n)
+            .map(|i| {
+                Ok(DocumentLogEntry {
+                    ts: ts(u64::from(i) + 1),
+                    id: doc_id(1, i),
+                    value: Some(document(1, i, "body")?),
+                    prev_ts: None,
+                })
+            })
+            .collect()
+    };
+
+    primary
+        .write(&batch(0, 100)?, &[], ConflictStrategy::Error)
+        .await?;
+
+    // Opened before the rest of the writes, as a long-running sidecar would be.
+    let secondary = RocksDbPersistence::new_secondary(&db_path)?;
+
+    // Acknowledged after the secondary opened, and never flushed.
+    primary
+        .write(&batch(100, 100)?, &[], ConflictStrategy::Error)
+        .await?;
+
+    // The whole operation a CronJob performs.
+    secondary.backup(&backup_dir, 3)?;
+
+    let restored_dir = dir.path().join("restored");
+    backup::restore(&backup_dir, &restored_dir, None)?;
+    let restored = RocksDbPersistence::new(&restored_dir)?;
+    let check = restored.inner.verify_readable()?;
+    assert_eq!(
+        check.documents, 200,
+        "a live backup must include writes the primary acknowledged but never flushed; got {} of \
+         200",
+        check.documents
+    );
+    Ok(())
 }

@@ -123,28 +123,20 @@ fn run() -> anyhow::Result<()> {
             let db_dir = args
                 .db
                 .ok_or_else(|| anyhow::anyhow!("backup needs --db <db-dir>"))?;
-            // No background work: this is a one-shot tool, and attaching a
-            // periodic worker or a health monitor to it would be surprising.
             anyhow::ensure!(
                 db_dir.join("CURRENT").exists(),
                 "{} is not a RocksDB database. Refusing to create one — a mistyped --db would \
                  otherwise back up an empty database over a real chain.",
                 db_dir.display(),
             );
-            let persistence = rocksdb_persistence::RocksDbPersistence::open_with(
-                &db_dir,
-                rocksdb_persistence::OpenOptions {
-                    ..rocksdb_persistence::OpenOptions::default()
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "could not open {}. RocksDB allows one writer, so this fails while the \
-                     backend is running — stop it first, or let the periodic worker take the \
-                     backup instead.",
-                    db_dir.display(),
-                )
-            })?;
+            // Opened as a *secondary*, always. RocksDB allows one writer, so a
+            // read-write open fails whenever the backend is running — which is
+            // when a scheduled backup runs. A secondary takes no lock, tails
+            // the primary's write-ahead log, and sees every acknowledged write.
+            // It works just as well against a stopped database, so there is one
+            // code path rather than two.
+            let persistence = rocksdb_persistence::RocksDbPersistence::new_secondary(&db_dir)
+                .with_context(|| format!("could not open {} for reading", db_dir.display()))?;
             let info = persistence.backup(&args.dir, args.keep)?;
             println!(
                 "backup {} written: {} files, {} MiB",
