@@ -2151,3 +2151,47 @@ async fn restore_refuses_a_target_holding_files_it_does_not_recognise() -> anyho
     );
     Ok(())
 }
+
+/// The whitelist that decides what a retried restore may delete.
+///
+/// An earlier revision matched on the extension alone, with a guard that
+/// reduced to "the name contains a digit somewhere". `backup-2024.log`,
+/// `2024-notes.log` and `report.v2.log` all passed it — plausible things to
+/// find in a directory somebody named as a restore target, and this predicate
+/// is what stands between them and `remove_file`.
+#[test]
+fn only_rocksdb_file_names_make_a_directory_clearable() {
+    for name in [
+        "CURRENT",
+        "CURRENT.tmp",
+        "IDENTITY",
+        "LOCK",
+        "LOG",
+        "LOG.old.1712345678",
+        "MANIFEST-000001",
+        "OPTIONS-000005",
+        "000123.sst",
+        "000123.log",
+        "000123.blob",
+    ] {
+        assert!(backup::is_rocksdb_artifact(name), "{name} should be ours");
+    }
+    for name in [
+        "backup-2024.log",
+        "2024-notes.log",
+        "report.v2.log",
+        "notes.log",
+        "archive.blob",
+        "exports.tar.gz",
+        "MANIFEST-backup",
+        "OPTIONS-old",
+        ".hidden",
+        "readme",
+        "x.sst",
+    ] {
+        assert!(
+            !backup::is_rocksdb_artifact(name),
+            "{name} is not a RocksDB file and must not license a delete",
+        );
+    }
+}

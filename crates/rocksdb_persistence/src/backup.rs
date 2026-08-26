@@ -120,14 +120,31 @@ const OWNER_FILE: &str = "convex-backup-owner";
 /// restore or somebody's directory. Being wrong in the permissive direction
 /// deletes data, so this is a whitelist: anything unrecognised makes the whole
 /// directory off-limits.
-fn is_rocksdb_artifact(name: &str) -> bool {
+pub(crate) fn is_rocksdb_artifact(name: &str) -> bool {
     const EXACT: [&str; 5] = ["CURRENT", "CURRENT.tmp", "IDENTITY", "LOG", "LOCK"];
-    const PREFIXES: [&str; 2] = ["MANIFEST-", "OPTIONS-"];
-    const SUFFIXES: [&str; 4] = [".sst", ".blob", ".log", ".ldb"];
-    EXACT.contains(&name)
-        || PREFIXES.iter().any(|p| name.starts_with(p))
-        || (SUFFIXES.iter().any(|e| name.ends_with(e))
-            && name.trim_end_matches(|c: char| !c.is_ascii_digit()).len() > 0)
+    const NUMBERED_PREFIXES: [&str; 2] = ["MANIFEST-", "OPTIONS-"];
+    const NUMBERED_SUFFIXES: [&str; 4] = ["sst", "blob", "log", "ldb"];
+
+    if EXACT.contains(&name) || name.starts_with("LOG.old.") {
+        return true;
+    }
+    if let Some(rest) = NUMBERED_PREFIXES.iter().find_map(|p| name.strip_prefix(p)) {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    // RocksDB numbers every data file, and the number is the *whole* stem:
+    // `000123.sst`, `000123.log`, `000123.blob`. Requiring that is the entire
+    // point of this function. Matching on the extension alone accepts
+    // `backup-2024.log` and `report.v2.log`, which are the kind of thing an
+    // operator keeps in a directory — and this whitelist decides what gets
+    // deleted.
+    match name.rsplit_once('.') {
+        Some((stem, extension)) => {
+            NUMBERED_SUFFIXES.contains(&extension)
+                && !stem.is_empty()
+                && stem.bytes().all(|b| b.is_ascii_digit())
+        },
+        None => false,
+    }
 }
 
 /// Removes everything inside `db_dir`, leaving the directory itself.
