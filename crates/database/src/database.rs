@@ -1630,6 +1630,31 @@ impl<RT: Runtime> Database<RT> {
         Ok(())
     }
 
+    /// One bounded point read straight through persistence, for a liveness
+    /// probe to hang on.
+    ///
+    /// An embedded storage engine has a failure the relational backends do not:
+    /// on a full disk or a hung mount RocksDB does not fail a write, it blocks,
+    /// so nothing errors, nothing crashes, and the process keeps answering
+    /// health checks while doing no work. Nothing inside the process can detect
+    /// that — every signal the engine exposes for it is maintained by the
+    /// machinery that has stopped — so detection belongs to the orchestrator,
+    /// and the orchestrator needs an endpoint whose success actually depends on
+    /// the volume.
+    ///
+    /// This is that endpoint's body. A single `globals` point get: no scan, no
+    /// pagination, no cursor cache, no usage metering, and a fixed cost that
+    /// does not grow with the database. It is a *read*, so it cannot detect an
+    /// engine that has latched read-only — `Persistence`'s write path escalates
+    /// that separately — but it does block on exactly the volume a wedged mount
+    /// would park, which is the case with no other detector.
+    pub async fn check_storage(&self) -> anyhow::Result<()> {
+        self.reader
+            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+            .await?;
+        Ok(())
+    }
+
     pub fn persistence_version(&self) -> PersistenceVersion {
         self.reader.version()
     }

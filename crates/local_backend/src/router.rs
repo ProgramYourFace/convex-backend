@@ -543,6 +543,41 @@ where
             get(|MtState(st): MtState<LocalAppState>| async move { st.instance_name.clone() }),
         )
         .route("/instance_version", get(|| async move { version }))
+        // The liveness probe. Unauthenticated and storage-touching, and it has
+        // to be both.
+        //
+        // Storage-touching, because the failure it exists for is a volume that
+        // has wedged rather than errored: RocksDB blocks instead of failing, so
+        // the process keeps serving while doing no work. `/version`,
+        // `/instance_name` and `/` all answer from memory and report a dead
+        // cell healthy for as long as it stays dead.
+        //
+        // Unauthenticated, because a liveness probe that can fail for any
+        // reason other than "this process is unwell" is a kill switch. A
+        // kubelet has no identity, cannot read a Secret into a probe header
+        // (Kubernetes expands `$(VAR)` in `command`, `args` and `env`, and
+        // nowhere else), and cannot tell 401 from a hung disk — so an
+        // authenticated probe crashloops a healthy cell the moment a key
+        // rotates, and cannot recover by restarting.
+        //
+        // It reads no user data: one `globals` point get whose value is a
+        // timestamp the deployment publishes anyway.
+        .route(
+            "/health/storage",
+            get(|MtState(st): MtState<LocalAppState>| async move {
+                match st.application.check_storage().await {
+                    Ok(()) => (StatusCode::OK, "ok"),
+                    // Reached only when the read *fails*. A wedged volume
+                    // blocks instead, and the probe hangs until the kubelet's
+                    // own `timeoutSeconds` fires — which is the intended
+                    // outcome, and the reason that field has to be set.
+                    Err(e) => {
+                        tracing::error!("storage health check failed: {e:#}");
+                        (StatusCode::SERVICE_UNAVAILABLE, "storage unavailable")
+                    },
+                }
+            }),
+        )
         .route(
             "/",
             get(|| async { "This Convex deployment is running. See https://docs.convex.dev/." }),
