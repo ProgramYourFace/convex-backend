@@ -108,7 +108,17 @@ use tokio::{
 /// before it gives up. A container runtime will SIGKILL at the end of its own
 /// termination grace period regardless, so this is deliberately well inside a
 /// typical one.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// How long the supervisor gets to unload every instance once the listeners are
+/// down. Bounded because `shutdown_all` closes stores SEQUENTIALLY and each
+/// RocksDB close can wait for a flush: unbounded, one slow store eats the rest
+/// of the pod's termination grace and every remaining instance is SIGKILLed
+/// with an unflushed WAL — the exact harm the ordering exists to avoid.
+///
+/// `SHUTDOWN_GRACE + UNLOAD_BUDGET` plus the manifest's `preStop` sleep must
+/// stay comfortably inside `terminationGracePeriodSeconds`.
+const UNLOAD_BUDGET: Duration = Duration::from_secs(20);
 
 fn main() -> Result<(), MainError> {
     let _guard = config_service();
@@ -167,6 +177,22 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
     // instance. See `multitenant_backend::instance`.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
     let (supervisor_tx, supervisor_rx) = async_broadcast::broadcast(1);
+
+    // REGISTERED HERE, before anything slow, and reused by reference below.
+    //
+    // `signal()` installs the OS handler when it is CALLED. Building the stream
+    // inside the shutdown future would leave SIGTERM at its default disposition
+    // for the whole of `SharedResources::new` and the source's first read (a
+    // 10s HTTP timeout) — and this process is PID 1 in its container, where the
+    // kernel discards a default-disposition signal. A pod deleted while
+    // starting would hang until SIGKILL.
+    //
+    // ONE stream each, not one per wait: `Signal` is a `watch::Receiver` and
+    // subscribing marks the current value as already seen, so a stream built
+    // freshly for the second-signal wait would miss a signal that arrived while
+    // the first was still being handled.
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
 
     let state = MultitenantState::new(runtime.clone());
     let shared = Arc::new(SharedResources::new(&runtime, &config).await?);
@@ -281,13 +307,21 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         // below is loopback.
         Some((Ipv4Addr::UNSPECIFIED.octets(), config.site_port)),
         format!("http://127.0.0.1:{}/http", config.api_port),
-        // NOT the stock 4. That number is a single-tenant dev default, and it
-        // is a GLOBAL semaphore across the listener — so on a host forwarding
-        // for a dozen deployments, four slow HTTP actions in one tenant queue
-        // every other tenant's ingest behind them until the request timeout
-        // returns a bare 408. The one shared resource here that has no
-        // per-tenant partition, in the crate whose job is per-tenant isolation.
-        MAX_CONCURRENT_REQUESTS,
+        // A FRACTION of the API listener's budget, and neither the stock 4 nor
+        // the full 128.
+        //
+        // 4 is a single-tenant dev default applied as one global semaphore, so
+        // on a host forwarding for a dozen deployments four slow HTTP actions
+        // in one tenant queue every other tenant's ingest behind them.
+        //
+        // But the full 128 is worse in the other direction: every site request
+        // holds a site permit AND, after the loopback hop, an API permit, so
+        // HTTP actions alone could occupy all 128 API permits and the cell
+        // would stop answering queries, mutations and sync entirely. Waiting
+        // for a permit also sits OUTSIDE the request timeout (the limiter is
+        // applied outside it), so those requests block until the client gives
+        // up. Half leaves the API listener a floor it cannot be pushed below.
+        MAX_CONCURRENT_REQUESTS / 2,
         shutdown_rx,
     );
 
@@ -305,10 +339,7 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
             Ok(_) => Err(anyhow::anyhow!("the listeners stopped unexpectedly")),
             Err(e) => Err(e),
         }),
-        r = termination_signal().fuse() => match r {
-            Ok(()) => Exit::Signal,
-            Err(e) => Exit::Listeners(Err(e)),
-        },
+        () = next_termination(&mut sigterm, &mut sigint).fuse() => Exit::Signal,
     };
 
     if matches!(exit, Exit::Signal) {
@@ -326,21 +357,35 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         futures::pin_mut!(drained);
         let mut grace = runtime.wait(SHUTDOWN_GRACE).fuse();
         futures::select! {
-            r = drained => r?,
+            // Deliberately NOT `?`. Returning here would skip the unload
+            // below — precisely the failure the `Exit` capture above exists to
+            // prevent — and a listener error is not actionable once the process
+            // is already terminating.
+            r = drained => if let Err(e) = r {
+                tracing::warn!("the listeners errored while draining: {e:#}");
+            },
             _ = grace => tracing::warn!(
                 "requests did not drain within {SHUTDOWN_GRACE:?}; unloading instances anyway"
             ),
-            r = termination_signal().fuse() => {
-                r?;
-                tracing::warn!("second termination signal; unloading instances now");
-            },
+            () = next_termination(&mut sigterm, &mut sigint).fuse() => tracing::warn!(
+                "second termination signal; unloading instances now"
+            ),
         }
     }
 
     // ALWAYS, on either exit: the listeners are down and nothing new can
     // arrive, so the instances the drained requests were using can be unloaded.
     let _: Result<_, _> = supervisor_tx.broadcast(()).await;
-    supervisor_handle.join().await?;
+    let mut unload = supervisor_handle.join().fuse();
+    let mut unload_budget = runtime.wait(UNLOAD_BUDGET).fuse();
+    futures::select! {
+        r = unload => r?,
+        _ = unload_budget => tracing::error!(
+            "instances did not finish unloading within {UNLOAD_BUDGET:?}; some stores may not \
+             have been flushed. Lower ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS or raise the pod's \
+             terminationGracePeriodSeconds."
+        ),
+    }
     match exit {
         Exit::Signal => {
             tracing::info!("shut down cleanly");
@@ -358,22 +403,18 @@ enum Exit {
     Listeners(anyhow::Result<()>),
 }
 
-/// Resolves on SIGINT **or SIGTERM**.
+/// The next SIGINT **or SIGTERM**, on streams registered at startup.
 ///
-/// `tokio::signal::ctrl_c()` is SIGINT only. Kubernetes only ever sends
-/// SIGTERM, and this binary is PID 1 in its container (the entrypoint `exec`s
-/// it), where the kernel discards a signal whose disposition is still the
-/// default. So with `ctrl_c()` alone every pod replacement went: preStop sleep,
-/// SIGTERM discarded, the process serving on obliviously, then SIGKILL at the
-/// end of the termination grace period — no drain, no
-/// `Application::shutdown()`, and every RocksDB store killed open, making each
-/// restart a WAL recovery. None of the shutdown ordering above ran even once in
-/// a cluster.
-async fn termination_signal() -> anyhow::Result<()> {
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+/// Both matter: Kubernetes only ever sends SIGTERM, and `tokio::signal::ctrl_c`
+/// — the obvious thing to reach for — is SIGINT only. With `ctrl_c()` alone
+/// every pod replacement went: preStop sleep, SIGTERM discarded by the kernel
+/// (PID 1, default disposition), the process serving on obliviously, then
+/// SIGKILL at the end of the grace period. No drain, no
+/// `Application::shutdown()`, every store killed open, so every restart was a
+/// WAL recovery — none of the ordering above ran even once in a cluster.
+async fn next_termination(sigterm: &mut signal::unix::Signal, sigint: &mut signal::unix::Signal) {
     futures::select! {
-        r = signal::ctrl_c().fuse() => r?,
         _ = sigterm.recv().fuse() => {},
+        _ = sigint.recv().fuse() => {},
     }
-    Ok(())
 }

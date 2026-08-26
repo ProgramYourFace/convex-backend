@@ -211,9 +211,14 @@ impl HostResolver {
             // extracts and rule 5 below compares the two as strings. Without
             // this, an ingress that copies the leading Host label into the
             // header verbatim turns a request that names ONE instance twice
-            // into `400 instance_conflict`. Instance names are lowercase by
-            // construction (`naming::is_valid_instance_name`), so this only
-            // ever normalises input that could not have resolved anyway.
+            // into `400 instance_conflict`.
+            //
+            // This DOES change what resolves: `is_valid_instance_name` requires
+            // a lowercase first character, so `X-...: I-0068A1F3…` used to 404
+            // and now names the same instance the Host form does. That is the
+            // intended behaviour — a selector should not be case-sensitive when
+            // the hostname carrying the same value is not — but it is a real
+            // change, not a normalisation of input that could never resolve.
             .map(|v| v.to_ascii_lowercase());
         let from_host = headers
             .get(http::header::HOST)
@@ -541,7 +546,11 @@ mod tests {
     #[test]
     fn a_malformed_name_never_reaches_the_hosted_set() {
         let r = resolver();
-        for bad in ["../../etc/passwd", "Foo", "a\"b", "1abc", &"a".repeat(80)] {
+        // NB: not "Foo" — the header is lowercased before validation now, so
+        // `Foo` is a well-formed name that is merely unhosted, and it would pass
+        // this assertion for the wrong reason. Every entry here must still be
+        // malformed AFTER lowercasing.
+        for bad in ["../../etc/passwd", "-lead", "a\"b", "1abc", &"a".repeat(80)] {
             let err = r
                 .resolve(&headers(&[(DEFAULT_INSTANCE_HEADER, bad)]), API_PATH)
                 .unwrap_err();

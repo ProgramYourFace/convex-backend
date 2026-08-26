@@ -123,10 +123,6 @@ pub struct InProcessFunctionRunner<RT: Runtime> {
     // and ApplicationFunctionRunner.
     action_callbacks: Arc<RwLock<Option<Weak<dyn ActionCallbacks>>>>,
     fetch_client: Arc<dyn FetchClient>,
-    // `None` when the isolate pool is shared with other runners in this process:
-    // whoever built the shared core owns the logger task, and dropping this
-    // runner must not cancel it.
-    _concurrency_logger: Option<Box<dyn SpawnHandle>>,
 }
 
 // We gather prometheus stats every 30 seconds, so we should make sure we log
@@ -168,30 +164,6 @@ pub fn new_shared_core<RT: Runtime>(
 }
 
 impl<RT: Runtime> InProcessFunctionRunner<RT> {
-    pub fn new(
-        deployment: DeploymentMetadata,
-        keybroker: FunctionRunnerKeyBroker,
-        convex_origin: ConvexOrigin,
-        rt: RT,
-        persistence_reader: Arc<dyn PersistenceReader>,
-        storage: DeploymentStorage,
-        database: Database<RT>,
-        fetch_client: Arc<dyn FetchClient>,
-    ) -> anyhow::Result<Self> {
-        // InProcessFunctionRunner is single tenant and thus can use the full capacity.
-        let (core, concurrency_logger) = new_shared_core(rt, 100)?;
-        Ok(Self::build(
-            core.with_storage(storage),
-            deployment,
-            keybroker,
-            convex_origin,
-            persistence_reader,
-            database,
-            fetch_client,
-            Some(concurrency_logger),
-        ))
-    }
-
     /// Builds a runner over an isolate pool and cache set shared with the other
     /// runners in this process. See [`new_shared_core`].
     ///
@@ -208,30 +180,8 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         database: Database<RT>,
         fetch_client: Arc<dyn FetchClient>,
     ) -> Self {
-        Self::build(
-            core,
-            deployment,
-            keybroker,
-            convex_origin,
-            persistence_reader,
-            database,
-            fetch_client,
-            None,
-        )
-    }
-
-    fn build(
-        server: FunctionRunnerCore<RT, DeploymentStorage>,
-        deployment: DeploymentMetadata,
-        keybroker: FunctionRunnerKeyBroker,
-        convex_origin: ConvexOrigin,
-        persistence_reader: Arc<dyn PersistenceReader>,
-        database: Database<RT>,
-        fetch_client: Arc<dyn FetchClient>,
-        concurrency_logger: Option<Box<dyn SpawnHandle>>,
-    ) -> Self {
         Self {
-            server,
+            server: core,
             persistence_reader,
             deployment,
             key_broker: keybroker,
@@ -239,7 +189,6 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
             database,
             action_callbacks: Arc::new(RwLock::new(None)),
             fetch_client,
-            _concurrency_logger: concurrency_logger,
         }
     }
 

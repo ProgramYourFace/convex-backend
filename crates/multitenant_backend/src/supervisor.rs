@@ -174,7 +174,19 @@ impl Supervisor {
         // interval later.
         {
             let initial = roster_rx.borrow_and_update().clone();
-            self.reconcile(&initial).await;
+            // Raced against shutdown: booting N stores takes seconds each, and
+            // this runs BEFORE the select loop below — so without the race a
+            // pod deleted during cold start has to finish opening every
+            // instance before it can begin closing any, and the termination
+            // grace period expires mid-boot.
+            futures::select! {
+                () = self.reconcile(&initial).fuse() => {},
+                _ = shutdown_rx.recv().fuse() => {
+                    tracing::info!("shutdown during the first reconcile; unloading what booted");
+                    self.shutdown_all().await;
+                    return;
+                },
+            }
             // Only NOW is the pod fit to receive traffic. Note this is set even
             // when the initial roster was empty or every boot failed: readiness
             // means "this process has finished trying", not "N instances are

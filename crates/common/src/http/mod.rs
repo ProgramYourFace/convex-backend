@@ -212,8 +212,7 @@ impl From<HttpRequest> for HttpRequestStream {
     }
 }
 
-impl HttpRequestStream {
-}
+impl HttpRequestStream {}
 
 impl HeapSize for HttpRequest {
     fn heap_size(&self) -> usize {
@@ -580,11 +579,27 @@ impl ConvexHttpService {
         self
     }
 
+    /// The built-in pair, which `meta_routes_enabled` gates.
     fn meta_routes(&self) -> Router {
         let version = self.version.clone();
-        let base = Router::new()
+        Router::new()
             .route("/version", get(move || async move { version }))
-            .route("/metrics", get(metrics));
+            .route("/metrics", get(metrics))
+    }
+
+    /// Everything served ahead of the middleware: the built-in pair when it is
+    /// enabled, plus any extra routes.
+    ///
+    /// The extra routes are NOT gated by `meta_routes_enabled`. That flag means
+    /// "do not serve `/version` and `/metrics`"; a caller that sets it to hide
+    /// those must not thereby unmount a readiness probe or an administrative
+    /// API it registered separately.
+    fn all_meta_routes(&self) -> Router {
+        let base = if self.meta_routes_enabled {
+            self.meta_routes()
+        } else {
+            Router::new()
+        };
         match &self.extra_meta_routes {
             Some(extra) => base.merge(extra.clone()),
             None => base,
@@ -596,12 +611,11 @@ impl ConvexHttpService {
         addr: impl MakeSocket,
         shutdown: F,
     ) -> anyhow::Result<()> {
-        let extra = self.meta_routes();
-        let mut router = self.router;
-        if self.meta_routes_enabled {
-            router = router.merge(extra);
-        }
-        let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
+        let meta = self.all_meta_routes();
+        let make_svc = self
+            .router
+            .merge(meta)
+            .into_make_service_with_connect_info::<SocketAddr>();
         let socket = addr.make_socket()?;
         let local_addr = socket.local_addr()?;
         tracing::info!("{} listening on {local_addr}", self.service_name);
@@ -626,13 +640,14 @@ impl ConvexHttpService {
         Rejection: IntoResponse + Send + 'static,
     {
         let middleware = axum::middleware::map_request(middleware_fn);
-        let meta_router = self.meta_routes();
+        let has_meta = self.meta_routes_enabled || self.extra_meta_routes.is_some();
+        let meta_router = self.all_meta_routes();
         let wrapped_svc = middleware.layer(self.router);
 
         let socket = addr.make_socket()?;
         let local_addr = socket.local_addr()?;
         tracing::info!("{} listening on {local_addr}", self.service_name);
-        if self.meta_routes_enabled {
+        if has_meta {
             // Fall back to the middleware-wrapped service if the request doesn't match the
             // meta router.
             serve_http(
@@ -653,7 +668,6 @@ impl ConvexHttpService {
             .await
         }
     }
-
 }
 
 /// Serves an HTTP server using the given service.
