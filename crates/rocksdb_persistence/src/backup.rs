@@ -114,6 +114,68 @@ struct LockedEngine {
 /// Name of the file that records which database owns a backup directory.
 const OWNER_FILE: &str = "convex-backup-owner";
 
+/// Names a restore that started and has not been seen to finish.
+///
+/// It lives in the *backup* directory rather than the target, because RocksDB's
+/// own restore deletes the target's children before it copies anything — a
+/// marker there would be gone before it could mean anything.
+const RESTORE_MARKER: &str = "convex-restore-in-progress";
+
+/// Records that a restore into `db_dir` has begun.
+fn mark_restore_started(dir: &Path, db_dir: &Path) -> anyhow::Result<()> {
+    std::fs::write(dir.join(RESTORE_MARKER), db_dir.to_string_lossy().as_bytes())
+        .with_context(|| format!("failed to mark a restore in {}", dir.display()))
+}
+
+/// Whether an earlier restore into exactly this target was interrupted.
+fn restore_was_interrupted(dir: &Path, db_dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(RESTORE_MARKER)) {
+        Ok(recorded) => Path::new(recorded.trim()) == db_dir,
+        Err(_) => false,
+    }
+}
+
+fn clear_restore_marker(dir: &Path) {
+    let marker = dir.join(RESTORE_MARKER);
+    if let Err(e) = std::fs::remove_file(&marker)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("could not remove {}: {e}", marker.display());
+    }
+}
+
+/// Removes everything inside `db_dir`, leaving the directory itself.
+///
+/// Contents, not the directory: a restore target is often a mount point or a
+/// PVC subdirectory whose ownership, mode and labels the operator set up.
+/// Removing and recreating it discards all of that, and on a mount root it
+/// fails outright.
+fn clear_contents(db_dir: &Path) {
+    match std::fs::read_dir(db_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(e) = removed {
+                    tracing::warn!(
+                        "could not clear {} after a failed restore: {e}. Remove it before \
+                         retrying.",
+                        path.display(),
+                    );
+                }
+            }
+        },
+        Err(e) => tracing::warn!(
+            "could not read {} after a failed restore: {e}. Clear it before retrying.",
+            db_dir.display(),
+        ),
+    }
+}
+
 /// Records, or checks, which database a backup directory belongs to.
 ///
 /// Two cells pointed at one `ROCKSDB_BACKUP_DIR` — a shared volume, a templated
@@ -221,12 +283,28 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
     if db_dir.exists() {
         let mut entries = std::fs::read_dir(db_dir)
             .with_context(|| format!("failed to read {}", db_dir.display()))?;
-        anyhow::ensure!(
-            entries.next().is_none(),
-            "{} is not empty. Restore into a fresh directory and swap it in, so that a running \
-             database is never written underneath and the current one stays recoverable.",
-            db_dir.display(),
-        );
+        if entries.next().is_some() {
+            // One exception, and it is the one that matters during a disaster.
+            // The cleanup below runs only when the restore *returns* an error;
+            // a killed process — OOM, `activeDeadlineSeconds`, an evicted node
+            // — runs nothing and leaves a half-restored directory. Without
+            // this, the emptiness precondition then refuses every retry, so an
+            // init container crashloops with no way out but a human with a
+            // shell. The marker says the contents are a previous attempt's, so
+            // clearing them is safe.
+            anyhow::ensure!(
+                restore_was_interrupted(dir, db_dir),
+                "{} is not empty. Restore into a fresh directory and swap it in, so that a \
+                 running database is never written underneath and the current one stays \
+                 recoverable.",
+                db_dir.display(),
+            );
+            tracing::warn!(
+                "{} holds a restore that did not finish; clearing it and starting again",
+                db_dir.display(),
+            );
+            clear_contents(db_dir);
+        }
     }
     restore_into(dir, db_dir, backup_id)
 }
@@ -236,6 +314,7 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
 /// Split out for [`rehearse`], which restores into a directory it constructed
 /// itself and so has no pre-existing content to protect.
 fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Result<()> {
+    mark_restore_started(dir, db_dir)?;
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
     let opts = RestoreOptions::default();
@@ -248,40 +327,16 @@ fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Re
             .context("failed to restore the latest backup"),
     };
     if result.is_err() {
-        // A restore that failed part-way — disk full, killed — leaves a
-        // populated directory, which the emptiness precondition would then
-        // refuse on the retry, wedging the operator at the worst moment.
-        // Clearing it is safe: it was empty before this call, so nothing here
-        // predates the attempt.
-        //
-        // Contents, not the directory itself. A restore target is often a mount
-        // point or a PVC subdirectory whose ownership, mode and labels the
-        // operator set up; removing and recreating it discards all of that, and
-        // on a mount root it fails outright.
-        match std::fs::read_dir(db_dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let removed = if path.is_dir() {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                    if let Err(e) = removed {
-                        tracing::warn!(
-                            "could not clear {} after a failed restore: {e}. Remove it before \
-                             retrying.",
-                            path.display(),
-                        );
-                    }
-                }
-            },
-            Err(e) => tracing::warn!(
-                "could not read {} after a failed restore: {e}. Clear it before retrying.",
-                db_dir.display(),
-            ),
-        }
+        // A restore that failed part-way leaves a populated directory, which
+        // the emptiness precondition would refuse on the retry. Clearing it is
+        // safe: it was empty before this call, so nothing here predates the
+        // attempt.
+        clear_contents(db_dir);
     }
+    // Either way the attempt is over, so the marker should not outlive it. On
+    // the error path the directory has just been cleared, and on the success
+    // path there is a database there now.
+    clear_restore_marker(dir);
     result
 }
 

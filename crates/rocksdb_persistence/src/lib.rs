@@ -381,6 +381,15 @@ impl RocksDbPersistence {
         if directory_is_new && !create_if_missing {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
+        if directory_is_new && *options::REQUIRE_EXISTING {
+            anyhow::bail!(
+                "ROCKSDB_REQUIRE_EXISTING is set and there is no database at {}. Refusing to \
+                 create one: on a cell whose volume already holds data this means the volume did \
+                 not mount — an unbound PVC, a mistyped subPath, a re-provisioned claim — and \
+                 creating a database here would bring the cell up healthy and empty.",
+                path.display(),
+            );
+        }
 
         let mut shared = options::build(create_if_missing, sync);
         if opts.statistics {
@@ -541,11 +550,14 @@ impl Inner {
                 Ok(value)
             },
             Err(e) => {
+                metrics::log_write_failure(what);
                 let failures = self
                     .consecutive_write_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                if failures == *options::WRITE_FAILURES_TO_ESCALATE
+                let threshold = *options::WRITE_FAILURES_TO_ESCALATE;
+                if threshold != 0
+                    && failures == threshold
                     && let Some(shutdown) = &self.shutdown
                 {
                     shutdown.signal(anyhow::anyhow!(
@@ -600,6 +612,20 @@ impl Inner {
                         codec::decode_index_entry(value)
                             .context("index entry did not decode after the restore")?;
                         check.index_entries += 1;
+                    },
+                    // The secondary indexes carry no value, but their keys are
+                    // what `delete_document_revisions` navigates and what
+                    // `previous_revisions` reads. A restore that brought back
+                    // `dlog` and `idx` intact and lost one of these would pass a
+                    // rehearsal that only counted their rows, and then show up
+                    // much later as retention deleting nothing.
+                    keys::CF_DOCS => {
+                        keys::parse_docs_key(key)
+                            .context("a docs key did not parse after the restore")?;
+                    },
+                    keys::CF_DTAB => {
+                        keys::parse_dtab_key(key)
+                            .context("a dtab key did not parse after the restore")?;
                     },
                     _ => {},
                 }

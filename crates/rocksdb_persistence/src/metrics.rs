@@ -1,5 +1,6 @@
 use metrics::{
     log_counter,
+    log_counter_with_labels,
     log_distribution,
     register_convex_counter,
     register_convex_histogram,
@@ -15,6 +16,25 @@ register_convex_histogram!(
 );
 pub fn write_timer() -> Timer<VMHistogram> {
     Timer::new(&ROCKSDB_WRITE_SECONDS)
+}
+
+register_convex_counter!(
+    ROCKSDB_WRITE_FAILURES_TOTAL,
+    "Engine writes that returned an error, by the operation that failed",
+    &["operation"]
+);
+/// The escalation resets its counter on any success, so a fault that fails half
+/// of all writes never reaches the threshold and never stops the process. That
+/// is deliberate — one bad write should not take a cell down — but it is only
+/// defensible if the condition is visible, and `ROCKSDB_WRITE_SECONDS` carries
+/// no status label, so a failing write is otherwise indistinguishable from a
+/// succeeding one. Alert on `rate(rocksdb_write_failures_total[5m]) > 0`.
+pub fn log_write_failure(operation: &str) {
+    log_counter_with_labels(
+        &ROCKSDB_WRITE_FAILURES_TOTAL,
+        1,
+        vec![metrics::MetricLabel::new("operation", operation.to_owned())],
+    );
 }
 
 register_convex_histogram!(

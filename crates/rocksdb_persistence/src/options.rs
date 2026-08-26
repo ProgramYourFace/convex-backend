@@ -177,16 +177,37 @@ fn explicit_cache_bytes() -> Option<usize> {
 /// budget would evict every data, index and filter block — including the bloom
 /// filters the uniqueness check depends on — and turn reads into I/O exactly
 /// when writes are heaviest.
-pub static WRITE_BUFFER_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("ROCKSDB_WRITE_BUFFER_BYTES", *BLOCK_CACHE_BYTES / 4));
+/// Floored away from zero: RocksDB reads a zero budget on `WriteBufferManager`
+/// as *disabled*, not as zero, so setting it to 0 to "turn the buffer off"
+/// removes the cross-column-family memtable ceiling entirely and leaves memory
+/// bounded only by `MEMTABLE_BYTES * max_write_buffer_number * 5`.
+pub static WRITE_BUFFER_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    env_config("ROCKSDB_WRITE_BUFFER_BYTES", *BLOCK_CACHE_BYTES / 4).max(8 << 20)
+});
 
 /// Per-column-family memtable size, in bytes.
+/// Floored: RocksDB's own sanitiser clamps `write_buffer_size` up to 64 KiB
+/// rather than rejecting a zero, which turns into a flush storm rather than an
+/// error an operator can see.
 pub static MEMTABLE_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("ROCKSDB_MEMTABLE_BYTES", 64 << 20));
+    LazyLock::new(|| env_config("ROCKSDB_MEMTABLE_BYTES", 64 << 20).max(1 << 20));
 
 /// Background flush and compaction threads. Zero means available parallelism.
-pub static BACKGROUND_JOBS: LazyLock<i32> =
-    LazyLock::new(|| env_config("ROCKSDB_BACKGROUND_JOBS", 0));
+pub static BACKGROUND_JOBS: LazyLock<i32> = LazyLock::new(|| {
+    // Negative is not "auto" — `0` is. RocksDB floors both derived counts at 1,
+    // so `-1` parses cleanly and silently yields one flush and one compaction
+    // thread, which is the opposite of what someone writing `-1` wants.
+    let configured = env_config("ROCKSDB_BACKGROUND_JOBS", 0i32);
+    if configured < 0 {
+        tracing::warn!(
+            "ROCKSDB_BACKGROUND_JOBS={configured} is negative; RocksDB would read that as one \
+             flush and one compaction thread. Using 0 (one per core) instead."
+        );
+        0
+    } else {
+        configured
+    }
+});
 
 /// Documents at or above this many bytes are stored outside the LSM tree, in
 /// blob files, so that compacting the `dlog` column family does not rewrite
@@ -200,6 +221,18 @@ pub static BLOB_THRESHOLD_BYTES: LazyLock<u64> =
 pub static SCAN_PAGE_ROWS: LazyLock<usize> =
     LazyLock::new(|| env_config::<usize>("ROCKSDB_SCAN_PAGE_ROWS", 1024).max(1));
 
+/// Refuse to create a database that is not already there.
+///
+/// `open` is always called with `create_if_missing`, which is right for a first
+/// boot and dangerous afterwards: if the PVC fails to bind, a `subPath` is
+/// mistyped, or the volume is re-provisioned, the path resolves to an empty
+/// directory, RocksDB creates a fresh database, `Database::initialize` runs, and
+/// the cell comes up **healthy and empty**. Every probe passes. Set this on a
+/// cell whose volume already holds data and that failure becomes a refusal to
+/// start.
+pub static REQUIRE_EXISTING: LazyLock<bool> =
+    LazyLock::new(|| env_config("ROCKSDB_REQUIRE_EXISTING", false));
+
 /// Generations retained before `purge_old_backups`. Zero disables pruning,
 /// which grows without bound — a deliberate choice rather than a default.
 pub static BACKUP_KEEP: LazyLock<usize> =
@@ -211,8 +244,12 @@ pub static BACKUP_KEEP: LazyLock<usize> =
 /// engine got nothing through, this many times running" rather than "one write
 /// was bad". Small, because RocksDB latches read-only rather than recovering:
 /// once it is refusing writes, waiting longer only fails more mutations.
+/// **Zero disables the escalation** rather than meaning "escalate immediately".
+/// An earlier revision applied `.max(1)`, which turned the most natural way an
+/// operator would ask for it to be off into the most aggressive setting there
+/// is: a single transient `EIO` would then stop the cell.
 pub static WRITE_FAILURES_TO_ESCALATE: LazyLock<u32> =
-    LazyLock::new(|| env_config::<u32>("ROCKSDB_WRITE_FAILURES_TO_ESCALATE", 5).max(1));
+    LazyLock::new(|| env_config::<u32>("ROCKSDB_WRITE_FAILURES_TO_ESCALATE", 5));
 
 /// How long `shutdown` waits for background compactions to settle.
 /// Clamped away from zero deliberately. RocksDB reads a zero timeout on

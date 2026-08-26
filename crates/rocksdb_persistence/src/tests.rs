@@ -2024,3 +2024,82 @@ async fn every_write_path_syncs_the_wal_only_under_sync_mode_every() -> anyhow::
     }
     Ok(())
 }
+
+/// A restore that was killed part-way can be retried.
+///
+/// The cleanup inside `restore_into` runs only when the restore *returns* an
+/// error. A killed process — OOM, `activeDeadlineSeconds`, an evicted node —
+/// runs nothing, and the half-restored directory then fails the emptiness
+/// precondition on every retry. That is a crashlooping init container during a
+/// disaster, recoverable only by a human with a shell, so the marker exists to
+/// tell a retry that the contents are its own previous attempt's.
+#[tokio::test]
+async fn an_interrupted_restore_can_be_retried() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&db_path)?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+    }
+
+    // Exactly what a `SIGKILL` mid-restore leaves: partial content in the
+    // target and the marker still in the backup directory.
+    let target = dir.path().join("restored");
+    std::fs::create_dir_all(&target)?;
+    std::fs::write(target.join("000123.sst"), b"half a restore")?;
+    std::fs::write(
+        backup_dir.join("convex-restore-in-progress"),
+        target.to_string_lossy().as_bytes(),
+    )?;
+
+    backup::restore(&backup_dir, &target, None)?;
+
+    // The retry replaced the partial content rather than merging with it.
+    assert!(
+        !target.join("000123.sst").exists(),
+        "the previous attempt's leftovers survived the retry",
+    );
+    let restored = RocksDbPersistence::new(&target)?;
+    assert_eq!(restored.inner.verify_readable()?.documents, 1);
+    Ok(())
+}
+
+/// Without the marker, a populated target is still refused — that guard is what
+/// stops a restore from being written over a live database.
+#[tokio::test]
+async fn restore_still_refuses_a_populated_target_with_no_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&db_path)?;
+        persistence
+            .write(&[entry(1, 1, 10, "v1", None)?], &[], ConflictStrategy::Error)
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+    }
+
+    let target = dir.path().join("live");
+    std::fs::create_dir_all(&target)?;
+    std::fs::write(target.join("CURRENT"), b"someone else's database")?;
+
+    let err = backup::restore(&backup_dir, &target, None)
+        .expect_err("a populated target with no marker must be refused");
+    assert!(
+        format!("{err}").contains("is not empty"),
+        "the refusal must say why: {err}"
+    );
+    assert!(
+        target.join("CURRENT").exists(),
+        "the refusal must not have touched the target",
+    );
+    Ok(())
+}
