@@ -215,8 +215,13 @@ pub static WRITE_FAILURES_TO_ESCALATE: LazyLock<u32> =
     LazyLock::new(|| env_config::<u32>("ROCKSDB_WRITE_FAILURES_TO_ESCALATE", 5).max(1));
 
 /// How long `shutdown` waits for background compactions to settle.
-pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64)));
+/// Clamped away from zero deliberately. RocksDB reads a zero timeout on
+/// `WaitForCompactOptions` as "wait as long as there is background work to
+/// finish" — the opposite of what an operator setting it to zero would mean,
+/// and an unbounded wait on the teardown path.
+pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64).clamp(1, 300))
+});
 
 fn background_jobs() -> i32 {
     match *BACKGROUND_JOBS {

@@ -1366,7 +1366,7 @@ async fn rehearse_refuses_an_empty_database() -> anyhow::Result<()> {
 
 /// RocksDB defines no behaviour for two backup engines on one directory —
 /// its own header says the result may include trashing the directory — and
-/// `purge_old_backups` runs on every worker tick, so an operator listing
+/// `purge_old_backups` runs on every scheduled backup, so an operator listing
 /// generations while the worker prunes is a real sequence.
 #[tokio::test]
 async fn backup_directory_refuses_concurrent_use() -> anyhow::Result<()> {
@@ -1962,5 +1962,38 @@ async fn a_backup_of_a_live_primary_captures_unflushed_writes() -> anyhow::Resul
          200",
         check.documents
     );
+    Ok(())
+}
+
+/// `SyncMode::Never` must still survive a crash of *this* process.
+///
+/// The mode trades away host loss, not process loss: RocksDB still writes
+/// through to the page cache on every write, so only the machine going down
+/// loses data. Nothing tested that, and `new_with_sync_mode` — the only way to
+/// state the mode in code rather than hope an environment variable was set —
+/// had no callers at all.
+#[tokio::test]
+async fn never_sync_survives_a_process_crash() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Never)?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        // Deliberately no shutdown: dropping the handle is the closest thing to
+        // a teardown that a killed process gets.
+    }
+    let reopened = RocksDbPersistence::new(&path)?;
+    let check = reopened.inner.verify_readable()?;
+    assert_eq!(
+        check.documents, 1,
+        "a write acknowledged under `Never` must survive reopening the database"
+    );
+    assert_eq!(check.index_entries, 1);
     Ok(())
 }

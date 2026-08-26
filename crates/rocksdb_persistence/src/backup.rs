@@ -63,9 +63,9 @@ pub struct BackupInfo {
 /// `backup_dir` are unspecified — `Write × Open` and `Write × Read` are listed
 /// as *"unspec = Behavior is unspecified, including possibly trashing the
 /// backup_dir"* — and it ships no lock of its own. Every entry point here opens
-/// a read-write engine, and `purge_old_backups` runs on every worker tick, so
-/// "the operator lists generations while the worker prunes" is a real sequence
-/// that this makes an error instead of a corruption.
+/// a read-write engine, and `purge_old_backups` runs on every scheduled backup,
+/// so "the operator lists generations while the worker prunes" is a real
+/// sequence that this makes an error instead of a corruption.
 struct DirLock {
     /// Held only so the descriptor stays open: the `flock` lives on the fd and
     /// is released when it closes.
@@ -316,10 +316,6 @@ pub fn rehearse(
 
     // Opening exercises the manifest and every column family descriptor; the
     // scan then forces real iterators over real data rather than a bare open.
-    // No background work: this process may be running in the backend's own
-    // environment, where `ROCKSDB_BACKUP_DIR` is set. A worker attached to a
-    // scratch database would write generations *of the scratch database* into
-    // the production backup chain and then prune the real ones away.
     let persistence = RocksDbPersistence::open_with(
         &restored,
         OpenOptions {

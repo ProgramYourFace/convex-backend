@@ -32,7 +32,7 @@ Without --id, the newest generation is used.
 
 `backup` is for the database being *stopped* — before an upgrade or a risky
 migration. RocksDB allows one writer, so it fails while the backend is running;
-a running deployment takes its generations from the periodic worker instead.
+It opens the database read-only, so it works against a running deployment.
 
 `verify` checks that the files are intact. `rehearse` checks the thing you
 actually need to know — that a database restored from them opens and reads —
@@ -71,7 +71,7 @@ fn parse() -> anyhow::Result<Args> {
         dir,
         to: None,
         db: None,
-        keep: 24,
+        keep: *rocksdb_persistence::options::BACKUP_KEEP,
         scratch: None,
         id: None,
     };

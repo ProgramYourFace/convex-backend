@@ -153,9 +153,9 @@ which also surveys what the ingest path still pays for above this trait.
 `rocksdb-backup`, a separate binary in this crate, is the operator side:
 
 ```sh
-rocksdb-backup backup   /convex/backup --db /convex/data/db   # only while stopped
+rocksdb-backup backup   /convex/backup --db /convex/data/db   # live or stopped
 rocksdb-backup list     /convex/backup
-rocksdb-backup verify   /convex/backup [--id N]      # checksum the files
+rocksdb-backup verify   /convex/backup [--id N]      # check every file is present and sized
 rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
 rocksdb-backup restore  /convex/backup --to /convex/data/db
 ```
@@ -185,9 +185,9 @@ backup.
 Only one process may use a backup directory at a time, enforced by an advisory lock that
 `list`, `verify`, `rehearse`, `restore` and the worker all take. RocksDB defines no
 behaviour for concurrent backup engines on one directory — its own header allows for
-trashing the directory — and `purge_old_backups` runs on every worker tick, so an
-operator listing generations while the worker prunes is a real sequence rather than a
-hypothetical one.
+trashing the directory. Two `rocksdb-backup` invocations overlapping — a slow backup and
+the next cron tick, or an operator listing generations while a scheduled prune runs — is
+the sequence it guards.
 
 Each generation is verified before older ones are pruned. `create_new_backup_flush`
 returning `Ok` says RocksDB wrote the files; it does not say the destination kept them,
@@ -198,13 +198,16 @@ Backups are written to a local path; the crate binds no object-store `Env`, so
 replicating that directory off-node is an external job. A backup directory on the same
 volume as the database protects against a bad migration, not against losing the volume.
 
-Watch `rocksdb_backup_age_seconds`. It is a gauge, published by the health monitor on its
-own short timer rather than by the backup worker, and emitted from process start rather
-than from the first generation — a deployment whose backups have never worked is the case
-most worth alerting on, and waiting for a first backup would leave the series absent — a level that keeps rising says "no
-backup has landed", where a distribution that stops receiving samples says nothing at
-all, and the case worth catching is precisely the one where the backup worker is the
-thing that died.
+Backups are a scheduled job, so alert on the job rather than on the database: a CronJob
+that has not succeeded within its interval is the signal, and Kubernetes already tracks
+`status.lastSuccessfulTime`. This crate publishes no backup metric — it has no thread to
+publish one from, and a gauge that only moves when the job runs would tell you nothing the
+job's own status does not.
+
+Run `rocksdb-backup rehearse` on a schedule of its own. `verify` checks that every file a
+generation names is present and the right size; it does not read them. A rehearsal
+restores into a scratch directory and decodes every document and index entry, which is the
+only check that covers a corrupted file rather than a missing one.
 
 **There is no point-in-time recovery, and there cannot be at this layer.** Postgres
 reaches an arbitrary moment by replaying archived WAL onto a base backup; RocksDB

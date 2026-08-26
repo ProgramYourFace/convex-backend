@@ -395,23 +395,6 @@ impl RocksDbPersistence {
     }
 }
 
-/// Stops the background threads and flushes the write-ahead log before
-/// `Inner`'s fields — `db` among them — are dropped.
-///
-/// `Persistence::shutdown` is the intended teardown, but nothing in the tree
-/// calls it: `Database::shutdown` stops the committer and its workers and
-/// returns, and no relational backend overrides `shutdown` either, so the hook
-/// was never wired up. Dropping the handle is the closest thing to a teardown
-/// that runs, so it has to be the safe one.
-///
-/// It is not guaranteed to run either. `local_backend` installs no SIGTERM
-/// handler, so a Kubernetes pod stop terminates the process with no destructor
-/// executing at all — which under `SyncMode::Interval` costs up to one interval
-/// on every rolling restart. Under the default `SyncMode::Every` nothing is
-/// lost. Wiring a signal handler to `Persistence::shutdown` is an upstream gap
-/// affecting every backend, not just this one. Without this, `db` — the
-/// first field — would close while the workers were still running, and in
-/// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
 /// Refuses a directory whose on-disk layout this build does not understand, and
 /// stamps the version on one that has none.
 ///
@@ -1037,17 +1020,6 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
-            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-            // default `FlushOptions`, whose `allow_write_stall = false` waits
-            // for L0 to fall below the slowdown trigger — and "a bulk import
-            // leaves everything in L0" is this function's own premise, so the
-            // wait can be long and is healthy. Counting it as an in-flight
-            // write would let a large import trip the stall ceiling and stop a
-            // backend that is doing exactly what it was asked to.
-            //
-            // Nothing is lost: the guard exists so a *stalled acknowledged
-            // write* is visible, and this is neither acknowledged nor a write.
-            //
             // Every family, explicitly. `atomic_flush` does *not* widen a
             // single-family flush: `DBImpl::Flush` passes a one-element
             // candidate list into `SelectColumnFamiliesForAtomicFlush`, so
