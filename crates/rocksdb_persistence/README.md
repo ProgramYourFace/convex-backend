@@ -316,35 +316,39 @@ stopped, and so latches in exactly the failure being detected:
   because no new memtables are filling.
 
 Measured on a healthy, continuously busy database, the engine reports a background job
-open in **under half** of samples
-(`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`), so an
-instantaneous reading of these properties carries very little information about whether
-the engine is working.
+open in **under half** of samples — typically well under. The measurement lives in
+`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`, which is
+`#[ignore]`d because it samples the host's I/O scheduler rather than this crate; run it
+with `cargo test -p rocksdb_persistence -- --ignored`. Either way an instantaneous reading
+of these properties carries very little information about whether the engine is working.
 
 So the classification is gone, and with it any attempt to escalate quickly. What remains
 is **duration alone**, at `ROCKSDB_WRITE_STALL_CEILING_SECONDS` (default 1200 — twenty
 minutes). That predicate reads no engine property: the clock belongs to a guard this crate
 takes and drops around each write, which RocksDB never touches and therefore cannot latch.
-Real backpressure drains long before twenty minutes; a hung mount does not. It is measured
-and escalated before any other work in the poll, so a health thread that later blocks
-inside `DBImpl::GetIntProperty` — which takes the engine's mutex — cannot stop the
-escalation or freeze the gauge below.
+Real backpressure drains long before twenty minutes; a hung mount does not.
 
-It runs on its own thread — `rocksdb-watchdog` — which touches nothing but `WriteWatch`
-and the flush clock. That separation is the point rather than tidiness: every other check
-has to ask RocksDB a question, and `DBImpl::GetIntProperty` takes the engine's `mutex_`.
-A single thread doing both would, on blocking inside that call, stop polling *permanently*
-— the loop is serial, so the next pass never begins — and the ceiling needs about eighty
-consecutive polls to elapse at the defaults. An earlier revision tried to fix that by
-evaluating the stall check first in the pass, which buys exactly one poll and no
-additional chances to escalate.
+It runs on its own thread — `rocksdb-watchdog` — which touches nothing but `WriteWatch`,
+the flush clock and an atomic. That separation is the point rather than tidiness: the
+latched-background-error check has to ask RocksDB a question, and `DBImpl::GetIntProperty`
+takes the engine's `mutex_`. A single thread doing both would, on blocking inside that
+call, stop polling *permanently* — the loop is serial, so the next pass never begins — and
+the ceiling needs about eighty consecutive polls to elapse at the defaults. Evaluating the
+stall check first in the pass does not fix that; it buys exactly one poll.
+
+The write-ahead log's durability check lives on the watchdog for a sharper reason than
+symmetry. In `SyncMode::Interval` a wedged volume does **not** stall `Persistence::write`
+at all — the write reaches the memtable and RocksDB's own buffer and returns — so the
+stall ceiling is not the backstop in that mode. The flush clock is, and leaving it behind
+the engine call would strand the one escalation that mode depends on exactly when it is
+needed. Only the background-error check remains on the poller.
 
 The watchdog also publishes `rocksdb_health_poll_age_seconds`, the time since the polling
 thread last completed a pass. A Prometheus gauge that stops being written still scrapes
-its last sample, so without this a dead monitor is indistinguishable from a healthy one —
+its last sample, so without this a dead poller is indistinguishable from a healthy one —
 and the poller cannot report its own death. **Alert on this**: if it climbs past a few
-poll intervals, the background-error and WAL escalations are no longer running even though
-their gauges still look fine.
+poll intervals, the background-error escalation is no longer running even though its gauge
+still looks fine.
 
 The cost of the ceiling's generosity is honest: **a wedged volume is unavailable for up to
 twenty minutes before the process stops itself.** Tighten

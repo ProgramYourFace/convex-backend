@@ -80,9 +80,7 @@ register_convex_gauge!(
     ROCKSDB_OLDEST_WRITE_SECONDS,
     "How long the oldest in-flight write has been running"
 );
-/// The signal a stall actually produces. A write RocksDB cannot make progress
-/// for blocks rather than failing, so no error counter moves and no `Result` is
-/// ever returned — only this number grows.
+
 /// How long since the polling thread last completed a pass.
 ///
 /// Published by the watchdog, which never calls into RocksDB, so a poller that
@@ -99,6 +97,15 @@ register_convex_gauge!(
     "Seconds since the RocksDB health poller last completed a pass"
 );
 
+/// The signal a stall actually produces. A write RocksDB cannot make progress
+/// for blocks rather than failing, so no error counter moves and no `Result` is
+/// ever returned — only this number grows.
+/// Age of the oldest write still in flight, or zero when none is.
+///
+/// The signal a stall actually produces. A wedged volume does not fail writes,
+/// it stops returning from them, so no error counter moves and only duration
+/// changes. Published by the watchdog, which calls into RocksDB nowhere, so it
+/// keeps climbing even if the engine has stopped answering.
 pub fn log_oldest_write(seconds: f64) {
     log_gauge(&ROCKSDB_OLDEST_WRITE_SECONDS, seconds);
 }

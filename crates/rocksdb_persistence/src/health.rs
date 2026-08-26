@@ -138,10 +138,19 @@ impl HealthMonitor {
         // this by evaluating the stall check *first* in the pass, which buys
         // exactly one poll and no additional escalation opportunities.
         //
-        // So the check that must survive a wedged engine runs on a thread that
-        // never touches the engine. It reads `WriteWatch`, which is wall-clock
-        // over a guard this crate takes and drops around each write, and the
-        // flush clock, which the flusher stamps. Neither can block on I/O.
+        // So everything whose escalation must survive a wedged engine runs on a
+        // thread that never touches the engine: the stall ceiling, the
+        // write-ahead log's durability, and the backup age. Each reads a
+        // `Mutex<Instant>`, an `AtomicU32` or a `Copy` field, and none can
+        // block on I/O. Only the latched-background-error check needs to ask
+        // RocksDB anything, so only it is left on the poller.
+        //
+        // The write-ahead log check belongs here for a sharper reason than
+        // symmetry: in `SyncMode::Interval` a wedged volume does not stall
+        // `Persistence::write` at all — the write reaches the memtable and
+        // RocksDB's buffer and returns — so the stall ceiling is not the
+        // backstop in that mode. The flush clock is, and leaving it behind the
+        // engine call would strand it exactly when it is needed.
         //
         // The watchdog also publishes how long it has been since the poller
         // completed a pass, which is what makes a parked poller visible from
@@ -153,6 +162,7 @@ impl HealthMonitor {
             let db = db.clone();
             let shutdown = shutdown.clone();
             let poll_clock = poll_clock.clone();
+            let backup_dir = backup_dir.clone();
             std::thread::Builder::new()
                 .name("rocksdb-watchdog".to_string())
                 .spawn(move || loop {
@@ -163,7 +173,7 @@ impl HealthMonitor {
                         break;
                     };
                     metrics::log_health_poll_age(poll_clock.since_last().as_secs_f64());
-                    if watch_writes(&inner, &shutdown) {
+                    if watchdog_pass(&inner, &shutdown, backup_dir.as_deref(), started) {
                         break;
                     }
                 })
@@ -181,7 +191,7 @@ impl HealthMonitor {
                     let Some(inner) = db.upgrade() else {
                         break;
                     };
-                    check(&inner, &shutdown, backup_dir.as_deref(), started);
+                    check(&inner, &shutdown);
                     poll_clock.completed();
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?
@@ -271,6 +281,97 @@ fn watch_writes(inner: &Inner, shutdown: &ShutdownSignal) -> bool {
     watch_writes_against(inner, shutdown, *options::WRITE_STALL_CEILING)
 }
 
+/// Everything the watchdog checks: the stall ceiling, the durability of the
+/// write-ahead log, and the age of the newest backup.
+///
+/// All of it reads a `Mutex<Instant>`, an `AtomicU32` or a `Copy` field, and
+/// none of it calls into RocksDB. That is the criterion for living here rather
+/// than on the poller — not importance. The WAL check in particular *has* to be
+/// here: in [`SyncMode::Interval`] a wedged volume does not stall
+/// `Persistence::write` at all, because the write only reaches the memtable and
+/// RocksDB's own buffer, so the stall ceiling is not the backstop in that mode.
+/// The flush clock is. Leaving it behind `background_errors`, which takes the
+/// engine's mutex, would strand the one escalation that mode depends on behind
+/// the call most likely to block.
+///
+/// Returns whether the caller should stop.
+fn watchdog_pass(
+    inner: &Inner,
+    shutdown: &ShutdownSignal,
+    backup_dir: Option<&std::path::Path>,
+    started: Instant,
+) -> bool {
+    if watch_writes(inner, shutdown) {
+        return true;
+    }
+    if let SyncMode::Interval(interval) = inner.sync
+        && let Some(flusher) = inner.wal_flusher.get()
+    {
+        let since = flusher.since_last_success();
+        metrics::log_wal_flush_age(since.as_secs_f64());
+        // Two ways this ends badly, and they need different thresholds.
+        //
+        // Flushes *failing*: escalate once several in a row have failed. A
+        // single fsync slower than the budget is ordinary on a contended volume
+        // — at a 100 ms interval the budget is one second — so time alone would
+        // be a self-inflicted outage.
+        //
+        // Flushes *stopping*: a thread that panicked, or is wedged inside
+        // `flush_wal`, never increments the failure count, so the conjunction
+        // above would stay silent forever while the mode kept acknowledging
+        // writes that never reach the kernel. A much longer deadline catches
+        // that without being trippable by a slow disk.
+        let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
+        let failing = since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS;
+        // Bounds and their reasons live on `silence_deadline`.
+        let silence_deadline = silence_deadline(interval);
+        let stopped = since > silence_deadline;
+        if failing || stopped {
+            shutdown.signal(anyhow::anyhow!(
+                "the RocksDB write-ahead log has not been flushed for {since:?} ({} failures \
+                 since the last success); acknowledged writes are accumulating unwritten, so \
+                 stopping rather than continuing to acknowledge them",
+                flusher.consecutive_failures(),
+            ));
+            return true;
+        }
+    }
+
+    // Read from the worker's own record rather than listing the directory:
+    // listing takes the backup directory lock, which the worker holds for the
+    // whole of a backup, so polling it would fail backups and blind the gauge
+    // during exactly the backups worth watching.
+    if backup_dir.is_some()
+        && let Some(worker) = inner.backup_worker.get()
+    {
+        // Emitted even when no generation exists yet, measured from process
+        // start. A deployment whose backups have *never* worked — wrong path,
+        // unwritable volume, a rejected ownership claim — is the case most
+        // worth alerting on, and it is precisely the case where waiting for a
+        // first generation would leave the series absent. An alert on a level
+        // that is missing does not fire.
+        let age = match worker.newest_backup_unix_secs() {
+            Some(newest) => backup::age_seconds(newest),
+            None => started.elapsed().as_secs_f64(),
+        };
+        metrics::log_backup_age(age);
+    }
+
+    if let Some(dir) = backup_dir {
+        let age = match inner
+            .backup_worker
+            .get()
+            .and_then(|worker| worker.newest_backup_unix_secs())
+        {
+            Some(newest) => backup::age_seconds(newest),
+            None => started.elapsed().as_secs_f64(),
+        };
+        let _ = dir;
+        metrics::log_backup_age(age);
+    }
+    false
+}
+
 /// The body, with the ceiling injected.
 ///
 /// Split out so a test can reach the branch that escalates without waiting
@@ -317,12 +418,14 @@ fn silence_deadline(interval: Duration) -> Duration {
 /// The checks that need to ask RocksDB something, on the thread that is allowed
 /// to block doing it. The stall ceiling is deliberately not among them — see
 /// [`watch_writes`] and the note in [`HealthMonitor::spawn`].
-fn check(
-    inner: &Inner,
-    shutdown: &ShutdownSignal,
-    backup_dir: Option<&std::path::Path>,
-    started: Instant,
-) {
+/// The one check that needs to ask RocksDB a question, on the thread that is
+/// allowed to block doing it.
+///
+/// Everything else lives on the watchdog — see [`watchdog_pass`] — because
+/// `DBImpl::GetIntProperty` takes the engine's mutex, and a thread that blocks
+/// there stops polling permanently rather than skipping a pass. Nothing whose
+/// escalation must survive a wedged engine may sit behind this call.
+fn check(inner: &Inner, shutdown: &ShutdownSignal) {
     // Published on every poll, failing or not. A series that only appears once
     // the process is already being shut down is not something an alert can
     // watch — the same argument `log_backup_age` makes, applied here.
@@ -336,75 +439,6 @@ fn check(
             "RocksDB has latched {errors} background error(s) and is refusing writes; stopping so \
              the deployment restarts or fails over rather than failing every mutation"
         ));
-        return;
-    }
-
-    if let SyncMode::Interval(interval) = inner.sync
-        && let Some(flusher) = inner.wal_flusher.get()
-    {
-        let since = flusher.since_last_success();
-        metrics::log_wal_flush_age(since.as_secs_f64());
-        // Two ways this ends badly, and they need different thresholds.
-        //
-        // Flushes *failing*: escalate once several in a row have failed. A
-        // single fsync slower than the budget is ordinary on a contended volume
-        // — at a 100 ms interval the budget is one second — so time alone would
-        // be a self-inflicted outage.
-        //
-        // Flushes *stopping*: a thread that panicked, or is wedged inside
-        // `flush_wal`, never increments the failure count, so the conjunction
-        // above would stay silent forever while the mode kept acknowledging
-        // writes that never reach the kernel. A much longer deadline catches
-        // that without being trippable by a slow disk.
-        let budget = interval.saturating_mul(FLUSH_FAILURE_INTERVALS);
-        let failing = since > budget && flusher.consecutive_failures() >= FLUSH_FAILURE_INTERVALS;
-        // With an absolute floor. At the interval the README uses as its worked
-        // example — 100 ms — the multiplied budget is six seconds, and an fsync
-        // tail that long on a throttled network volume is ordinary. The flusher
-        // is *inside* `flush_wal` while that happens, so it records neither a
-        // success nor a failure and this clock keeps climbing: without the
-        // floor, a slow disk kills a healthy backend.
-        // Bounded at both ends: the floor keeps a short interval from turning
-        // an ordinary fsync tail into a kill, the ceiling keeps a long one from
-        // granting an hour of silence in a mode that advertises at most one
-        // interval of loss.
-        // Bounded at both ends, and the upper bound is itself floored by the
-        // interval it bounds. A healthy flusher waits the whole interval before
-        // each tick, so `since_last_success` necessarily climbs to about one
-        // interval every cycle — a ceiling below that would read the healthy
-        // steady state as a dead flusher and restart the pod onto the same
-        // configuration, forever.
-        let silence_deadline = silence_deadline(interval);
-        let stopped = since > silence_deadline;
-        if failing || stopped {
-            shutdown.signal(anyhow::anyhow!(
-                "the RocksDB write-ahead log has not been flushed for {since:?} ({} failures \
-                 since the last success); acknowledged writes are accumulating unwritten, so \
-                 stopping rather than continuing to acknowledge them",
-                flusher.consecutive_failures(),
-            ));
-            return;
-        }
-    }
-
-    // Read from the worker's own record rather than listing the directory:
-    // listing takes the backup directory lock, which the worker holds for the
-    // whole of a backup, so polling it would fail backups and blind the gauge
-    // during exactly the backups worth watching.
-    if backup_dir.is_some()
-        && let Some(worker) = inner.backup_worker.get()
-    {
-        // Emitted even when no generation exists yet, measured from process
-        // start. A deployment whose backups have *never* worked — wrong path,
-        // unwritable volume, a rejected ownership claim — is the case most
-        // worth alerting on, and it is precisely the case where waiting for a
-        // first generation would leave the series absent. An alert on a level
-        // that is missing does not fire.
-        let age = match worker.newest_backup_unix_secs() {
-            Some(newest) => backup::age_seconds(newest),
-            None => started.elapsed().as_secs_f64(),
-        };
-        metrics::log_backup_age(age);
     }
 }
 
@@ -590,6 +624,7 @@ mod watchdog_tests {
         persistence::{
             ConflictStrategy,
             Persistence,
+            PersistenceGlobalKey,
         },
         shutdown::ShutdownSignal,
     };
@@ -600,47 +635,17 @@ mod watchdog_tests {
         watch_writes_against,
         WriteWatch,
     };
-    use crate::{
-        options,
-        tests::{
-            doc_id,
-            document,
-            ts,
-        },
-        RocksDbPersistence,
-    };
 
-    /// The escalation this module exists for, driven through the public write
-    /// path rather than by reaching into `WriteWatch` directly.
-    ///
-    /// That distinction is the whole point of this test. An earlier revision
-    /// deleted `write_watch.begin()` from all five write paths, leaving the
-    /// escalation permanently unreachable and `rocksdb_oldest_write_seconds`
-    /// pinned at zero — and the tests here still passed, because they took
-    /// their in-flight write from `write_watch.begin()` themselves, which is
-    /// precisely the layer that had broken. A test that bypasses the code under
-    /// test proves nothing.
-    #[tokio::test]
-    async fn a_real_write_is_visible_to_the_watchdog() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let persistence = Arc::new(RocksDbPersistence::new(&dir.path().join("db"))?);
-        let inner = persistence.inner.clone();
+    /// One `Persistence` call, boxed so the cases can live in a table.
+    type WritePath = Box<
+        dyn Fn(
+            Arc<RocksDbPersistence>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>,
+    >;
 
-        let saw_a_write = Arc::new(AtomicBool::new(false));
-        let observing = saw_a_write.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let stop = done.clone();
-        let observer = std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                if inner.write_watch.oldest_in_flight().is_some() {
-                    observing.store(true, Ordering::Relaxed);
-                    return;
-                }
-                std::thread::yield_now();
-            }
-        });
-
-        // Big enough that the write is in flight long enough to be sampled.
+    /// Enough documents that the write is still in flight when sampled.
+    async fn bulk_write(persistence: Arc<RocksDbPersistence>) -> anyhow::Result<()> {
         let documents: Vec<_> = (0..4000u32)
             .map(|n| {
                 Ok(common::persistence::DocumentLogEntry {
@@ -652,16 +657,120 @@ mod watchdog_tests {
             })
             .collect::<anyhow::Result<_>>()?;
         persistence
-            .write(&documents, &[], ConflictStrategy::Error)
-            .await?;
+            .write(&documents, &[], ConflictStrategy::Overwrite)
+            .await
+    }
+    use crate::{
+        options,
+        tests::{
+            doc_id,
+            document,
+            index_id,
+            tablet,
+            ts,
+        },
+        RocksDbPersistence,
+    };
 
-        done.store(true, Ordering::Relaxed);
-        observer.join().expect("observer thread panicked");
-        assert!(
-            saw_a_write.load(Ordering::Relaxed),
-            "Persistence::write took no WriteWatch guard, so the watchdog can never see a stalled \
-             write and the stall ceiling is dead code"
-        );
+    /// Every write path must be visible to the watchdog, driven through the
+    /// public API rather than by reaching into `WriteWatch`.
+    ///
+    /// Both halves of that matter, and each corresponds to a defect that
+    /// shipped. An over-broad edit once deleted `write_watch.begin()` from all
+    /// five write paths, leaving the stall ceiling unreachable and
+    /// `rocksdb_oldest_write_seconds` pinned at zero — and the tests passed,
+    /// because they took their in-flight write from `write_watch.begin()`
+    /// themselves, which is exactly the layer that had broken. The replacement
+    /// covered only `write`, so deleting the guard from the other four still
+    /// shipped green past both the test and the compiler's `dead_code` warning,
+    /// which only fires when the last caller goes. The retention paths are
+    /// where a wedged volume parks threads for hours.
+    #[tokio::test]
+    async fn every_write_path_is_visible_to_the_watchdog() -> anyhow::Result<()> {
+        // Each case names a `Persistence` method that reaches `db.write_opt`,
+        // and does enough work to still be in flight when sampled.
+        let cases: Vec<(&str, WritePath)> = vec![
+            ("write", Box::new(|p| Box::pin(bulk_write(p)))),
+            (
+                "write_persistence_global",
+                Box::new(|p| {
+                    Box::pin(async move {
+                        p.write_persistence_global(
+                            PersistenceGlobalKey::IndexRetentionMinSnapshotTimestamp,
+                            serde_json::json!(1),
+                        )
+                        .await
+                    })
+                }),
+            ),
+            (
+                "delete_index_entries",
+                Box::new(|p| {
+                    Box::pin(async move {
+                        let entries: Vec<_> = (0..2000u32)
+                            .map(|n| common::index::IndexEntry {
+                                index_id: index_id(1),
+                                key_prefix: format!("k{n:06}").into_bytes(),
+                                key_suffix: None,
+                                key_sha256: vec![0; 32],
+                                ts: ts(1),
+                                deleted: false,
+                            })
+                            .collect();
+                        p.delete_index_entries(entries).await.map(|_| ())
+                    })
+                }),
+            ),
+            (
+                "delete",
+                Box::new(|p| {
+                    Box::pin(async move {
+                        let ids: Vec<_> = (0..2000u32).map(|n| (ts(1), doc_id(1, n))).collect();
+                        p.delete(ids).await.map(|_| ())
+                    })
+                }),
+            ),
+            (
+                "delete_tablet_documents",
+                Box::new(|p| {
+                    Box::pin(
+                        async move { p.delete_tablet_documents(tablet(1), 1000).await.map(|_| ()) },
+                    )
+                }),
+            ),
+        ];
+
+        for (name, run) in cases {
+            let dir = tempfile::tempdir()?;
+            let persistence = Arc::new(RocksDbPersistence::new(&dir.path().join("db"))?);
+            // Give the delete paths something to delete, so they do real work.
+            bulk_write(persistence.clone()).await?;
+
+            let inner = persistence.inner.clone();
+            let saw = Arc::new(AtomicBool::new(false));
+            let observing = saw.clone();
+            let done = Arc::new(AtomicBool::new(false));
+            let stop = done.clone();
+            let observer = std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if inner.write_watch.oldest_in_flight().is_some() {
+                        observing.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+
+            run(persistence.clone()).await?;
+            done.store(true, Ordering::Relaxed);
+            observer.join().expect("observer thread panicked");
+
+            assert!(
+                saw.load(Ordering::Relaxed),
+                "{name} took no WriteWatch guard, so a stall in it is invisible to the watchdog \
+                 and the stall ceiling is dead code for that path"
+            );
+        }
         Ok(())
     }
 
@@ -744,23 +853,18 @@ mod watchdog_tests {
     /// write, or it becomes the round-5 failure again in a new place: a backend
     /// stopped for being busy.
     ///
-    /// Asserting `>= 60s` would be unfalsifiable — `options` already clamps it
-    /// there. This asserts the property that matters, that the default is on
-    /// the order of many minutes rather than many seconds, so an ordinary
-    /// ingest burst cannot reach it.
+    /// This asserts against `options`' own default constant. Two earlier
+    /// versions of this test could not fail — one compared the configured value
+    /// against the floor `options` already clamps it to, the other compared a
+    /// literal `1200` against `600`. Changing the real default to 61 left both
+    /// of them green.
     #[test]
     fn the_default_ceiling_is_a_backstop_not_a_latency_guard() {
-        // Read the default directly rather than the process-wide value, which
-        // an env var in the test runner could have moved.
-        let default = Duration::from_secs(1200);
         assert!(
-            default >= Duration::from_secs(600),
-            "a ceiling under ten minutes would stop backends for ordinary backpressure"
-        );
-        // And the configured value must still be a backstop, not a no-op.
-        assert!(
-            *options::WRITE_STALL_CEILING >= Duration::from_secs(60),
-            "the floor in `options` must keep an operator from disabling this entirely"
+            options::DEFAULT_WRITE_STALL_CEILING_SECONDS >= 600,
+            "a default ceiling under ten minutes would stop backends for ordinary backpressure; \
+             it is {}s",
+            options::DEFAULT_WRITE_STALL_CEILING_SECONDS
         );
     }
 }

@@ -1001,6 +1001,8 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
+            // Same collapse as `delete_index_entries`: one document can be
+            // named more than once, and each revision must count once.
             let _guard = inner.write_watch.begin();
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
@@ -1053,6 +1055,7 @@ impl Persistence for RocksDbPersistence {
             //
             // Nothing is lost: the guard exists so a *stalled acknowledged
             // write* is visible, and this is neither acknowledged nor a write.
+            //
             // Every family, explicitly. `atomic_flush` does *not* widen a
             // single-family flush: `DBImpl::Flush` passes a one-element
             // candidate list into `SelectColumnFamiliesForAtomicFlush`, so

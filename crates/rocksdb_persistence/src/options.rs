@@ -252,15 +252,27 @@ pub static MIN_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_MIN_FLUSH_SILENCE_SECONDS", 120).max(10))
 });
 
+/// The default for [`WRITE_STALL_CEILING`], named rather than inlined so a test
+/// can assert on it. A test comparing a literal against another literal proves
+/// nothing about the value the process actually runs with, which is how two
+/// successive versions of that test came to be unfalsifiable.
+pub const DEFAULT_WRITE_STALL_CEILING_SECONDS: u64 = 1200;
+
 /// How long one write may be in flight before the process stops itself.
 ///
 /// Deliberately generous. This is a backstop for the case nothing else can see
 /// — a volume that has stopped responding without returning an error — not a
-/// latency guard, and the cost of firing it early is an outage.
-/// `finish_loading` holds a write guard across a bulk import's flush, so the
-/// ceiling has to outlast that too.
+/// latency guard, and the cost of firing it early is an outage. It has to
+/// outlast the slowest legitimate `Persistence` write; `finish_loading` is not
+/// among them, since it takes no write guard.
 pub static WRITE_STALL_CEILING: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_WRITE_STALL_CEILING_SECONDS", 1200).max(60))
+    Duration::from_secs(
+        env_config::<u64>(
+            "ROCKSDB_WRITE_STALL_CEILING_SECONDS",
+            DEFAULT_WRITE_STALL_CEILING_SECONDS,
+        )
+        .max(60),
+    )
 });
 
 /// Ceiling on the same deadline, independent of the configured interval.

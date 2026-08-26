@@ -72,7 +72,7 @@ use crate::{
 
 const TABLE_NUMBER: u32 = 7;
 
-fn tablet(n: u8) -> TabletId {
+pub(crate) fn tablet(n: u8) -> TabletId {
     TabletId(InternalId([n; keys::ID_LEN]))
 }
 
@@ -86,7 +86,7 @@ pub(crate) fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
     InternalDocumentId::new(tablet(tablet_n), internal_id(n))
 }
 
-fn index_id(n: u8) -> IndexId {
+pub(crate) fn index_id(n: u8) -> IndexId {
     IndexId(InternalId([0xA0 | n; keys::ID_LEN]))
 }
 
