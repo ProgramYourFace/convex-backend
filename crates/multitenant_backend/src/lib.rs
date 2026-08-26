@@ -73,6 +73,12 @@
 //! (`local_backend::make_app_with_shared`), and making a process-wide RocksDB
 //! memory budget serve N stores (`rocksdb_persistence::options`).
 
+// Release-mode layout computation of the deeply nested async blocks behind
+// `ApplicationApi::execute_public_query` overflows the default query depth
+// ("queries overflow the depth limit!", first release build 2026-08-26);
+// dev/test profiles never hit it because they don't compute those layouts.
+#![recursion_limit = "256"]
+
 use std::{
     collections::HashMap,
     sync::Arc,
