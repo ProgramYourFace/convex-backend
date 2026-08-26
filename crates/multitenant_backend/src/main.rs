@@ -23,12 +23,18 @@
 //! backend serves is served here, and a route added upstream tomorrow is served
 //! here without an edit.
 //!
-//! **The listeners come up FIRST, before any instance exists.** `GET /version`
-//! is a meta route on `ConvexHttpService`, so a readiness probe passes as soon
-//! as the process is listening — which is what lets whatever manages placement
-//! proceed to hand this process its first tenant. Until the first roster
-//! arrives, instance-scoped routes 404, which is the documented cold-start
-//! behaviour.
+//! **The listeners come up FIRST, before any instance exists**, so that
+//! whatever manages placement can reach this process to hand it its first
+//! tenant. Until the supervisor's first reconcile finishes, instance-scoped
+//! routes 404.
+//!
+//! That window is exactly why readiness is `GET /ready` and NOT `GET /version`.
+//! `/version` answers as soon as the socket binds, so a probe on it admits the
+//! pod to its Service while stores are still opening — and a 404 is a permanent
+//! answer, so a client that distinguishes "no such deployment" from "try again"
+//! drops those writes rather than retrying them. `/ready` reports the first
+//! reconcile. Both are meta routes on `ConvexHttpService`, mounted ahead of the
+//! resolving middleware.
 
 #![feature(try_blocks)]
 #![feature(try_blocks_heterogeneous)]
@@ -275,48 +281,99 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         // below is loopback.
         Some((Ipv4Addr::UNSPECIFIED.octets(), config.site_port)),
         format!("http://127.0.0.1:{}/http", config.api_port),
+        // NOT the stock 4. That number is a single-tenant dev default, and it
+        // is a GLOBAL semaphore across the listener — so on a host forwarding
+        // for a dozen deployments, four slow HTTP actions in one tenant queue
+        // every other tenant's ingest behind them until the request timeout
+        // returns a bare 408. The one shared resource here that has no
+        // per-tenant partition, in the crate whose job is per-tenant isolation.
+        MAX_CONCURRENT_REQUESTS,
         shutdown_rx,
     );
 
     let serve_future = future::try_join(serve_api, serve_site).fuse();
     futures::pin_mut!(serve_future);
 
-    futures::select! {
-        r = serve_future => {
-            r?;
-            anyhow::bail!("the listeners stopped unexpectedly")
+    // Why the outcome is captured rather than returned from the arm: BOTH exits
+    // must still unload the instances. Returning early from the listener-error
+    // arm drops `supervisor_handle`, and dropping a `SpawnHandle` CANCELS its
+    // task (only `spawn_background` detaches) — so a listener failing to bind
+    // would abandon the supervisor at whatever await point it was on, quite
+    // possibly mid-boot with a store open and no `Application::shutdown()`.
+    let exit = futures::select! {
+        r = serve_future => Exit::Listeners(match r {
+            Ok(_) => Err(anyhow::anyhow!("the listeners stopped unexpectedly")),
+            Err(e) => Err(e),
+        }),
+        r = termination_signal().fuse() => match r {
+            Ok(()) => Exit::Signal,
+            Err(e) => Exit::Listeners(Err(e)),
         },
-        r = signal::ctrl_c().fuse() => {
-            r?;
-            tracing::info!("received a termination signal; draining");
-            let _: Result<_, _> = shutdown_tx.broadcast(()).await;
-        },
+    };
+
+    if matches!(exit, Exit::Signal) {
+        tracing::info!("received a termination signal; draining");
+        let _: Result<_, _> = shutdown_tx.broadcast(()).await;
+
+        // Drain requests and stop the listeners. Only then may the supervisor
+        // unload anything: unloading an instance stops the workers a
+        // still-running request would be using.
+        let drained = async {
+            serve_future.await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .fuse();
+        futures::pin_mut!(drained);
+        let mut grace = runtime.wait(SHUTDOWN_GRACE).fuse();
+        futures::select! {
+            r = drained => r?,
+            _ = grace => tracing::warn!(
+                "requests did not drain within {SHUTDOWN_GRACE:?}; unloading instances anyway"
+            ),
+            r = termination_signal().fuse() => {
+                r?;
+                tracing::warn!("second termination signal; unloading instances now");
+            },
+        }
     }
 
-    // Drain requests and stop the listeners, then let the supervisor unload
-    // every instance. The order matters: unloading an instance stops the
-    // workers a still-running request would be using.
-    let drained = async {
-        serve_future.await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .fuse();
-    futures::pin_mut!(drained);
-    let mut grace = runtime.wait(SHUTDOWN_GRACE).fuse();
-    futures::select! {
-        r = drained => r?,
-        _ = grace => tracing::warn!(
-            "requests did not drain within {SHUTDOWN_GRACE:?}; unloading instances anyway"
-        ),
-        r = signal::ctrl_c().fuse() => {
-            r?;
-            tracing::warn!("second termination signal; unloading instances now");
-        },
-    }
-    // The listeners are down and nothing new can arrive, so the instances the
-    // drained requests were using can now be unloaded.
+    // ALWAYS, on either exit: the listeners are down and nothing new can
+    // arrive, so the instances the drained requests were using can be unloaded.
     let _: Result<_, _> = supervisor_tx.broadcast(()).await;
     supervisor_handle.join().await?;
-    tracing::info!("shut down cleanly");
+    match exit {
+        Exit::Signal => {
+            tracing::info!("shut down cleanly");
+            Ok(())
+        },
+        Exit::Listeners(r) => r,
+    }
+}
+
+/// Why this exists rather than `matches!` on a bare `Result`: the listener
+/// branch carries an error that must be returned AFTER the instances are
+/// unloaded, not instead of unloading them.
+enum Exit {
+    Signal,
+    Listeners(anyhow::Result<()>),
+}
+
+/// Resolves on SIGINT **or SIGTERM**.
+///
+/// `tokio::signal::ctrl_c()` is SIGINT only. Kubernetes only ever sends
+/// SIGTERM, and this binary is PID 1 in its container (the entrypoint `exec`s
+/// it), where the kernel discards a signal whose disposition is still the
+/// default. So with `ctrl_c()` alone every pod replacement went: preStop sleep,
+/// SIGTERM discarded, the process serving on obliviously, then SIGKILL at the
+/// end of the termination grace period — no drain, no
+/// `Application::shutdown()`, and every RocksDB store killed open, making each
+/// restart a WAL recovery. None of the shutdown ordering above ran even once in
+/// a cluster.
+async fn termination_signal() -> anyhow::Result<()> {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    futures::select! {
+        r = signal::ctrl_c().fuse() => r?,
+        _ = sigterm.recv().fuse() => {},
+    }
     Ok(())
 }

@@ -202,20 +202,37 @@ async fn open_persistence(
     match config.db {
         DbDriverTag::RocksDb => {
             let paths = config.instance_paths(name);
-            std::fs::create_dir_all(&paths.db)?;
-            let persistence = RocksDbPersistence::open_with(
-                &paths.db,
-                OpenOptions {
-                    shutdown: Some(shutdown.clone()),
-                    // Descriptors and memtable shape, divided by the instance
-                    // cap. Memory needs nothing here: the block cache and the
-                    // write-buffer manager are process-wide singletons, so
-                    // every instance already shares one budget.
-                    tuning: config.rocksdb_tuning,
-                    ..OpenOptions::default()
-                },
-            )?;
-            tracing::info!("instance {name} opened RocksDB at {}", paths.db.display());
+            let tuning = config.rocksdb_tuning;
+            let shutdown = shutdown.clone();
+            let name = name.to_owned();
+            // OFF THE ASYNC WORKERS. `create_dir_all` and `open_with` are
+            // synchronous, and opening a store replays its WAL — seconds, not
+            // microseconds. The pod is capped at 2 CPUs and
+            // `available_parallelism` reads the cgroup quota, so tokio has two
+            // worker threads while `boot_concurrency` is four: run these inline
+            // and admitting one tenant parks every worker, stalling every
+            // CO-TENANT's requests, sync sockets and even `/ready` for the
+            // length of the boot. That is precisely the cross-tenant coupling
+            // this crate exists to prevent.
+            let persistence = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&paths.db)?;
+                let persistence = RocksDbPersistence::open_with(
+                    &paths.db,
+                    OpenOptions {
+                        shutdown: Some(shutdown),
+                        // Descriptors and memtable shape, divided by the
+                        // instance cap. Memory needs nothing here: the block
+                        // cache and the write-buffer manager are process-wide
+                        // singletons, so every instance already shares one
+                        // budget.
+                        tuning,
+                        ..OpenOptions::default()
+                    },
+                )?;
+                tracing::info!("instance {name} opened RocksDB at {}", paths.db.display());
+                anyhow::Ok(persistence)
+            })
+            .await??;
             Ok(Arc::new(persistence) as Arc<dyn Persistence>)
         },
         // The relational and SQLite drivers already derive one database per

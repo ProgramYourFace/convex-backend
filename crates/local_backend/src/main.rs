@@ -179,6 +179,8 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     let proxy_future = dev_site_proxy(
         config.site_bind_address(),
         config.site_forward_prefix(),
+        // Unchanged from when this was hardcoded here.
+        4,
         shutdown_rx,
     );
 

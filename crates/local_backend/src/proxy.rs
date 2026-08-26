@@ -17,12 +17,35 @@ use common::{
     },
     knobs::HTTP_SERVER_TIMEOUT_DURATION,
 };
-use hyper_util::rt::TokioExecutor;
+use hyper_util::{
+    client::legacy::{
+        connect::HttpConnector,
+        Client,
+    },
+    rt::TokioExecutor,
+};
 
-/// Routes HTTP actions to the main webserver
+/// Everything the forwarder needs, built ONCE.
+///
+/// The client is here rather than in the handler because a client built per
+/// request gets no connection pool: every HTTP action would pay a fresh TCP
+/// connect and leave a socket in TIME_WAIT.
+#[derive(Clone)]
+struct ProxyState {
+    site_forward_prefix: String,
+    client: Client<HttpConnector, axum::body::Body>,
+}
+
+/// Routes HTTP actions to the main webserver.
+///
+/// `max_concurrency` bounds requests in flight across the WHOLE listener. A
+/// single-tenant dev backend passes a small number; a host forwarding for many
+/// deployments must not, or one deployment's slow HTTP actions queue every
+/// other deployment's behind them.
 pub async fn dev_site_proxy(
     site_bind_addr: Option<([u8; 4], u16)>,
     site_forward_prefix: String,
+    max_concurrency: usize,
     mut shutdown_rx: async_broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let Some(addr) = site_bind_addr else {
@@ -32,13 +55,13 @@ pub async fn dev_site_proxy(
     tracing::info!("Starting dev site proxy at {:?}...", addr);
 
     async fn proxy_method(
-        State(site_forward_prefix): State<String>,
+        State(state): State<ProxyState>,
         mut request: Request,
     ) -> Result<impl IntoResponse, HttpResponseError> {
-        let new_uri = format!("{}{}", site_forward_prefix, request.uri());
+        let new_uri = format!("{}{}", state.site_forward_prefix, request.uri());
         *request.uri_mut() = new_uri.parse().map_err(anyhow::Error::new)?;
-        let resp = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .build_http()
+        let resp = state
+            .client
             .request(request)
             .await
             .map_err(anyhow::Error::new)?;
@@ -54,13 +77,16 @@ pub async fn dev_site_proxy(
     let router = Router::new()
         .route("/{*rest}", proxy_handler.clone())
         .route("/", proxy_handler)
-        .with_state(site_forward_prefix);
+        .with_state(ProxyState {
+            site_forward_prefix,
+            client: Client::builder(TokioExecutor::new()).build_http(),
+        });
 
     let service = ConvexHttpService::new(
         Router::new().fallback_service(router),
         "backend_http_proxy",
         "unknown".to_string(),
-        4,
+        max_concurrency,
         *HTTP_SERVER_TIMEOUT_DURATION,
         NoopRouteMapper,
     );

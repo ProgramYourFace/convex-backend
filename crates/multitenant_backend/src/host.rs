@@ -207,7 +207,14 @@ impl HostResolver {
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(str::to_owned);
+            // Lowercased, because `instance_from_host` lowercases the label it
+            // extracts and rule 5 below compares the two as strings. Without
+            // this, an ingress that copies the leading Host label into the
+            // header verbatim turns a request that names ONE instance twice
+            // into `400 instance_conflict`. Instance names are lowercase by
+            // construction (`naming::is_valid_instance_name`), so this only
+            // ever normalises input that could not have resolved anyway.
+            .map(|v| v.to_ascii_lowercase());
         let from_host = headers
             .get(http::header::HOST)
             .and_then(|v| v.to_str().ok())

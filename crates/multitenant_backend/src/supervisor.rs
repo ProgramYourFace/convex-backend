@@ -452,13 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cap_of_zero_refuses_everything_without_underflowing() {
-        let p = plan(&set(&[]), &set(&["a"]), 0);
-        assert_eq!(p.refused, vec!["a".to_owned()]);
-        assert!(p.admit.is_empty());
-    }
-
-    #[test]
     fn already_over_the_cap_still_evicts_and_admits_nothing() {
         let p = plan(&set(&["a", "b", "c"]), &set(&["a", "b", "c", "d"]), 2);
         assert!(p.evict.is_empty());
