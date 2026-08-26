@@ -25,29 +25,7 @@
 //! live on the filesystem beside the database, not in it. See
 //! `docs/proposals/005-backup-and-restore.md` §6.
 
-use std::{
-    path::{
-        Path,
-        PathBuf,
-    },
-    sync::{
-        atomic::{
-            AtomicBool,
-            AtomicI64,
-            Ordering,
-        },
-        Arc,
-        Condvar,
-        Mutex,
-        Weak,
-    },
-    thread::JoinHandle,
-    time::{
-        Duration,
-        SystemTime,
-        UNIX_EPOCH,
-    },
-};
+use std::path::Path;
 
 use anyhow::Context as _;
 use rocksdb::backup::{
@@ -58,7 +36,6 @@ use rocksdb::backup::{
 
 use crate::{
     metrics,
-    options,
     Inner,
     OpenOptions,
     RocksDbPersistence,
@@ -67,10 +44,15 @@ use crate::{
 /// One generation, as `BackupEngine` records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackupInfo {
+    /// The engine's own identifier for this generation, and the handle every
+    /// other operation takes.
     pub backup_id: u32,
     /// Seconds since the Unix epoch, as recorded by the engine.
     pub timestamp: i64,
+    /// Size of this generation's files. Incremental, so generations sharing an
+    /// SST each report it.
     pub size_bytes: u64,
+    /// How many files this generation references.
     pub num_files: u32,
 }
 
@@ -341,7 +323,6 @@ pub fn rehearse(
     let persistence = RocksDbPersistence::open_with(
         &restored,
         OpenOptions {
-            background: false,
             ..OpenOptions::default()
         },
     )
@@ -424,212 +405,6 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
     timer.finish();
     metrics::log_backup(latest.size_bytes, latest.num_files);
     Ok(latest)
-}
-
-// ---------------------------------------------------------------------------
-// The periodic worker
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct BackupConfig {
-    pub dir: PathBuf,
-    pub interval: Duration,
-    pub keep: usize,
-}
-
-impl BackupConfig {
-    /// Reads the configuration from the environment, or `None` if
-    /// `ROCKSDB_BACKUP_DIR` is unset.
-    ///
-    /// Unset means off, deliberately. A backend that silently starts writing
-    /// backups into an unconfigured path is worse than one that does nothing.
-    pub fn from_env() -> Option<Self> {
-        let dir = std::env::var("ROCKSDB_BACKUP_DIR").ok()?;
-        let dir = dir.trim();
-        if dir.is_empty() {
-            return None;
-        }
-        Some(Self::for_dir(PathBuf::from(dir)))
-    }
-
-    /// The same configuration for an explicitly chosen directory.
-    ///
-    /// A process that opens several databases has to name a directory per
-    /// database: generations are numbered per directory and carry no record of
-    /// which database wrote them, so sharing one would interleave two chains
-    /// and let each database's pruning delete the other's generations.
-    pub fn for_dir(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            interval: *options::BACKUP_INTERVAL,
-            keep: *options::BACKUP_KEEP,
-        }
-    }
-}
-
-pub(crate) struct BackupWorker {
-    stop: Arc<Signal>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    /// Unix seconds of the newest generation, or 0 if none is known yet.
-    ///
-    /// The health monitor reads this instead of listing the directory. Listing
-    /// takes the directory lock, which the worker holds for the whole of a
-    /// backup — so a monitor polling every 15 seconds would fail the hourly
-    /// backup it collided with, and would stop publishing the backup-age gauge
-    /// for exactly as long as a backup was running.
-    newest: Arc<AtomicI64>,
-}
-
-struct Signal {
-    stopped: AtomicBool,
-    lock: Mutex<()>,
-    wake: Condvar,
-}
-
-impl BackupWorker {
-    /// Spawns the periodic worker.
-    ///
-    /// Holds a [`Weak`] for the same reason the WAL flusher does: a strong
-    /// reference would keep the database alive for as long as the thread ran,
-    /// and the thread runs until the database is dropped.
-    pub(crate) fn spawn(db: Weak<Inner>, config: BackupConfig) -> anyhow::Result<Self> {
-        // Seeded once, before the worker starts, so the gauge is meaningful
-        // from boot rather than only after the first interval elapses.
-        let newest = Arc::new(AtomicI64::new(
-            list(&config.dir)
-                .ok()
-                .and_then(|g| g.last().map(|i| i.timestamp))
-                .unwrap_or(0),
-        ));
-        let thread_newest = newest.clone();
-        let stop = Arc::new(Signal {
-            stopped: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        });
-        let signal = stop.clone();
-        tracing::info!(
-            "rocksdb backups: every {}s into {}, keeping {}",
-            config.interval.as_secs(),
-            config.dir.display(),
-            config.keep,
-        );
-        let handle = std::thread::Builder::new()
-            .name("rocksdb-backup".to_string())
-            .spawn(move || {
-                loop {
-                    {
-                        let guard = match signal.lock.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        // Re-checked under the mutex: waiting without a
-                        // predicate lets a `stop()` that lands before this
-                        // thread parks be missed entirely, and the thread then
-                        // sleeps out a full backup interval — an hour by
-                        // default — with `stop()` blocked in `join`.
-                        let (guard, _) = signal
-                            .wake
-                            .wait_timeout_while(guard, config.interval, |_| {
-                                !signal.stopped.load(Ordering::Relaxed)
-                            })
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        drop(guard);
-                    }
-                    if signal.stopped.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let Some(inner) = db.upgrade() else {
-                        break;
-                    };
-                    match backup_inner(&inner, &config.dir, config.keep) {
-                        Ok(info) => {
-                            thread_newest.store(info.timestamp, Ordering::Relaxed);
-                            tracing::info!(
-                                "rocksdb backup {} written: {} files, {} MiB",
-                                info.backup_id,
-                                info.num_files,
-                                info.size_bytes >> 20,
-                            );
-                        },
-                        Err(e) => {
-                            // Log rather than crash: the next tick retries, and
-                            // the database is unaffected. A backup system that
-                            // fails quietly is the one failure mode worse than
-                            // not having one, so this also drives the age gauge
-                            // below, which is what an alert should watch.
-                            tracing::error!("rocksdb backup failed: {e:#}");
-                            metrics::log_backup_failure(&inner.instance);
-                        },
-                    }
-                }
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB backup worker: {e}"))?;
-        Ok(Self {
-            stop,
-            handle: Mutex::new(Some(handle)),
-            newest,
-        })
-    }
-
-    /// Unix seconds of the newest generation the worker knows about, or `None`
-    /// before the first one exists.
-    pub(crate) fn newest_backup_unix_secs(&self) -> Option<i64> {
-        match self.newest.load(Ordering::Relaxed) {
-            0 => None,
-            secs => Some(secs),
-        }
-    }
-
-    /// Stop the thread and wait for it. Idempotent.
-    pub(crate) fn stop(&self) {
-        {
-            // Set under the same mutex the waiter re-checks the flag beneath,
-            // so the notification cannot be issued into the gap before it
-            // parks.
-            let guard = match self.stop.lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.stop.stopped.store(true, Ordering::Relaxed);
-            drop(guard);
-        }
-        self.stop.wake.notify_all();
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(handle) = handle {
-            // The worker holds a strong `Arc<Inner>` for the duration of a
-            // tick. If the owner released the last other reference in that
-            // window, `Inner` is dropped *on this thread*, which reaches here —
-            // and joining yourself deadlocks (the platform returns EDEADLK and
-            // `join` panics). Signalling is enough in that case: the loop is
-            // already unwinding.
-            if handle.thread().id() == std::thread::current().id() {
-                // Dropping the handle here would detach the thread, which is
-                // fine — it is this thread, and it is already unwinding out of
-                // the loop. Joining it would deadlock.
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
-    }
-}
-
-impl Drop for BackupWorker {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-pub(crate) fn age_seconds(timestamp: i64) -> f64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(timestamp);
-    (now - timestamp).max(0) as f64
 }
 
 #[cfg(test)]

@@ -13,8 +13,8 @@ PVCs.
 ## 0. Summary
 
 The switch is smaller operationally than it looks, because the reference topology already
-satisfies the one invariant an embedded engine imposes. But it is **not** free, and two
-items below are correctness issues rather than tuning:
+satisfies the one invariant an embedded engine imposes. But it is **not** free, and three
+items below need action rather than tuning:
 
 | | Item | Kind | Status |
 |---|---|---|---|
@@ -22,6 +22,7 @@ items below are correctness issues rather than tuning:
 | §2 | The relay checkpoint stops sharing a durability domain with Convex | **correctness** | rule below; keep `ROCKSDB_SYNC_WRITES=true` |
 | §3 | Memory is one budget, and RocksDB reads no cgroup limit | **bug** | fixed: the cache is derived from the container limit |
 | §4 | Crash recovery stops being unbounded | win | no action |
+| §4b | No Postgres lease: a wedged volume costs up to 20 min, not seconds | **regression vs PG** | in-process ceiling; no HTTP probe can see a wedge today |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
 | §6 | No backup or point-in-time restore | **gap** | backup/restore/rehearsal implemented per [005](./005-backup-and-restore.md); no PITR, and none possible at this layer |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |
@@ -164,6 +165,69 @@ kill" state to be in.
 The 20-minute probe window can come down substantially once the cell's data is no longer
 in Postgres. Keep it generous — the sidecar still recovers its own small database — but
 the death spiral it was defending against is gone.
+
+---
+
+## 4b. No lease, so a wedged volume takes twenty minutes to recover
+
+Postgres gives the cell a failure model for free: a wedged node loses its lease, the pod
+dies, and another takes over. An embedded engine has no lease, so the backend carries an
+in-process backstop instead — a write in flight past
+`ROCKSDB_WRITE_STALL_CEILING_SECONDS` (default 1200) raises the same `ShutdownSignal` the
+relational backends raise on lease loss, and the process exits so the kubelet restarts it.
+
+**Why the ceiling is twenty minutes rather than two.** RocksDB blocks writers both
+deliberately, as backpressure, and permanently, on a hung volume. Four review rounds each
+produced a new defect trying to tell those apart from inside, because every RocksDB signal
+that could — `num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
+`actual-delayed-write-rate`, `current-super-version-number` — is updated by the machinery
+that has stopped, and so latches in exactly the failure being detected. That
+classification was removed. What survives is duration alone, on a clock the crate owns
+rather than one RocksDB maintains, set generously enough that no legitimate ingest burst
+reaches it.
+
+So the honest number for the manifest: **a wedged volume leaves the cell unavailable for
+up to twenty minutes.** Postgres's lease is faster.
+
+Worse on an idle cell. The watchdog only sees a write that is in flight, and a cell
+serving reads without mutations issues persistence writes only from the committer's idle
+timestamp bump — randomised up to an hour. So an idle-but-serving cell can sit **one to
+two hours** with every read hanging before the twenty-minute clock starts. A cell taking
+steady relay ingest, which is the case here, does not have this gap; a cell that has gone
+quiet does.
+
+**A liveness probe does not close this gap, and the obvious one is a trap.** An earlier
+revision of this proposal recommended `livenessProbe` on `/version` as a replacement for
+the lease. That is wrong: `/version` is a pure async closure returning a cached string,
+serving on a tokio async worker rather than the blocking pool, and merged into the router
+after the timeout and concurrency layers are applied — so it sits outside both. On a
+wedged volume it answers `200 OK` in about a millisecond, indefinitely. Measured. A probe
+pointed at it reports the cell healthy for exactly as long as the cell is dead.
+
+Nothing currently exposed performs a storage round-trip on the blocking pool, so no HTTP
+probe can detect a wedge today. Adding such an endpoint would let the probe beat the
+twenty-minute ceiling, and is the natural follow-up if that number is too slow for the
+fleet's availability target.
+
+What is worth configuring now:
+
+- Keep the existing **readiness** probe on `/version` — it correctly answers "is this
+  process up and routing".
+- **There is no in-process stall signal to alert on any more.** Earlier revisions
+  recommended `rocksdb_oldest_write_seconds` and `rocksdb_health_poll_age_seconds`, both
+  published by the watchdog and poller in the supervision layer. That layer was deleted
+  (see the crate README): every signal it offered for telling a wedge from deliberate
+  backpressure was itself updated by the machinery that had stopped, so each latched in
+  exactly the failure it existed to detect — five attempts, five different defects. The
+  metrics went with it, and an alert on a gauge that is never published never fires, which
+  is a worse failure than having no alert at all. Do not configure these two.
+- What is left to watch from outside: the **ingest lag** on the cell's bus consumer, which
+  rises when applies stop landing whatever the cause, and the **relay's** own
+  readiness. Neither is a RocksDB metric and neither can be latched by a wedged engine,
+  which is the property that matters.
+- Keep §4's generous **startup** probe. Recovery still has to open and load the database
+  before the port binds, and a liveness probe without a startup probe in front of it will
+  CrashLoopBackOff a large cell during boot.
 
 ---
 
@@ -344,4 +408,5 @@ streaming export, and the search and vector indexes are untouched. `CONVEX_CLOUD
 `INSTANCE_NAME`, `INSTANCE_SECRET`, the readiness probe on `/version`, the ingress, the
 relay's `CELL_SITE_URL` and `CONVEX_URL` and every application-level knob in the manifest
 carry over unchanged. The change is `POSTGRES_URL` becoming `--db rocksdb <path>`, plus
-the resource and volume consequences above.
+the resource and volume consequences above and the liveness probe in §4b — which is an
+addition rather than a change, and the only one the loss of the Postgres lease forces.

@@ -109,14 +109,14 @@ use serde_json::Value as JsonValue;
 
 pub mod backup;
 pub mod codec;
-mod health;
 pub mod keys;
 mod memory;
 mod metrics;
 pub mod options;
 mod reader;
-mod wal_flush;
 
+#[cfg(test)]
+mod adversarial;
 #[cfg(test)]
 mod tests;
 
@@ -131,15 +131,6 @@ use keys::{
 
 pub(crate) type Db = DBWithThreadMode<MultiThreaded>;
 
-/// The gauge label for a database opened without an explicit instance name: the
-/// last component of its directory, which for a single-tenant backend is the
-/// data directory's own name and for anything else is at least unique within
-/// the process.
-fn default_instance_label(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
 /// Key under which a database's backup identity lives in the `globals` column
 /// family. Namespaced away from every `PersistenceGlobalKey`.
 const IDENTITY_KEY: &[u8] = b"__convex_rocksdb_backup_identity";
@@ -158,65 +149,36 @@ const FORMAT_VERSION: u64 = 1;
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadCheck {
+    /// Rows read across every column family.
     pub rows: usize,
+    /// Rows that decoded as a document revision.
     pub documents: usize,
+    /// Rows that decoded as an index entry.
     pub index_entries: usize,
 }
 
 /// How to open a database.
 ///
-/// A struct rather than a run of positional flags because these are unrelated
-/// decisions — durability, failure escalation, whether this process owns the
-/// database's background work, and how this database shares the process with
-/// any others — and an `open(path, true, false, None)` at a call site says none
-/// of that.
-///
-/// `Default` is written out rather than derived: `background` must default to
-/// **true**, and a derive would give it `false` — which is not merely
-/// un-optimised but strictly less durable than `SyncMode::Never`, since the
-/// database is then opened with `manual_wal_flush` and nothing moves the
-/// buffer.
+/// A struct rather than a run of positional flags because these are three
+/// unrelated decisions — durability, failure escalation, and how this database
+/// shares the process with any others — and an `open(path, true, None)` at a
+/// call site says none of them.
 pub struct OpenOptions {
     /// Durability mode. `None` takes it from the environment.
     pub sync: Option<options::SyncMode>,
     /// Where to report a latched background error. Without one, a database
     /// that has stopped accepting writes keeps the process alive.
     pub shutdown: Option<ShutdownSignal>,
-    /// Whether to run background work — the interval WAL flusher, the periodic
-    /// backup worker and the health monitor.
+    /// Per-database RocksDB knobs, for a process that opens more than one.
     ///
-    /// Defaults to **true**, because `SyncMode::Interval` without a flusher is
-    /// not merely un-optimised, it is *less* durable than `Never`: the database
-    /// is opened with `manual_wal_flush`, so acknowledged writes sit in
-    /// RocksDB's own buffer with nothing to move them. A default of false made
-    /// every caller that did not think about it — including this crate's own
-    /// tests and the benchmark — silently opt out of the durability mode they
-    /// asked for.
-    ///
-    /// Set it false only for a short-lived open that must not touch shared
-    /// state: a restore rehearsal, which would otherwise attach a backup worker
-    /// to a scratch database and write generations of it into the production
-    /// chain.
-    pub background: bool,
-    /// Which deployment this database belongs to, used to label the
-    /// per-database gauges (backup age, WAL flush age).
-    ///
-    /// Those gauges are levels, not rates, so N unlabelled databases in one
-    /// process would each overwrite the others and the series would report
-    /// whichever wrote last. `None` labels them with the directory name, which
-    /// is right for the one database a single-tenant backend opens.
-    pub instance: Option<String>,
-    /// Where the periodic backup worker writes, overriding
-    /// `ROCKSDB_BACKUP_DIR`.
-    ///
-    /// A process with several databases MUST set this per database:
-    /// `BackupEngine` generations are numbered per directory with no notion of
-    /// which database produced them, so two databases pointed at one directory
-    /// interleave their generations and each one's `purge_old_backups` deletes
-    /// the other's.
-    pub backup_dir: Option<PathBuf>,
-    /// Per-database RocksDB knobs. Defaults defer to the environment, which is
-    /// what a single-tenant backend wants; see [`options::DbTuning`].
+    /// Memory needs nothing here — the block cache and the write-buffer manager
+    /// are process-wide singletons, so N databases already share one budget.
+    /// What does NOT share is file descriptors, which are a per-process
+    /// resource nothing divides on your behalf, and the memtable *shape*: left
+    /// at the single-tenant default, N databases x 5 column families all target
+    /// the whole budget and the manager answers by force-flushing whichever
+    /// memtable is largest. Defaults defer to the environment, which is what a
+    /// single-tenant backend wants. See [`options::DbTuning`].
     pub tuning: options::DbTuning,
 }
 
@@ -225,12 +187,8 @@ impl Default for OpenOptions {
         Self {
             sync: None,
             shutdown: None,
-            background: true,
-            // The multi-database fields all default to "behave exactly as a
-            // single-tenant backend did": no explicit label, no per-database
-            // backup directory, and tuning that defers to the environment.
-            instance: None,
-            backup_dir: None,
+            // Defer to the environment: exactly what a single-tenant backend
+            // did before this field existed.
             tuning: options::DbTuning::default(),
         }
     }
@@ -248,8 +206,6 @@ pub(crate) struct Inner {
     /// to be told to catch up before it can see recent writes.
     secondary: bool,
     path: PathBuf,
-    /// Label for this database's own gauges. See [`OpenOptions::instance`].
-    pub(crate) instance: String,
     /// Held for the lifetime of the database so the shared block cache and
     /// memtable budget outlive the column families that reference them.
     _cache: rocksdb::Cache,
@@ -258,16 +214,17 @@ pub(crate) struct Inner {
     /// environment per write, so a single process can hold databases in
     /// different modes — which is what makes the mode testable.
     sync: options::SyncMode,
-    /// Present only in [`options::SyncMode::Interval`]. Populated after the
-    /// `Arc<Inner>` exists, because the thread needs a `Weak` back to it.
-    wal_flusher: std::sync::OnceLock<wal_flush::WalFlusher>,
-    /// Present only when `ROCKSDB_BACKUP_DIR` is set. Same `Weak` reasoning.
-    backup_worker: std::sync::OnceLock<backup::BackupWorker>,
-    /// Present on any primary opened with a shutdown signal. Same `Weak`
-    /// reasoning.
-    health: std::sync::OnceLock<health::HealthMonitor>,
-    /// In-flight write durations, so a stalled write is visible as a level.
-    pub(crate) write_watch: health::WriteWatch,
+    /// Where to report a database that has stopped accepting writes.
+    shutdown: Option<ShutdownSignal>,
+    /// Latched by the first `shutdown()`, so a second is a no-op rather than an
+    /// error. See the note there.
+    shutdown_done: std::sync::atomic::AtomicBool,
+    /// A secondary's scratch directory, owned here so it is removed when the
+    /// reader using it goes away. Held rather than leaked: the caller cannot
+    /// drop it earlier without pulling the ground out from under an open
+    /// engine, and leaking it accumulates a directory per reader in TMPDIR
+    /// across restarts.
+    _secondary_scratch: Option<tempfile::TempDir>,
 }
 
 impl RocksDbPersistence {
@@ -301,14 +258,6 @@ impl RocksDbPersistence {
     }
 
     /// Whether an interval WAL flusher is running.
-    ///
-    /// Exists so a test about the flusher can assert that one exists: the
-    /// difference between "the flusher made this durable" and "`Inner::drop`
-    /// did" is invisible in the result, and a test that cannot tell them apart
-    /// is not testing what it claims.
-    pub fn has_wal_flusher(&self) -> bool {
-        self.inner.wal_flusher.get().is_some()
-    }
 
     /// Open a read-only view of a database another process has open for
     /// writing.
@@ -319,9 +268,34 @@ impl RocksDbPersistence {
     /// the write lock, and catches up to the primary's log on demand — which
     /// [`Inner::refresh`] does before every read.
     ///
-    /// `secondary_path` needs its own writable directory for the instance's
-    /// own bookkeeping; it holds no user data.
-    pub fn new_secondary(path: &Path, secondary_path: &Path) -> anyhow::Result<Self> {
+    /// The instance needs its own writable directory for its bookkeeping; it
+    /// holds no user data, and is created here so its lifetime can be tied to
+    /// the reader that uses it rather than leaked by the caller.
+    ///
+    /// Per *reader*, not per process: two readers in one process sharing a
+    /// directory would corrupt each other's catch-up state, and in a container
+    /// the backend is usually PID 1, so a pid-derived path would also be
+    /// identical across restarts and silently reuse a dead process's state.
+    pub fn new_secondary(path: &Path) -> anyhow::Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("convex-rocksdb-secondary-")
+            .tempdir()?;
+        let secondary_path = scratch.path().to_path_buf();
+        Self::open_secondary(path, &secondary_path, Some(scratch))
+    }
+
+    /// As [`Self::new_secondary`], but into a caller-provided directory whose
+    /// lifetime the caller manages. Used by tests, which want a path they can
+    /// inspect.
+    pub fn new_secondary_in(path: &Path, secondary_path: &Path) -> anyhow::Result<Self> {
+        Self::open_secondary(path, secondary_path, None)
+    }
+
+    fn open_secondary(
+        path: &Path,
+        secondary_path: &Path,
+        scratch: Option<tempfile::TempDir>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             path.join("CURRENT").exists(),
             "no RocksDB database at {}",
@@ -342,16 +316,14 @@ impl RocksDbPersistence {
                 db,
                 newly_created: false,
                 secondary: true,
-                instance: default_instance_label(path),
                 path: path.to_path_buf(),
                 _cache: shared.cache,
                 _write_buffer_manager: shared.write_buffer_manager,
                 // A secondary instance never writes, so it has no WAL to flush.
                 sync: options::SyncMode::Every,
-                wal_flusher: std::sync::OnceLock::new(),
-                backup_worker: std::sync::OnceLock::new(),
-                health: std::sync::OnceLock::new(),
-                write_watch: health::WriteWatch::default(),
+                shutdown: None,
+                shutdown_done: std::sync::atomic::AtomicBool::new(false),
+                _secondary_scratch: scratch,
             }),
         })
     }
@@ -411,55 +383,14 @@ impl RocksDbPersistence {
             db,
             newly_created,
             secondary: false,
-            instance: opts
-                .instance
-                .clone()
-                .unwrap_or_else(|| default_instance_label(path)),
             path: path.to_path_buf(),
             _cache: shared.cache,
             _write_buffer_manager: shared.write_buffer_manager,
             sync,
-            wal_flusher: std::sync::OnceLock::new(),
-            backup_worker: std::sync::OnceLock::new(),
-            health: std::sync::OnceLock::new(),
-            write_watch: health::WriteWatch::default(),
+            shutdown: opts.shutdown,
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
+            _secondary_scratch: None,
         });
-
-        if opts.background
-            && let options::SyncMode::Interval(interval) = sync
-        {
-            let flusher = wal_flush::WalFlusher::spawn(Arc::downgrade(&inner), interval)?;
-            let _ = inner.wal_flusher.set(flusher);
-        }
-
-        // A backup directory is only ever taken from the environment, and only
-        // when the caller wants background work at all. `rocksdb-backup` opens
-        // databases too, and a rehearsal or a restore run in the backend's own
-        // environment must not attach a worker that would write generations of
-        // a scratch database into the production backup chain.
-        let backup_config = opts
-            .background
-            .then(|| match &opts.backup_dir {
-                Some(dir) => Some(backup::BackupConfig::for_dir(dir.clone())),
-                None => backup::BackupConfig::from_env(),
-            })
-            .flatten();
-        if let Some(config) = backup_config.clone() {
-            let worker = backup::BackupWorker::spawn(Arc::downgrade(&inner), config)?;
-            let _ = inner.backup_worker.set(worker);
-        }
-
-        if opts.background
-            && let Some(shutdown) = opts.shutdown
-        {
-            let monitor = health::HealthMonitor::spawn(
-                Arc::downgrade(&inner),
-                shutdown,
-                backup_config.map(|c| c.dir),
-                inner.instance.clone(),
-            )?;
-            let _ = inner.health.set(monitor);
-        }
 
         Ok(Self { inner })
     }
@@ -482,28 +413,6 @@ impl RocksDbPersistence {
 /// affecting every backend, not just this one. Without this, `db` — the
 /// first field — would close while the workers were still running, and in
 /// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
-impl Drop for Inner {
-    fn drop(&mut self) {
-        if let Some(monitor) = self.health.get() {
-            monitor.stop();
-        }
-        if let Some(worker) = self.backup_worker.get() {
-            worker.stop();
-        }
-        if let Some(flusher) = self.wal_flusher.get() {
-            flusher.stop();
-        }
-        // Only interval mode can be holding acknowledged writes in RocksDB's
-        // buffer; the other modes have already handed them to the kernel.
-        if matches!(self.sync, options::SyncMode::Interval(_))
-            && !self.secondary
-            && let Err(e) = self.db.flush_wal(true)
-        {
-            tracing::error!("failed to flush the RocksDB WAL while closing: {e}");
-        }
-    }
-}
-
 /// Refuses a directory whose on-disk layout this build does not understand, and
 /// stamps the version on one that has none.
 ///
@@ -531,7 +440,18 @@ fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow:
         // versioning existed — the same layout, so stamping it is correct
         // rather than a migration. A secondary never writes.
         None if stamp_if_missing => {
-            db.put_cf(&globals, FORMAT_VERSION_KEY, FORMAT_VERSION.to_string())?;
+            // Synced, unlike an ordinary write, because losing it is not
+            // losing data: the next boot would see an unstamped database and
+            // stamp it again, which is harmless here but is the same pattern as
+            // the identity below, where it is not.
+            let mut sync = rocksdb::WriteOptions::default();
+            sync.set_sync(true);
+            db.put_cf_opt(
+                &globals,
+                FORMAT_VERSION_KEY,
+                FORMAT_VERSION.to_string(),
+                &sync,
+            )?;
         },
         None => {},
     }
@@ -539,6 +459,52 @@ fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow:
 }
 
 impl Inner {
+    /// Escalates a write failure that means the database has stopped accepting
+    /// writes altogether, rather than that one write was bad.
+    ///
+    /// RocksDB latches read-only on a background error — a full disk, an SST
+    /// checksum failure — and stays there. Every subsequent write fails, the
+    /// process keeps serving, and nothing crashes. A Postgres deployment gets a
+    /// pod that dies and a database another node can take over; an embedded one
+    /// would fail every mutation indefinitely until somebody looked.
+    ///
+    /// Checked here rather than on a timer, and only when a write has *already*
+    /// failed, for two reasons. It costs nothing on the path that matters:
+    /// `property_int_value` takes the engine's mutex, so polling it per write
+    /// would tax every commit. And it asks a question that is true *now* — this
+    /// write just failed and the engine reports itself in error — instead of
+    /// reading `background-errors` as a level. That counter is cumulative and
+    /// never cleared, while RocksDB auto-resumes retryable errors by default
+    /// (`max_bgerror_resume_count` is `INT_MAX`), so one transient EIO that the
+    /// engine itself recovered from leaves it permanently non-zero. Escalating
+    /// on the counter alone would kill a healthy backend; escalating on a
+    /// failed write plus a non-zero counter cannot.
+    fn escalate_if_read_only(&self, cause: &rocksdb::Error) {
+        let Some(shutdown) = &self.shutdown else {
+            return;
+        };
+        // The default column family, deliberately. `rocksdb.background-errors`
+        // is served per column family but RocksDB only ever increments it on
+        // `default`: `DBImpl` holds a single `default_cf_internal_stats_` and
+        // every bump goes through it. Asking any of the five this backend
+        // defines returns a permanent zero. Verified against a full filesystem:
+        // those five read `0` while `default` read `3`.
+        let errors = self
+            .db
+            .property_int_value(rocksdb::properties::BACKGROUND_ERRORS)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if errors == 0 {
+            return;
+        }
+        shutdown.signal(anyhow::anyhow!(
+            "a RocksDB write failed ({cause}) and the engine has latched {errors} background \
+             error(s), so it is refusing writes: stopping so the deployment restarts or fails \
+             over rather than failing every mutation from here on"
+        ));
+    }
+
     pub(crate) fn cf(&self, name: &str) -> anyhow::Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
         self.db
             .cf_handle(name)
@@ -623,7 +589,17 @@ impl Inner {
         let minted = std::fs::read_to_string(self.path.join("IDENTITY"))
             .map(|id| id.trim().to_string())
             .unwrap_or_else(|_| format!("path:{}", self.path.display()));
-        self.db.put_cf(&globals, IDENTITY_KEY, minted.as_bytes())?;
+        // Synced regardless of the configured mode. This row is what a backup
+        // chain matches a database against, and it is minted from RocksDB's
+        // `IDENTITY` file — which a restore regenerates. Lose the row to a
+        // crash and the next boot mints a *different* value, at which point
+        // every backup into the existing directory fails as "a different
+        // database". That lockout is the exact failure this row was added to
+        // prevent, so it must not be the one write that was still in a buffer.
+        let mut sync = rocksdb::WriteOptions::default();
+        sync.set_sync(true);
+        self.db
+            .put_cf_opt(&globals, IDENTITY_KEY, minted.as_bytes(), &sync)?;
         Ok(minted)
     }
 
@@ -733,6 +709,32 @@ impl Inner {
                 .chain(write.indexes.iter().map(|(k, _)| (&idx, &k[..])))
                 .collect();
             let n_documents = write.documents.len();
+            // `multi_get_cf` reads committed state, so it cannot see the batch's
+            // own rows: two entries naming the same key would both probe clean
+            // and the later would silently shadow the earlier. Postgres's
+            // `insert_document` is a plain INSERT with no ON CONFLICT clause and
+            // so raises a primary-key violation for that input. The keys are
+            // already materialised, so catching it here is a set insert per key.
+            let mut seen = std::collections::BTreeSet::new();
+            for (cf_is_dlog, key) in write
+                .documents
+                .iter()
+                .map(|(k, ..)| (true, &k[..]))
+                .chain(write.indexes.iter().map(|(k, _)| (false, &k[..])))
+            {
+                if !seen.insert((cf_is_dlog, key)) {
+                    if cf_is_dlog {
+                        let (ts, id) = keys::parse_dlog_key(key)?;
+                        anyhow::bail!("document {id} appears twice at timestamp {ts} in one write");
+                    }
+                    let (index_id, dup_key, ts) = keys::parse_idx_key(key)?;
+                    anyhow::bail!(
+                        "index entry for {index_id:?} key {:?} appears twice at timestamp {ts} in \
+                         one write",
+                        dup_key.0,
+                    );
+                }
+            }
             for (i, result) in self.db.multi_get_cf(probes).into_iter().enumerate() {
                 if result?.is_some() {
                     if i < n_documents {
@@ -760,7 +762,10 @@ impl Inner {
         }
 
         let _timer = metrics::write_timer();
-        self.db.write_opt(batch, &self.write_options())?;
+        if let Err(e) = self.db.write_opt(batch, &self.write_options()) {
+            self.escalate_if_read_only(&e);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -832,7 +837,6 @@ impl Persistence for RocksDbPersistence {
             // writer it cannot make progress for instead of failing it, and a
             // parked writer holds this thread until the volume recovers or the
             // process is stopped.
-            let _guard = inner.write_watch.begin();
             inner.apply_write(write, conflict_strategy)
         })
         .await
@@ -847,7 +851,6 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
-            let _guard = inner.write_watch.begin();
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
@@ -876,7 +879,6 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
                 let idx = inner.cf(CF_IDX)?;
 
                 // Retention deletes every version of a key at or before a
@@ -934,9 +936,11 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
-                // Same collapse as `delete_index_entries`: one document can be
-                // named more than once, and each revision must count once.
+                // Collapse to the highest expired timestamp per document: one
+                // id can be named more than once across the input, and each
+                // revision must count once — which is what Postgres's
+                // `DELETE ... WHERE (a) OR (b)` does, since a row matched by
+                // two clauses is still one deleted row.
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
                 for (ts, id) in documents {
                     highest_expired
@@ -966,7 +970,8 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
-            let _guard = inner.write_watch.begin();
+            // Same collapse as `delete_index_entries`: one document can be
+            // named more than once, and each revision must count once.
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
 
@@ -1008,11 +1013,25 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
-            let _guard = inner.write_watch.begin();
-            // `atomic_flush` routes any single-family flush through
-            // `AtomicFlushMemTables` over all of them, so the first call does
-            // the work and the rest are near-no-ops. Kept as a loop only
-            // because the binding exposes no multi-family flush.
+            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
+            // default `FlushOptions`, whose `allow_write_stall = false` waits
+            // for L0 to fall below the slowdown trigger — and "a bulk import
+            // leaves everything in L0" is this function's own premise, so the
+            // wait can be long and is healthy. Counting it as an in-flight
+            // write would let a large import trip the stall ceiling and stop a
+            // backend that is doing exactly what it was asked to.
+            //
+            // Nothing is lost: the guard exists so a *stalled acknowledged
+            // write* is visible, and this is neither acknowledged nor a write.
+            //
+            // Every family, explicitly. `atomic_flush` does *not* widen a
+            // single-family flush: `DBImpl::Flush` passes a one-element
+            // candidate list into `SelectColumnFamiliesForAtomicFlush`, so
+            // flushing `dlog` leaves the other four memtables where they are.
+            // (The backup path's flush is different, and genuinely does cover
+            // every family — `GetLiveFilesStorageInfo` selects with no
+            // candidate list at all.) This loop is doing the work, not
+            // repeating it.
             for name in ALL_COLUMN_FAMILIES {
                 inner.db.flush_cf(&inner.cf(name)?)?;
             }
@@ -1025,18 +1044,17 @@ impl Persistence for RocksDbPersistence {
     async fn shutdown(&self) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_shutdown", move || -> anyhow::Result<()> {
-            // Stop the background threads before touching the database, so
-            // neither a timed flush nor a backup can land in the middle of the
-            // close below. The `flush_wal` that follows covers whatever the
-            // flusher had not yet written.
-            if let Some(monitor) = inner.health.get() {
-                monitor.stop();
-            }
-            if let Some(worker) = inner.backup_worker.get() {
-                worker.stop();
-            }
-            if let Some(flusher) = inner.wal_flusher.get() {
-                flusher.stop();
+            // Idempotent, because the trait's default is: the relational
+            // backends inherit a no-op, so a deployment that wires SIGTERM to
+            // `shutdown()` alongside an existing teardown path can call this
+            // twice and must not get an error on the second. It would:
+            // `cancel_all_background_work` sets RocksDB's `shutting_down_`
+            // flag, after which every `flush_cf` returns `ShutdownInProgress`.
+            if inner
+                .shutdown_done
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
             }
             inner.db.flush_wal(true)?;
             for name in ALL_COLUMN_FAMILIES {
@@ -1052,6 +1070,13 @@ impl Persistence for RocksDbPersistence {
                 tracing::warn!("rocksdb compactions still running at shutdown: {e}");
             }
             inner.db.cancel_all_background_work(true);
+            // Latched only now: the guard exists so a *completed* shutdown can
+            // be repeated, not so a failed one can be papered over. Setting it
+            // before the flush made every retry of a shutdown that died at
+            // ENOSPC return Ok having written nothing.
+            inner
+                .shutdown_done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
         .await
@@ -1100,11 +1125,6 @@ impl RocksDbPersistence {
     }
 }
 
-/// Reconstruct documents for a set of `(ts, id)` pairs with one batched lookup.
-///
-/// `index_scan` and the `previous_revisions` family all resolve a list of
-/// document coordinates into bodies; batching turns what would be one point get
-/// per row into a single `multi_get`.
 /// Resolves document bodies for coordinates an index or table scan produced.
 ///
 /// `read_opts` must carry the *same* snapshot the scan's iterator used.

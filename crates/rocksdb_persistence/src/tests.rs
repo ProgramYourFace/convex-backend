@@ -9,7 +9,6 @@
 use std::{
     collections::BTreeSet,
     sync::Arc,
-    time::Duration,
 };
 
 use common::{
@@ -77,7 +76,7 @@ use crate::{
 
 const TABLE_NUMBER: u32 = 7;
 
-fn tablet(n: u8) -> TabletId {
+pub(crate) fn tablet(n: u8) -> TabletId {
     TabletId(InternalId([n; keys::ID_LEN]))
 }
 
@@ -87,19 +86,19 @@ fn internal_id(n: u32) -> InternalId {
     InternalId(bytes)
 }
 
-fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
+pub(crate) fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
     InternalDocumentId::new(tablet(tablet_n), internal_id(n))
 }
 
-fn index_id(n: u8) -> IndexId {
+pub(crate) fn index_id(n: u8) -> IndexId {
     IndexId(InternalId([0xA0 | n; keys::ID_LEN]))
 }
 
-fn ts(n: u64) -> Timestamp {
+pub(crate) fn ts(n: u64) -> Timestamp {
     Timestamp::try_from(n).unwrap()
 }
 
-fn document(tablet_n: u8, n: u32, body: &str) -> anyhow::Result<ResolvedDocument> {
+pub(crate) fn document(tablet_n: u8, n: u32, body: &str) -> anyhow::Result<ResolvedDocument> {
     let id = ResolvedDocumentId {
         tablet_id: tablet(tablet_n),
         developer_id: DeveloperDocumentId::new(
@@ -969,100 +968,6 @@ async fn writes_survive_a_reopen_without_a_clean_shutdown() -> anyhow::Result<()
     Ok(())
 }
 
-/// In interval mode a write returns before the record has reached the kernel,
-/// so the flusher thread is the only thing that makes it durable. Wait past one
-/// interval, then drop without `shutdown` — recovery has to come from what the
-/// flusher wrote.
-#[tokio::test]
-async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("db");
-    {
-        let persistence = RocksDbPersistence::new_with_sync_mode(
-            &path,
-            SyncMode::Interval(Duration::from_millis(50)),
-        )?;
-        assert!(persistence.has_wal_flusher());
-        let id = doc_id(1, 1);
-        persistence
-            .write(
-                &[entry(1, 1, 10, "flushed", None)?],
-                &[index_entry(1, b"k", 10, Some(id))],
-                ConflictStrategy::Error,
-            )
-            .await?;
-        // Several intervals, so this does not turn into a timing flake on a
-        // loaded machine.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Assert the *flusher* did it, not the drop. `has_wal_flusher` cannot
-        // tell those apart — `Inner::drop` flushes unconditionally in interval
-        // mode, so the end state is identical either way. A secondary instance
-        // can: it reads the primary's files but neither its memtables nor its
-        // WAL buffer, so it sees the write only once a flush has moved it.
-        let observer = RocksDbPersistence::new_secondary(&path, &dir.path().join("observer"))?;
-        let seen: Vec<_> = observer
-            .reader()
-            .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
-            .try_collect()
-            .await?;
-        assert_eq!(
-            seen.len(),
-            1,
-            "a secondary sees only flushed data, so this proves the flusher ran"
-        );
-        drop(observer);
-    }
-
-    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
-    let entries: Vec<_> = reopened
-        .reader()
-        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
-        .try_collect()
-        .await?;
-    assert_eq!(
-        entries.len(),
-        1,
-        "the flusher must have made the write durable"
-    );
-    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"flushed\"");
-    Ok(())
-}
-
-/// `shutdown` flushes whatever the last tick did not, so a clean stop never
-/// depends on the interval having elapsed.
-#[tokio::test]
-async fn interval_sync_shutdown_flushes_the_tail() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("db");
-    {
-        let persistence = RocksDbPersistence::new_with_sync_mode(
-            &path,
-            // Long enough that no tick can fire during the test.
-            SyncMode::Interval(Duration::from_secs(600)),
-        )?;
-        let id = doc_id(1, 1);
-        persistence
-            .write(
-                &[entry(1, 1, 10, "tail", None)?],
-                &[index_entry(1, b"k", 10, Some(id))],
-                ConflictStrategy::Error,
-            )
-            .await?;
-        persistence.shutdown().await?;
-    }
-
-    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
-    let entries: Vec<_> = reopened
-        .reader()
-        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
-        .try_collect()
-        .await?;
-    assert_eq!(entries.len(), 1, "shutdown must flush the WAL buffer");
-    assert_eq!(body_of(entries[0].value.as_ref().unwrap()), "\"tail\"");
-    Ok(())
-}
-
 /// `BackupEngine` is the mechanism `docs/proposals/005-backup-and-restore.md`
 /// proposes building on, and it rests on two assumptions worth checking rather
 /// than believing: that a backup covers every column family, and that it covers
@@ -1291,7 +1196,7 @@ async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
         )
         .await?;
 
-    let secondary = RocksDbPersistence::new_secondary(&db_path, &dir.path().join("secondary"))?;
+    let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
     let err = secondary
         .backup(&dir.path().join("backup"), 4)
         .expect_err("a secondary must refuse");
@@ -1416,75 +1321,6 @@ async fn load_index_chunk_orders_keys_that_share_a_truncated_prefix() -> anyhow:
         paged, sorted,
         "paging one at a time must yield every entry, in IndexEntry order"
     );
-    Ok(())
-}
-
-/// The worker holds a strong reference for a tick, so the owner releasing the
-/// last other reference mid-tick drops the database on the worker's own thread.
-/// Joining yourself panics with EDEADLK, and since nothing calls `shutdown()`,
-/// dropping is the path production takes.
-#[tokio::test]
-async fn dropping_during_a_flush_tick_does_not_panic() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    for round in 0..200u32 {
-        let path = dir.path().join(format!("db{round}"));
-        // `background: true` is the default, and load-bearing here: without a
-        // flusher thread there is no tick for the drop to race, and this test
-        // would assert nothing.
-        let persistence = RocksDbPersistence::new_with_sync_mode(
-            &path,
-            // Short enough that the flusher is very likely mid-tick at drop.
-            SyncMode::Interval(Duration::from_micros(200)),
-        )?;
-        assert!(
-            persistence.has_wal_flusher(),
-            "no flusher means no tick to race, and this test would pass vacuously"
-        );
-        for i in 1..=4u32 {
-            persistence
-                .write(
-                    &[entry(1, i, u64::from(i) * 10, "v", None)?],
-                    &[],
-                    ConflictStrategy::Error,
-                )
-                .await?;
-        }
-        // No `shutdown()` — exactly what the backend does today.
-        drop(persistence);
-        std::fs::remove_dir_all(&path).ok();
-    }
-    Ok(())
-}
-
-/// Dropping without `shutdown()` still has to flush interval mode's buffer, or
-/// an orderly stop loses acknowledged writes.
-#[tokio::test]
-async fn dropping_flushes_the_interval_wal_buffer() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("db");
-    {
-        let persistence = RocksDbPersistence::new_with_sync_mode(
-            &path,
-            // No tick can fire during the test, so only the drop can flush.
-            SyncMode::Interval(Duration::from_secs(600)),
-        )?;
-        persistence
-            .write(
-                &[entry(1, 1, 10, "dropped", None)?],
-                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
-                ConflictStrategy::Error,
-            )
-            .await?;
-        drop(persistence);
-    }
-
-    let reopened = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Every)?;
-    let entries: Vec<_> = reopened
-        .reader()
-        .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
-        .try_collect()
-        .await?;
-    assert_eq!(entries.len(), 1, "dropping must flush the WAL buffer");
     Ok(())
 }
 
@@ -1811,7 +1647,7 @@ async fn a_secondary_instance_can_actually_read() -> anyhow::Result<()> {
         )
         .await?;
 
-    let secondary = RocksDbPersistence::new_secondary(&path, &dir.path().join("secondary"))?;
+    let secondary = RocksDbPersistence::new_secondary_in(&path, &dir.path().join("secondary"))?;
     let reader = secondary.reader();
 
     let documents: Vec<_> = reader
@@ -1900,7 +1736,6 @@ async fn a_restored_database_can_continue_its_backup_chain() -> anyhow::Result<(
 #[test]
 fn sync_mode_sync_each_write_only_in_every() {
     assert!(SyncMode::Every.sync_each_write());
-    assert!(!SyncMode::Interval(Duration::from_millis(100)).sync_each_write());
     assert!(!SyncMode::Never.sync_each_write());
 }
 
@@ -1909,6 +1744,57 @@ async fn empty_writes_are_accepted() -> anyhow::Result<()> {
     let f = Fixture::new()?;
     f.write(&[], &[]).await?;
     assert!(f.log(TimestampRange::all(), Order::Asc).await?.is_empty());
+    Ok(())
+}
+
+/// `Persistence::shutdown` must be idempotent, because the trait's default is:
+/// the relational backends inherit a no-op. `cancel_all_background_work` sets
+/// RocksDB's `shutting_down_` flag, after which every `flush_cf` fails with
+/// `ShutdownInProgress` — so a deployment wiring SIGTERM to `shutdown()`
+/// alongside an existing teardown path used to get an error on the second call.
+#[tokio::test]
+async fn shutdown_is_idempotent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+    persistence.shutdown().await?;
+    persistence
+        .shutdown()
+        .await
+        .expect("a second shutdown must succeed");
+    persistence
+        .shutdown()
+        .await
+        .expect("and a third, for good measure");
+    Ok(())
+}
+
+/// The idempotence guard latches *before* the work it guards, so a shutdown
+/// that fails part-way is reported as a success by every later call — while
+/// nothing was ever flushed. A caller that retries a failed shutdown (the only
+/// sensible response) is told the log is on disk when it is not.
+#[tokio::test]
+async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+
+    // Put the engine in the state the commit message describes: once
+    // `shutting_down_` is set, every `flush_cf` returns ShutdownInProgress.
+    // Standing in for any mid-shutdown failure — ENOSPC on the WAL fsync is
+    // the one that matters in production.
+    persistence.inner.db.cancel_all_background_work(true);
+
+    let first = persistence.shutdown().await;
+    assert!(
+        first.is_err(),
+        "precondition: this shutdown must fail part-way"
+    );
+
+    let second = persistence.shutdown().await;
+    assert!(
+        second.is_err(),
+        "a retry after a failed shutdown must not report success: the guard latched before the \
+         flush, so this returns Ok having flushed nothing"
+    );
     Ok(())
 }
 
@@ -2003,7 +1889,8 @@ async fn two_databases_in_one_process_share_no_data() -> anyhow::Result<()> {
 /// `BackupEngine` numbers generations per DIRECTORY with no record of which
 /// database wrote them, so two databases pointed at one directory would
 /// interleave their chains and each one's pruning would delete the other's
-/// generations. `OpenOptions::backup_dir` is what keeps them apart.
+/// generations. Passing a directory per database to `backup` is what keeps
+/// them apart, and `claim_directory` is what makes getting it wrong loud.
 #[tokio::test]
 async fn each_database_backs_up_to_its_own_directory() -> anyhow::Result<()> {
     let a = Fixture::new()?;
@@ -2057,7 +1944,6 @@ async fn a_database_opened_with_per_database_tuning_still_round_trips() -> anyho
     let persistence = RocksDbPersistence::open_with(
         &dir.path().join("db"),
         OpenOptions {
-            instance: Some("i-0068a1f3".to_owned()),
             tuning: DbTuning {
                 max_open_files: Some(64),
                 memtable_bytes: Some(4 << 20),

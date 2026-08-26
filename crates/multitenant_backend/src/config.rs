@@ -297,6 +297,14 @@ impl MultitenantConfig {
     /// generations per directory with no record of which database wrote them,
     /// so two databases pointed at one directory interleave their chains and
     /// each one's pruning deletes the other's generations.
+    ///
+    /// NOT read by this process. `rocksdb_persistence` no longer schedules
+    /// backups in-process — they are operations driven by the `rocksdb-backup`
+    /// binary from a CronJob, the same shape as `pg_basebackup`. This stays
+    /// because the naming convention has to be stated and tested somewhere, and
+    /// the host is what knows an instance's layout: a scheduler asking "where
+    /// do this tenant's backups live?" should ask here rather than re-deriving
+    /// `<root>/<instance>` and getting it subtly wrong.
     pub fn instance_backup_dir(&self, instance: &str) -> Option<PathBuf> {
         self.backup_dir.as_ref().map(|root| root.join(instance))
     }

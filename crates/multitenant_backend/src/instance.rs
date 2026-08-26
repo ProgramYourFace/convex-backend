@@ -207,9 +207,10 @@ async fn open_persistence(
                 &paths.db,
                 OpenOptions {
                     shutdown: Some(shutdown.clone()),
-                    background: true,
-                    instance: Some(name.to_owned()),
-                    backup_dir: config.instance_backup_dir(name),
+                    // Descriptors and memtable shape, divided by the instance
+                    // cap. Memory needs nothing here: the block cache and the
+                    // write-buffer manager are process-wide singletons, so
+                    // every instance already shares one budget.
                     tuning: config.rocksdb_tuning,
                     ..OpenOptions::default()
                 },

@@ -134,7 +134,6 @@ fn run() -> anyhow::Result<()> {
             let persistence = rocksdb_persistence::RocksDbPersistence::open_with(
                 &db_dir,
                 rocksdb_persistence::OpenOptions {
-                    background: false,
                     ..rocksdb_persistence::OpenOptions::default()
                 },
             )
