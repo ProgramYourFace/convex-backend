@@ -14,7 +14,7 @@ rm -rf "$WORK" && mkdir -p "$WORK"
 ADMIN_KEY=$($ROOT/target/release/generate_key "$INSTANCE" "$SECRET" 2>/dev/null | tail -1)
 
 INSTANCE_NAME=$INSTANCE INSTANCE_SECRET=$SECRET DISABLE_BEACON=true RUST_LOG=error \
-  INDEX_CACHE_VERIFY_PERCENT=0 "$@" \
+  INDEX_CACHE_VERIFY_PERCENT=0 env "$@" \
   "$BIN" --db rocksdb "$WORK/db" \
     --instance-name "$INSTANCE" --instance-secret "$SECRET" \
     --port 3210 --site-proxy-port 3211 --local-storage "$WORK/storage" \
