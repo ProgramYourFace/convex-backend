@@ -153,7 +153,7 @@ which also surveys what the ingest path still pays for above this trait.
 `rocksdb-backup`, a separate binary in this crate, is the operator side:
 
 ```sh
-rocksdb-backup backup   /convex/backup --db /convex/data/db   # live or stopped
+rocksdb-backup backup   /convex/backup --db /convex/data/db   # backend must be stopped
 rocksdb-backup list     /convex/backup
 rocksdb-backup verify   /convex/backup [--id N]      # check every file is present and sized
 rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
@@ -224,19 +224,28 @@ and stays that way. Every subsequent write fails, the process keeps serving, and
 crashes. A Postgres deployment gets a pod that dies and a database another node can take
 over; an embedded one would fail every mutation indefinitely until somebody looked.
 
-So a write that fails checks whether the engine has latched, and if it has, raises the
+So every engine write is counted. A success resets the counter; a failure increments it,
+and the `ROCKSDB_WRITE_FAILURES_TO_ESCALATE`th consecutive failure (default 5) raises the
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss.
-That is the whole of it: no monitor thread, no polling, no timers.
+That is the whole of it: no monitor thread, no polling, no timers, and no property read on
+any path.
 
-The check runs only after a write has already failed, which matters twice.
-`property_int_value` takes the engine's mutex, so polling it per write would tax every
-commit for a condition that is almost never true. And it asks a question that is true
-*now* — this write just failed and the engine reports itself in error — rather than
-reading `rocksdb.background-errors` as a level. That counter is cumulative and never
-cleared, while RocksDB auto-resumes retryable errors by default
-(`max_bgerror_resume_count` is `INT_MAX`), so a single transient EIO that the engine
-recovered from on its own leaves it permanently non-zero. An earlier revision polled it on
-a timer and would have killed a healthy backend for exactly that.
+The signal is **consecutive failures across independent writes**, deliberately, rather
+than any property RocksDB exposes. An earlier revision gated on
+`rocksdb.background-errors` and was dead code for the case it was written for: that
+counter is bumped in exactly two places, both a failed background *flush* or *compaction*
+(`db_impl_compaction_flush.cc`), and never by a foreground write or by
+`ErrorHandler::SetBGError`. On ENOSPC the failing write never reaches the memtable, so no
+flush is ever scheduled and the counter stays zero while every write fails forever.
+Measured on an 8 MiB tmpfs: 20 rounds of failing writes, `background-errors` reading `0`
+throughout, no signal raised — and still refusing writes after 7 MiB was freed.
+
+Counting cannot be tripped by one bad write, since the counter resets on every success:
+reaching the threshold means that many *in a row* got nothing through.
+
+Batch writes only. A `flush_cf` failure is not evidence that the engine is refusing
+writes — `ShutdownInProgress` returns one on a database that is demonstrably still
+accepting them, and counting those escalated a healthy backend in review.
 
 ### What is deliberately not detected here
 
@@ -283,56 +292,6 @@ Generations are incremental — unchanged SST files are shared, so the *n*th bac
 only what changed since *n-1* — and memtables are flushed first, so a backup never depends
 on replaying a WAL. With `atomic_flush` on, that flush is a consistent cut across every
 column family, so a backup can never hold an index entry whose document it missed.
-
-## Health and failure escalation
-
-RocksDB latches read-only on a background error — a full disk, an SST checksum failure —
-and stays that way. Every subsequent write fails, the process keeps serving, and nothing
-crashes. A Postgres deployment gets a pod that dies and a database another node can take
-over; an embedded one would fail every mutation indefinitely until somebody looked.
-
-So a write that fails checks whether the engine has latched, and if it has, raises the
-backend's `ShutdownSignal` — the same one the relational backends raise on lease loss.
-That is the whole of it: no monitor thread, no polling, no timers.
-
-The check runs only after a write has already failed, which matters twice.
-`property_int_value` takes the engine's mutex, so polling it per write would tax every
-commit for a condition that is almost never true. And it asks a question that is true
-*now* — this write just failed and the engine reports itself in error — rather than
-reading `rocksdb.background-errors` as a level. That counter is cumulative and never
-cleared, while RocksDB auto-resumes retryable errors by default
-(`max_bgerror_resume_count` is `INT_MAX`), so a single transient EIO that the engine
-recovered from on its own leaves it permanently non-zero. An earlier revision polled it on
-a timer and would have killed a healthy backend for exactly that.
-
-### What is deliberately not detected here
-
-A **stalled** write. On a full volume or a hung mount RocksDB does not fail a write, it
-blocks — indefinitely — so no error surfaces and the check above never runs. Detecting
-that from inside the stuck process was attempted and abandoned: every signal RocksDB
-offers (`num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
-`actual-delayed-write-rate`, `current-super-version-number`) is updated by the machinery
-that has stopped, so each one latches in exactly the failure being detected. Five
-successive attempts each broke in a new way.
-
-Liveness is the cluster's job. A wedged volume parks the blocking pool the HTTP paths use,
-so requests hang and time out — configure a liveness probe against an endpoint that
-performs a storage round-trip, and the kubelet restarts the pod, which is the recovery
-action an in-process escalation was reaching for anyway. Note that `/version` is **not**
-such an endpoint: it is a pure async closure returning a cached string, outside the
-timeout layer, and answers `200 OK` in about a millisecond on a wedged volume.
-
-## Backups
-
-Backups are a scheduled job, not a thread inside the backend — the same shape as
-`pg_basebackup` against Postgres. `rocksdb-backup` is a standalone binary with `backup`,
-`list`, `verify`, `rehearse` and `restore` subcommands; run it from a CronJob against the
-data volume.
-
-An earlier revision ran the schedule on a worker thread inside the process. That put
-backup timing, retention and failure handling on the critical path of the backend's own
-teardown — a shutdown had to wait out an in-flight generation, minutes wide on a real
-database — and it is work the orchestrator already knows how to do.
 
 ## Semantics that differ from the relational backends
 

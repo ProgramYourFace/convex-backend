@@ -37,8 +37,11 @@ rocksdb-backup — administer backups of an embedded RocksDB Convex database
 Without --id, the newest generation is used.
 
 `backup` is for the database being *stopped* — before an upgrade or a risky
-migration. RocksDB allows one writer, so it fails while the backend is running;
-It opens the database read-only, so it works against a running deployment.
+migration. RocksDB allows one writer, so it fails while the backend is running.
+To back up a running deployment, snapshot the volume: under the default
+`SyncMode::Every` every acknowledged write is in the write-ahead log before
+`write` returns, so a crash-consistent snapshot recovers exactly as an unclean
+restart does.
 
 `verify` checks that the files are intact. `rehearse` checks the thing you
 actually need to know — that a database restored from them opens and reads —
@@ -135,14 +138,25 @@ fn run() -> anyhow::Result<()> {
                  otherwise back up an empty database over a real chain.",
                 db_dir.display(),
             );
-            // Opened as a *secondary*, always. RocksDB allows one writer, so a
-            // read-write open fails whenever the backend is running — which is
-            // when a scheduled backup runs. A secondary takes no lock, tails
-            // the primary's write-ahead log, and sees every acknowledged write.
-            // It works just as well against a stopped database, so there is one
-            // code path rather than two.
-            let persistence = rocksdb_persistence::RocksDbPersistence::new_secondary(&db_dir)
-                .with_context(|| format!("could not open {} for reading", db_dir.display()))?;
+            // Opened read-write, which is what makes the backup trustworthy.
+            // `BackupEngine` has to hold a file list still while it copies, and
+            // only the owner of the files can do that; a secondary answers
+            // `DisableFileDeletions` with `NotSupported` and the copy proceeds
+            // unpinned. `backup::backup_inner` refuses a secondary outright for
+            // that reason, so opening one here would fail every invocation.
+            //
+            // The cost is that this fails while the backend is running, since
+            // RocksDB allows one writer. That is intended: backing up a live
+            // deployment is a volume snapshot's job, not this tool's.
+            let persistence = rocksdb_persistence::RocksDbPersistence::new(&db_dir)
+                .with_context(|| {
+                    format!(
+                        "could not open {} for writing. `backup` needs exclusive access, so the \
+                         backend must be stopped; to back up a running deployment, snapshot the \
+                         volume instead.",
+                        db_dir.display(),
+                    )
+                })?;
             let info = persistence.backup(&args.dir, args.keep)?;
             println!(
                 "backup {} written: {} files, {} MiB",
