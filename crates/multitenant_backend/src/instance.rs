@@ -274,8 +274,8 @@ fn instance_config(config: &MultitenantConfig, name: &str) -> anyhow::Result<Loc
         db_spec,
         db: config.db,
         interface: std::net::Ipv4Addr::UNSPECIFIED,
-        port: API_PORT,
-        site_proxy_port: SITE_PORT,
+        port: config.api_port,
+        site_proxy_port: config.site_port,
         // Always explicit, so the `convex_origin_url` / `convex_site_url`
         // localhost defaults never apply. These are what the instance reports to
         // clients and what it signs file-storage URLs with.
@@ -331,6 +331,9 @@ mod tests {
             poll_interval: Duration::from_secs(2),
             data_dir: PathBuf::from("/convex/data"),
             backup_dir: None,
+            admin_token: None,
+            api_port: crate::instance::API_PORT,
+            site_port: crate::instance::SITE_PORT,
             max_instances: 24,
             boot_concurrency: 4,
             isolate_percent_per_client: 25,

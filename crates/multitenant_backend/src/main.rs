@@ -72,10 +72,6 @@ use multitenant_backend::{
         inject_resolved_hostname,
         HostResolver,
     },
-    instance::{
-        API_PORT,
-        SITE_PORT,
-    },
     shared::SharedResources,
     source::{
         source_description,
@@ -230,7 +226,7 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
 
     let mut api_shutdown_rx = shutdown_rx.clone();
     let serve_api = http_service.serve_with_middleware(
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, API_PORT)),
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.api_port)),
         async move {
             let _ = api_shutdown_rx.recv().await;
         },
@@ -243,8 +239,8 @@ async fn run_server(runtime: ProdRuntime, config: Arc<MultitenantConfig>) -> any
         // All interfaces, like the API listener: this is the public HTTP-action
         // surface, reached from outside the process. Only the FORWARD target
         // below is loopback.
-        Some((Ipv4Addr::UNSPECIFIED.octets(), SITE_PORT)),
-        format!("http://127.0.0.1:{API_PORT}/http"),
+        Some((Ipv4Addr::UNSPECIFIED.octets(), config.site_port)),
+        format!("http://127.0.0.1:{}/http", config.api_port),
         shutdown_rx,
     );
 

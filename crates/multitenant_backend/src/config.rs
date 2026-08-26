@@ -100,6 +100,16 @@ pub struct MultitenantConfig {
     /// operation across every hosted instance, so it must not be any single
     /// instance's admin key.
     pub admin_token: Option<String>,
+    /// The API and site listener ports.
+    ///
+    /// Overridable only so that SEVERAL CELLS CAN RUN ON ONE HOST, which is
+    /// what makes a cluster-wide rollout testable without a cluster: the
+    /// coordinator's whole job is the cross-cell decision, and one cell cannot
+    /// exercise it. In Kubernetes every cell is its own pod and these stay at
+    /// the defaults — the Services, the Ingress and the relay all address 3210
+    /// and 3211 by name.
+    pub api_port: u16,
+    pub site_port: u16,
     pub max_instances: usize,
     pub boot_concurrency: usize,
     pub isolate_percent_per_client: usize,
@@ -145,6 +155,8 @@ impl std::fmt::Debug for MultitenantConfig {
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("api_port", &self.api_port)
+            .field("site_port", &self.site_port)
             .field("max_instances", &self.max_instances)
             .field("boot_concurrency", &self.boot_concurrency)
             .field(
@@ -225,6 +237,13 @@ impl MultitenantConfig {
             );
         }
 
+        let api_port = parse_or("MULTITENANT_API_PORT", crate::instance::API_PORT)?;
+        let site_port = parse_or("MULTITENANT_SITE_PORT", crate::instance::SITE_PORT)?;
+        anyhow::ensure!(
+            api_port != site_port,
+            "MULTITENANT_API_PORT and MULTITENANT_SITE_PORT must differ (both {api_port})"
+        );
+
         let max_instances = parse_or("MULTITENANT_MAX_INSTANCES", DEFAULT_MAX_INSTANCES)?;
         anyhow::ensure!(max_instances > 0, "MULTITENANT_MAX_INSTANCES must be > 0");
         let boot_concurrency = parse_or("MULTITENANT_BOOT_CONCURRENCY", DEFAULT_BOOT_CONCURRENCY)?;
@@ -289,6 +308,8 @@ impl MultitenantConfig {
             data_dir,
             backup_dir,
             admin_token,
+            api_port,
+            site_port,
             max_instances,
             boot_concurrency,
             isolate_percent_per_client,
@@ -493,6 +514,9 @@ mod tests {
             poll_interval: Duration::from_secs(2),
             data_dir: "/convex/data".into(),
             backup_dir: None,
+            admin_token: None,
+            api_port: crate::instance::API_PORT,
+            site_port: crate::instance::SITE_PORT,
             max_instances: 24,
             boot_concurrency: 4,
             isolate_percent_per_client: 25,
@@ -561,6 +585,9 @@ mod tests {
             poll_interval: Duration::from_secs(2),
             data_dir: "/convex/data".into(),
             backup_dir: None,
+            admin_token: None,
+            api_port: crate::instance::API_PORT,
+            site_port: crate::instance::SITE_PORT,
             max_instances: 24,
             boot_concurrency: 4,
             isolate_percent_per_client: 25,

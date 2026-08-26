@@ -168,6 +168,17 @@ pub struct InstanceOutcome {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
+    /// The fingerprint of the schema this instance currently has ACTIVE.
+    ///
+    /// Reported by `GET /api/cell/instances` only, and it is what makes drift
+    /// checkable as a pure read. `state: "active"` alone says an active schema
+    /// exists, not WHICH one — so a cell built from a stale checkout, or one
+    /// that finished provisioning during a rollout, is indistinguishable from a
+    /// converged cell without it. A coordinator comparing this against the
+    /// fingerprint it last committed sees the divergence without submitting
+    /// anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl InstanceOutcome {
@@ -177,6 +188,7 @@ impl InstanceOutcome {
             state: state.to_owned(),
             error: None,
             table_name: None,
+            fingerprint: None,
         }
     }
 
@@ -186,7 +198,13 @@ impl InstanceOutcome {
             state: state.to_owned(),
             error: Some(error),
             table_name: None,
+            fingerprint: None,
         }
+    }
+
+    fn with_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.fingerprint = fingerprint;
+        self
     }
 
     fn is_validated(&self) -> bool {
@@ -304,24 +322,35 @@ async fn list_instances(
 
 async fn current_state(name: &str, app: &LocalAppState) -> InstanceOutcome {
     match read_state(app).await {
-        Ok(s) => InstanceOutcome::ok(name, &s),
+        Ok((s, fp)) => InstanceOutcome::ok(name, &s).with_fingerprint(fp),
         Err(e) => InstanceOutcome::failed(name, "error", format!("{e:#}")),
     }
 }
 
-async fn read_state(app: &LocalAppState) -> anyhow::Result<String> {
+/// The instance's current schema state, and — whenever one is ACTIVE — that
+/// schema's fingerprint.
+///
+/// The active fingerprint is read even when the reported state is `validated` or
+/// `pending`: those states describe a rollout IN FLIGHT, while the active schema
+/// is what the instance is serving right now, which is the thing drift is
+/// measured against.
+async fn read_state(app: &LocalAppState) -> anyhow::Result<(String, Option<String>)> {
     let mut tx = app.application.begin(Identity::system()).await?;
     let mut model = SchemaModel::new(&mut tx, TableNamespace::root_component());
+    let active = match model.get_by_state(SchemaState::Active).await? {
+        Some((_, schema)) => Some(fingerprint(&schema)?),
+        None => None,
+    };
     if model.get_by_state(SchemaState::Validated).await?.is_some() {
-        return Ok("validated".to_owned());
+        return Ok(("validated".to_owned(), active));
     }
     if model.get_by_state(SchemaState::Pending).await?.is_some() {
-        return Ok("pending".to_owned());
+        return Ok(("pending".to_owned(), active));
     }
-    if model.get_by_state(SchemaState::Active).await?.is_some() {
-        return Ok("active".to_owned());
+    if active.is_some() {
+        return Ok(("active".to_owned(), active));
     }
-    Ok("none".to_owned())
+    Ok(("none".to_owned(), None))
 }
 
 /// Phase one. Submit the schema everywhere, activate nowhere.
@@ -397,6 +426,7 @@ fn outcome_from_state(name: &str, state: SchemaState) -> InstanceOutcome {
             state: "failed".to_owned(),
             error: Some(error),
             table_name,
+            fingerprint: None,
         },
         SchemaState::Overwritten => InstanceOutcome::ok(name, "overwritten"),
     }
