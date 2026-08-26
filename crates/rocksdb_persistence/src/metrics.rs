@@ -1,9 +1,7 @@
 use metrics::{
     log_counter,
     log_distribution,
-    log_gauge,
     register_convex_counter,
-    register_convex_gauge,
     register_convex_histogram,
     StatusTimer,
     Timer,
@@ -24,12 +22,6 @@ register_convex_histogram!(
     "Time for one interval-mode WAL flush and fsync",
     &STATUS_LABEL
 );
-/// The interval flusher's own latency. A gap here — ticks that stop arriving,
-/// or arrive slower than the configured interval — is how a persistently
-/// failing flush becomes visible, since the writes themselves keep succeeding.
-pub fn wal_flush_timer() -> StatusTimer {
-    StatusTimer::new(&ROCKSDB_WAL_FLUSH_SECONDS)
-}
 
 register_convex_histogram!(
     ROCKSDB_BACKUP_SECONDS,
@@ -48,75 +40,6 @@ pub fn log_backup(size_bytes: u64, num_files: u32) {
 }
 
 register_convex_counter!(ROCKSDB_BACKUP_FAILURES_TOTAL, "Backup attempts that failed");
-pub fn log_backup_failure() {
-    log_counter(&ROCKSDB_BACKUP_FAILURES_TOTAL, 1);
-}
-
-register_convex_gauge!(
-    ROCKSDB_BACKUP_AGE_SECONDS,
-    "Age of the newest backup generation"
-);
-/// The metric to alert on, and a gauge rather than a histogram: a level that
-/// keeps rising says "no backup has landed", where a distribution that stops
-/// receiving samples says nothing at all. Published by the health monitor on
-/// its own short timer rather than by the backup worker, so it keeps moving
-/// even if the backup worker is the thing that died.
-pub fn log_backup_age(seconds: f64) {
-    log_gauge(&ROCKSDB_BACKUP_AGE_SECONDS, seconds);
-}
-
-register_convex_gauge!(
-    ROCKSDB_WAL_FLUSH_AGE_SECONDS,
-    "Time since the write-ahead log was last successfully flushed, in interval sync mode"
-);
-/// In interval mode a write is acknowledged before it reaches the kernel, so
-/// this is the durability measurement: how much acknowledged data could be
-/// lost right now.
-pub fn log_wal_flush_age(seconds: f64) {
-    log_gauge(&ROCKSDB_WAL_FLUSH_AGE_SECONDS, seconds);
-}
-
-register_convex_gauge!(
-    ROCKSDB_OLDEST_WRITE_SECONDS,
-    "How long the oldest in-flight write has been running"
-);
-
-/// How long since the polling thread last completed a pass.
-///
-/// Published by the watchdog, which never calls into RocksDB, so a poller that
-/// has blocked inside the engine shows up as a climbing level rather than as a
-/// set of gauges that quietly stopped moving. A Prometheus gauge that stops
-/// being written still scrapes its last sample, so without this a dead monitor
-/// is indistinguishable from a healthy one.
-pub fn log_health_poll_age(seconds: f64) {
-    log_gauge(&ROCKSDB_HEALTH_POLL_AGE_SECONDS, seconds);
-}
-
-register_convex_gauge!(
-    ROCKSDB_HEALTH_POLL_AGE_SECONDS,
-    "Seconds since the RocksDB health poller last completed a pass"
-);
-
-/// Age of the oldest write still in flight, or zero when none is.
-///
-/// The signal a stall actually produces. A wedged volume does not fail writes,
-/// it stops returning from them, so no error counter moves and only duration
-/// changes. Published by the watchdog, which calls into RocksDB nowhere, so it
-/// keeps climbing even if the engine has stopped answering.
-pub fn log_oldest_write(seconds: f64) {
-    log_gauge(&ROCKSDB_OLDEST_WRITE_SECONDS, seconds);
-}
-
-register_convex_gauge!(
-    ROCKSDB_BACKGROUND_ERRORS_TOTAL,
-    "Latched RocksDB background errors, which stop the database accepting writes"
-);
-/// A gauge, not a counter: the property is the *total* latched so far, so
-/// adding it to a counter on every poll would multiply one error by the poll
-/// rate.
-pub fn log_background_errors(count: u64) {
-    log_gauge(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count as f64);
-}
 
 register_convex_histogram!(
     ROCKSDB_CONFLICT_CHECK_SECONDS,

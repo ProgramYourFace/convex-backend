@@ -26,53 +26,33 @@ use crate::keys::CF_DLOG;
 /// Postgres backend at its default `synchronous_commit` behaves the same way.
 /// Turning it off trades recent writes on host loss for throughput, and is only
 /// safe where an upstream log can replay into idempotent appliers.
-///
-/// Ignored when [`SYNC_INTERVAL`] is set — see [`SyncMode`].
 pub static SYNC_WRITES: LazyLock<bool> = LazyLock::new(|| env_config("ROCKSDB_SYNC_WRITES", true));
-
-/// Flush and fsync the write-ahead log on this interval instead of on every
-/// write. Zero, the default, disables it.
-pub static SYNC_INTERVAL: LazyLock<Option<Duration>> =
-    LazyLock::new(|| match env_config("ROCKSDB_SYNC_INTERVAL_MS", 0u64) {
-        0 => None,
-        ms => Some(Duration::from_millis(ms)),
-    });
 
 /// How the write-ahead log reaches disk.
 ///
-/// The three modes are a durability/throughput curve, not three ways of
-/// spelling the same thing. What each one loses is different in kind, so the
-/// choice belongs to whoever knows what is upstream of the database:
+/// Two modes, and what they lose differs in kind, so the choice belongs to
+/// whoever knows what is upstream of the database:
 ///
 /// | Mode | On process crash | On host loss |
 /// |---|---|---|
 /// | [`Every`](SyncMode::Every) | nothing | nothing |
-/// | [`Interval`](SyncMode::Interval) | up to one interval | up to one interval |
 /// | [`Never`](SyncMode::Never) | nothing | unbounded — whatever the OS had not written |
 ///
-/// [`Interval`](SyncMode::Interval)'s bound holds under two conditions worth
-/// stating, because neither is automatic. Dropping the database handle flushes
-/// the buffer, so an orderly teardown loses nothing — but
-/// `Persistence::shutdown` has no caller anywhere in the backend, for any
-/// storage engine, so an exit that never drops the handle is a crash as far as
-/// this mode is concerned. And a flush that keeps *failing* accumulates
-/// acknowledged-but-unwritten data without bound, which is why
-/// [`crate::health`] escalates a stale flush clock to a process shutdown rather
-/// than trusting the interval alone.
-///
-/// `Interval` is the only mode that can lose a write the *process* never got a
-/// chance to hand to the kernel: it turns on RocksDB's manual WAL flush, so
-/// records sit in RocksDB's own buffer until the flusher thread moves them.
 /// `Never` still writes through to the page cache on every write, so it
 /// survives a crash of this process and only loses data if the machine goes
 /// down — but with no bound on how much.
+///
+/// An `Interval` mode once sat between them, holding records in RocksDB's own
+/// buffer for a background thread to flush. It was removed. It needed a flusher
+/// thread, a staleness escalation to notice that thread dying, and a bound on
+/// how long acknowledged-but-unwritten data could accumulate — machinery that
+/// produced a large share of this crate's defects and that no measurement ever
+/// justified, since every published benchmark ran in `Every`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncMode {
     /// fsync before `write` returns. RocksDB coalesces concurrent writers into
     /// one write group and syncs the shared WAL once for the group.
     Every,
-    /// Flush and fsync the WAL on a timer, on a background thread.
-    Interval(Duration),
     /// Leave it to the operating system.
     Never,
 }
@@ -80,13 +60,10 @@ pub enum SyncMode {
 impl SyncMode {
     /// Resolved from the environment once, at first use.
     pub fn current() -> Self {
-        // An explicit interval wins: asking for a timed flush and a per-write
-        // fsync at once is contradictory, and the interval is the more
-        // specific request.
-        match (*SYNC_INTERVAL, *SYNC_WRITES) {
-            (Some(interval), _) => Self::Interval(interval),
-            (None, true) => Self::Every,
-            (None, false) => Self::Never,
+        if *SYNC_WRITES {
+            Self::Every
+        } else {
+            Self::Never
         }
     }
 
@@ -223,67 +200,10 @@ pub static BLOB_THRESHOLD_BYTES: LazyLock<u64> =
 pub static SCAN_PAGE_ROWS: LazyLock<usize> =
     LazyLock::new(|| env_config::<usize>("ROCKSDB_SCAN_PAGE_ROWS", 1024).max(1));
 
-/// How often the periodic backup worker takes a generation. Only consulted
-/// when `ROCKSDB_BACKUP_DIR` is set.
-pub static BACKUP_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_BACKUP_INTERVAL_SECONDS", 3600).max(60))
-});
-
 /// Generations retained before `purge_old_backups`. Zero disables pruning,
 /// which grows without bound — a deliberate choice rather than a default.
 pub static BACKUP_KEEP: LazyLock<usize> =
     LazyLock::new(|| env_config("ROCKSDB_BACKUP_KEEP", 24usize));
-
-/// How often the health monitor polls for a latched background error, a
-/// write-ahead log that has stopped being flushed, and the age of the newest
-/// backup. Short enough that a stuck database is noticed in seconds, not the
-/// hour a backup interval would impose.
-pub static HEALTH_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_HEALTH_POLL_SECONDS", 15).max(1))
-});
-
-/// Floor on how long a write-ahead log may go unflushed before the flusher is
-/// presumed dead, independent of the configured interval.
-///
-/// Without it a short interval makes the deadline short too — six seconds at
-/// 100 ms — and an ordinary fsync tail on a throttled volume becomes a process
-/// kill.
-pub static MIN_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_MIN_FLUSH_SILENCE_SECONDS", 120).max(10))
-});
-
-/// The default for [`WRITE_STALL_CEILING`], named rather than inlined so a test
-/// can assert on it. A test comparing a literal against another literal proves
-/// nothing about the value the process actually runs with, which is how two
-/// successive versions of that test came to be unfalsifiable.
-pub const DEFAULT_WRITE_STALL_CEILING_SECONDS: u64 = 1200;
-
-/// How long one write may be in flight before the process stops itself.
-///
-/// Deliberately generous. This is a backstop for the case nothing else can see
-/// — a volume that has stopped responding without returning an error — not a
-/// latency guard, and the cost of firing it early is an outage. It has to
-/// outlast the slowest legitimate `Persistence` write; `finish_loading` is not
-/// among them, since it takes no write guard.
-pub static WRITE_STALL_CEILING: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(
-        env_config::<u64>(
-            "ROCKSDB_WRITE_STALL_CEILING_SECONDS",
-            DEFAULT_WRITE_STALL_CEILING_SECONDS,
-        )
-        .max(60),
-    )
-});
-
-/// Ceiling on the same deadline, independent of the configured interval.
-///
-/// The multiplied budget scales with the interval and overtakes the floor once
-/// the interval passes ~20 s: at 60 s it reaches an hour, which is an hour of
-/// acknowledged-but-unwritten writes in a mode whose contract is "up to one
-/// interval". The grace a large interval earns is bounded here.
-pub static MAX_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_MAX_FLUSH_SILENCE_SECONDS", 600).max(30))
-});
 
 /// How long `shutdown` waits for background compactions to settle.
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =
@@ -334,16 +254,6 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     db.set_bytes_per_sync(1 << 20);
     db.set_wal_bytes_per_sync(1 << 20);
     match sync {
-        SyncMode::Interval(interval) => {
-            // Hold WAL records in RocksDB's buffer and let the flusher thread
-            // move them, so a run of writes costs one fsync rather than one
-            // each.
-            db.set_manual_wal_flush(true);
-            tracing::info!(
-                "rocksdb WAL sync: every {}ms on a background thread",
-                interval.as_millis(),
-            );
-        },
         SyncMode::Every => tracing::info!("rocksdb WAL sync: on every write"),
         SyncMode::Never => {
             tracing::info!("rocksdb WAL sync: left to the operating system")

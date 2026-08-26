@@ -177,7 +177,6 @@ pub async fn connect_persistence<RT: Runtime>(
                 &path,
                 rocksdb_persistence::OpenOptions {
                     shutdown: Some(shutdown_signal),
-                    background: true,
                     ..rocksdb_persistence::OpenOptions::default()
                 },
             )?);

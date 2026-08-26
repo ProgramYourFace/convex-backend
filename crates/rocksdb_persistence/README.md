@@ -82,7 +82,6 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | Knob | Default | Meaning |
 |---|---|---|
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
-| `ROCKSDB_SYNC_INTERVAL_MS` | `0` (off) | flush and fsync the WAL on a timer instead of per write; overrides `ROCKSDB_SYNC_WRITES` |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
 | `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | cached data, index and filter blocks *and* memtable charge; the largest, but not the only, consumer |
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
@@ -92,59 +91,23 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
-| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a failing WAL flush |
-| `ROCKSDB_WRITE_STALL_CEILING_SECONDS` | 1200 | how long one write may be in flight before the process stops itself |
-| `ROCKSDB_MIN_FLUSH_SILENCE_SECONDS` | 120 | floor on how long the WAL may go unflushed before the flusher is presumed dead |
-| `ROCKSDB_MAX_FLUSH_SILENCE_SECONDS` | 600 | ceiling on the same, itself floored at 3× the interval so a healthy flusher never trips it |
-| `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
-| `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
 
-### The three sync modes
+### The two sync modes
 
 | Mode | Set with | On process crash | On host loss |
 |---|---|---|---|
 | every | `ROCKSDB_SYNC_WRITES=true` (default) | nothing | nothing |
-| interval | `ROCKSDB_SYNC_INTERVAL_MS=100` | up to one interval | up to one interval |
 | never | `ROCKSDB_SYNC_WRITES=false` | nothing | unbounded |
 
-Interval mode opens the database with `manual_wal_flush`, so a write leaves its records
-in RocksDB's own buffer and a background thread moves them with `flush_wal(true)` on the
-interval. It is the only mode that can lose a write the *process* never handed to the
-kernel — `never` still writes through to the page cache and only loses data if the
-machine goes down, but with no bound on how much.
+`never` still writes through to the page cache on every write, so it survives a crash of
+this process and only loses data if the machine goes down — but with no bound on how much.
 
-What it buys depends entirely on the commit rate, because RocksDB already coalesces
-concurrent writers into one write group and fsyncs once for the group. Measured on the
-device-location workload (`crates/persistence_bench`, fsync p50 0.17 ms on the test VM):
-
-| events per commit | every | interval=100ms | never | interval's gain |
-|--:|--:|--:|--:|--:|
-| 1 | 403 ev/s | 532 ev/s | 549 ev/s | **+32 %** |
-| 4 | 682 ev/s | 829 ev/s | 940 ev/s | **+22 %** |
-| 16 | 1111 ev/s | 1202 ev/s | 1076 ev/s | +8 % |
-| 64 | 1159 ev/s | 1291 ev/s | 1279 ev/s | +11 % |
-
-Interval mode captures most of what `never` offers while keeping the loss window bounded,
-so there is little reason to prefer `never` over a short interval. But the gain is a
-function of how many commits per second reach the disk: batch writes into larger
-transactions and the fsync stops mattering, which is the cheaper fix. These ratios are a
-floor for slower storage — on a network-attached volume where an fsync costs milliseconds
-rather than 0.17 ms, the same commit rate pays more for it.
-
-(An earlier version of this table reported larger gains. It was measured through a code
-path that opened the database with `manual_wal_flush` and *no flusher thread*, so the
-"interval" column was `never` plus buffering and never fsynced at all. The default now
-runs background work, and these numbers are from a configuration that actually flushes.)
-
-`ROCKSDB_SYNC_WRITES=false` is the analogue of Postgres's
-`synchronous_commit=off`: it trades a bounded window of recent writes on host
-loss for throughput, and is only safe where an upstream log can replay into
-idempotent appliers. "An upstream log" has to mean one whose checkpoint cannot
-survive a crash that this store did not: if the checkpoint lives in a *different*
-durability domain it can roll back less than this one does, and the difference is
-lost writes rather than replayed ones. See
-[`docs/proposals/004-rocksdb-in-kubernetes.md`](../../docs/proposals/004-rocksdb-in-kubernetes.md) §2.
+An interval mode once sat between them, holding records in RocksDB's own buffer for a
+background thread to flush. It was removed. It needed a flusher thread, an escalation to
+notice that thread dying, and a bound on how much acknowledged-but-unwritten data could
+accumulate — and no measurement ever justified it, because every benchmark in this crate
+ran in `every`, which is the default.
 
 ### Memory
 
@@ -186,15 +149,6 @@ Measure before changing any of them: if OCC retries are not what your function l
 lowering the backoff buys nothing. The first two are measured on an ingest-shaped
 workload in [`docs/proposals/003-beyond-the-storage-layer.md`](../../docs/proposals/003-beyond-the-storage-layer.md),
 which also surveys what the ingest path still pays for above this trait.
-
-## Backups
-
-Set `ROCKSDB_BACKUP_DIR` and a worker takes a `BackupEngine` generation on
-`ROCKSDB_BACKUP_INTERVAL_SECONDS`, pruning to `ROCKSDB_BACKUP_KEEP`. Generations are
-incremental — unchanged SST files are shared, so the *n*th backup writes only what
-changed since *n-1* — and memtables are flushed first, so a backup never depends on
-replaying a WAL. With `atomic_flush` on, that flush is a consistent cut across every
-column family, so a backup can never hold an index entry whose document it missed.
 
 `rocksdb-backup`, a separate binary in this crate, is the operator side:
 
@@ -262,141 +216,53 @@ for the runbook and for what a database backup does not cover.
 
 ## Health and failure escalation
 
-RocksDB latches read-only on a background error — a full disk, a checksum failure — and
-stays that way. Every subsequent write fails, the process keeps serving, and nothing
+RocksDB latches read-only on a background error — a full disk, an SST checksum failure —
+and stays that way. Every subsequent write fails, the process keeps serving, and nothing
 crashes. A Postgres deployment gets a pod that dies and a database another node can take
-over; an embedded one would fail every mutation indefinitely with no signal.
+over; an embedded one would fail every mutation indefinitely until somebody looked.
 
-**And the real symptom is often a stall, not an error.** Measured against a full volume:
-writes stop returning entirely rather than failing, each one parking a blocking-pool
-thread, so nothing errors, nothing crashes, and no error counter moves. Only duration
-changes.
+So a write that fails checks whether the engine has latched, and if it has, raises the
+backend's `ShutdownSignal` — the same one the relational backends raise on lease loss.
+That is the whole of it: no monitor thread, no polling, no timers.
 
-A health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
-backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
-on any of:
+The check runs only after a write has already failed, which matters twice.
+`property_int_value` takes the engine's mutex, so polling it per write would tax every
+commit for a condition that is almost never true. And it asks a question that is true
+*now* — this write just failed and the engine reports itself in error — rather than
+reading `rocksdb.background-errors` as a level. That counter is cumulative and never
+cleared, while RocksDB auto-resumes retryable errors by default
+(`max_bgerror_resume_count` is `INT_MAX`), so a single transient EIO that the engine
+recovered from on its own leaves it permanently non-zero. An earlier revision polled it on
+a timer and would have killed a healthy backend for exactly that.
 
-- **a write in flight past `ROCKSDB_WRITE_STALL_CEILING_SECONDS`**, on duration alone —
-  see below for why nothing finer-grained survived review;
+### What is deliberately not detected here
 
-- **a latched background error**, read from the `default` column family. That detail
-  matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
-  increments it on `default`, so polling the five families this backend defines returns a
-  permanent zero. Measured on a full filesystem: those five read `0` while `default` read
-  `3`.
-- **a write-ahead log whose flushes are failing** in interval mode, ten intervals running.
-  In that mode a write is acknowledged before it reaches the kernel, so persistent flush
-  failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
-  Escalation needs consecutive *failures*, not just elapsed time, so one slow fsync on a
-  contended volume cannot take the process down. A separate deadline —
-  `clamp(interval × 60, ROCKSDB_MIN_FLUSH_SILENCE_SECONDS, ROCKSDB_MAX_FLUSH_SILENCE_SECONDS)`
-  — catches a flusher that died without ever returning an error. Both bounds matter: the
-  floor stops a 100 ms interval from making that deadline six seconds, and the ceiling
-  stops a 60 s interval from granting an hour of silence in a mode that promises at most
-  one interval of loss.
+A **stalled** write. On a full volume or a hung mount RocksDB does not fail a write, it
+blocks — indefinitely — so no error surfaces and the check above never runs. Detecting
+that from inside the stuck process was attempted and abandoned: every signal RocksDB
+offers (`num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
+`actual-delayed-write-rate`, `current-super-version-number`) is updated by the machinery
+that has stopped, so each one latches in exactly the failure being detected. Five
+successive attempts each broke in a new way.
 
-### Why a stalled write is escalated only on duration
+Liveness is the cluster's job. A wedged volume parks the blocking pool the HTTP paths use,
+so requests hang and time out — configure a liveness probe against an endpoint that
+performs a storage round-trip, and the kubelet restarts the pod, which is the recovery
+action an in-process escalation was reaching for anyway. Note that `/version` is **not**
+such an endpoint: it is a pure async closure returning a cached string, outside the
+timeout layer, and answers `200 OK` in about a millisecond on a wedged volume.
 
-RocksDB blocks writers for two very different reasons, and telling them apart from inside
-the process turned out to be unfixable. Deliberate backpressure — the write buffer
-manager's `allow_stall`, the L0 slowdown and stop triggers — drains as compaction catches
-up, and stopping for it turns an ingest burst into an outage. A hung volume never drains.
-Four review rounds each produced a new defect trying to classify one as the other, because
-every RocksDB signal that could distinguish them is updated by the machinery that has
-stopped, and so latches in exactly the failure being detected:
+## Backups
 
-- `num-running-flushes` / `num-running-compactions` are incremented before a job runs and
-  decremented after its last fsync returns, so a job blocked on a hung device pins them
-  above zero forever.
-- `is-write-stopped` and `actual-delayed-write-rate` are released only by
-  `RecalculateWriteStallConditions`, which runs from `InstallSuperVersion` — that is, when
-  a flush or compaction *completes*. Nothing completes on a wedged volume. And since a
-  disk usually degrades before it wedges, the engine is likely to be holding one of these
-  tokens at the moment it stops responding.
-- `current-super-version-number` advances on completion, which correctly freezes on a
-  hang — but also freezes during a single long L0→L1 compaction with writes stopped,
-  because no new memtables are filling.
+Backups are a scheduled job, not a thread inside the backend — the same shape as
+`pg_basebackup` against Postgres. `rocksdb-backup` is a standalone binary with `backup`,
+`list`, `verify`, `rehearse` and `restore` subcommands; run it from a CronJob against the
+data volume.
 
-Measured on a healthy, continuously busy database, the engine reports a background job
-open in **under half** of samples — typically well under. The measurement lives in
-`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`, which is
-`#[ignore]`d because it samples the host's I/O scheduler rather than this crate; run it
-with `cargo test -p rocksdb_persistence -- --ignored`. Either way an instantaneous reading
-of these properties carries very little information about whether the engine is working.
-
-So the classification is gone, and with it any attempt to escalate quickly. What remains
-is **duration alone**, at `ROCKSDB_WRITE_STALL_CEILING_SECONDS` (default 1200 — twenty
-minutes). That predicate reads no engine property: the clock belongs to a guard this crate
-takes and drops around each write, which RocksDB never touches and therefore cannot latch.
-Real backpressure drains long before twenty minutes; a hung mount does not.
-
-It runs on its own thread — `rocksdb-watchdog` — which touches nothing but `WriteWatch`,
-the flush clock and an atomic. That separation is the point rather than tidiness: the
-latched-background-error check has to ask RocksDB a question, and `DBImpl::GetIntProperty`
-takes the engine's `mutex_`. A single thread doing both would, on blocking inside that
-call, stop polling *permanently* — the loop is serial, so the next pass never begins — and
-the ceiling needs about eighty consecutive polls to elapse at the defaults. Evaluating the
-stall check first in the pass does not fix that; it buys exactly one poll.
-
-The write-ahead log's durability check lives on the watchdog for a sharper reason than
-symmetry. In `SyncMode::Interval` a wedged volume does **not** stall `Persistence::write`
-at all — the write reaches the memtable and RocksDB's own buffer and returns — so the
-stall ceiling is not the backstop in that mode. The flush clock is, and leaving it behind
-the engine call would strand the one escalation that mode depends on exactly when it is
-needed. Only the background-error check remains on the poller.
-
-The watchdog also publishes `rocksdb_health_poll_age_seconds`, the time since the polling
-thread last completed a pass. A Prometheus gauge that stops being written still scrapes
-its last sample, so without this a dead poller is indistinguishable from a healthy one —
-and the poller cannot report its own death. **Alert on this**: if it climbs past a few
-poll intervals, the background-error escalation is no longer running even though its gauge
-still looks fine.
-
-The cost of the ceiling's generosity is honest: **a wedged volume is unavailable for up to
-twenty minutes before the process stops itself.** Tighten
-`ROCKSDB_WRITE_STALL_CEILING_SECONDS` if your workload has a known write-latency bound.
-
-And a sharper limit, worth knowing before relying on the number: the watchdog can only see
-a write that is *in flight*. A deployment serving reads but taking no mutations issues
-persistence writes only from the committer's idle timestamp bump, whose interval is
-randomised up to `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` (3600 s), and retention's
-checkpoint writes stop with it. So on an idle-but-serving cell a wedged volume can go
-**one to two hours with no in-flight write at all** — every read hanging the whole time —
-before the twenty-minute clock even starts. A cell taking steady mutations, which is the
-ingest case this backend was built for, does not have this gap.
-
-### Liveness probes
-
-A liveness probe is still worth configuring, but **not on `/version`**. That route is a
-pure async closure returning a cached string:
-
-```rust
-.route("/version", get(move || async move { version }))
-```
-
-It touches no persistence, runs on a tokio async worker rather than the blocking pool, and
-is merged into the router *after* the timeout and concurrency-limit layers are applied, so
-it sits outside both. On a wedged volume it answers `200 OK` in about a millisecond,
-indefinitely — measured. It is a fine readiness signal for "the process is up and routing";
-it says nothing about whether storage works.
-
-Nothing else currently exposed performs a storage round-trip on the blocking pool, so
-there is no HTTP endpoint that a probe can use to detect a wedge today. Until one exists,
-**the in-process ceiling above is the backstop**, and the probe is not a substitute for
-it. An endpoint that did a small read through persistence, inside the timeout layer, would
-both beat the twenty-minute ceiling and close the idle-deployment gap above — it is the
-single highest-value follow-up here.
-
-For alerting rather than restarting, watch **`rocksdb_oldest_write_seconds`** — the age of
-the oldest in-flight write, published on every poll before any call into RocksDB, whether
-or not anything is wrong. Sustained growth means writers are parked. Note that it cannot
-tell you *why*: a backpressured ingest burst and a dead volume look identical in it, and
-an earlier revision of this file claimed `rocksdb_write_stopped` could separate them. That
-gauge has been removed rather than corrected, because it reads zero during the
-write-buffer-manager stall this configuration actually produces and one during a genuine
-wedge — wrong in both directions.
-
-It also publishes `rocksdb_wal_flush_age_seconds` and `rocksdb_backup_age_seconds`.
+An earlier revision ran the schedule on a worker thread inside the process. That put
+backup timing, retention and failure handling on the critical path of the backend's own
+teardown — a shutdown had to wait out an in-flight generation, minutes wide on a real
+database — and it is work the orchestrator already knows how to do.
 
 ## Semantics that differ from the relational backends
 
