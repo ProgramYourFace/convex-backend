@@ -47,8 +47,14 @@ function makeEvent(lane, dStart, dPer, k) {
     // Successive events for one device step forward in time, so the
     // run-length-encoding neighbour reads see a real time series.
     timestamp: 1_700_000_000_000 + Math.floor(k / dPer) * 1000,
-    lat: 37 + (device % 100) / 1000,
-    lng: -122 + (device % 100) / 1000,
+    // Position derives from a cell index of 8 devices. Lanes own contiguous
+    // 64-device blocks, so an 8-device cell never spans two lanes — the
+    // geohash lookup in the mutation is real index work but cannot make one
+    // lane read a row another lane is writing. Without that, the spatial read
+    // reintroduces exactly the OCC contention this driver's lane partitioning
+    // exists to remove, and the benchmark measures retries instead of storage.
+    lat: 37 + Math.floor(device / 8) * 0.01,
+    lng: -122 + Math.floor(device / 8) * 0.01,
     speed: k % 7,
     engineOn: k % 3 !== 0,
     // Decided by the caller so the merge ratio is a property of the load, not

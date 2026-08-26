@@ -13,6 +13,7 @@ export default defineSchema({
     engineOn: v.boolean(),
     stillDuration: v.optional(v.number()),
     mergedCount: v.optional(v.number()),
+    neighbourCount: v.optional(v.number()),
   }).index('by_device_timestamp', ['deviceId', 'timestamp']),
 
   deviceLatestLocations: defineTable({
