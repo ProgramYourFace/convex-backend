@@ -33,8 +33,16 @@ rocksdb-backup — administer backups of an embedded RocksDB Convex database
   verify   <backup-dir> [--id N]                   check a generation's file sizes
   rehearse <backup-dir> --scratch <dir> [--id N]   restore to scratch and read it
   restore  <backup-dir> --to <db-dir> [--id N]     restore for real
+  check    --db <db-dir>                           read back a database directory
 
 Without --id, the newest generation is used.
+
+`check` is the odd one out: it takes a *database* directory rather than a
+backup directory, because that is what a volume snapshot restores to. Snapshots
+are the only backup that can be taken from a running cell, and every other verb
+here needs a backup directory, so without `check` a snapshot could never be
+verified. It opens read-write and replays the write-ahead log — what recovery
+actually does — so give it a clone, not the live volume.
 
 `backup` is for the database being *stopped* — before an upgrade or a risky
 migration. RocksDB allows one writer, so it fails while the backend is running.
@@ -73,8 +81,14 @@ fn parse() -> anyhow::Result<Args> {
         std::process::exit(0);
     }
     let command = raw.remove(0);
-    anyhow::ensure!(!raw.is_empty(), "{command} needs a backup directory");
-    let dir = PathBuf::from(raw.remove(0));
+    // Every verb but `check` names a backup directory first; `check` reads a
+    // database directory, which it takes through --db like `backup` does.
+    let dir = if command == "check" {
+        PathBuf::new()
+    } else {
+        anyhow::ensure!(!raw.is_empty(), "{command} needs a backup directory");
+        PathBuf::from(raw.remove(0))
+    };
     let mut args = Args {
         command,
         dir,
@@ -116,6 +130,17 @@ fn resolve_id(dir: &std::path::Path, id: Option<u32>) -> anyhow::Result<u32> {
 }
 
 fn main() {
+    // `backup.rs` reports several non-fatal conditions through `tracing::warn!`
+    // — a purge that could not delete old generations, a target that could not
+    // be cleared after a failed restore. Without a subscriber every one of them
+    // was discarded, so a backup job could exit 0 with its retention silently
+    // broken. stderr, so it interleaves with the messages below rather than
+    // with the tool's own stdout output.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
     // A backtrace is right for a server and wrong for an operator tool: the
     // failures here are things like "that directory is not empty", where the
     // message is the whole answer and a stack trace buries it.
@@ -219,6 +244,20 @@ fn run() -> anyhow::Result<()> {
             println!(
                 "the upstream log's checkpoint is now ahead of this database — rewind it to at or \
                  before this backup and let it replay, or the gap is permanent"
+            );
+        },
+        "check" => {
+            let db_dir = args
+                .db
+                .ok_or_else(|| anyhow::anyhow!("check needs --db <db-dir>"))?;
+            let read = rocksdb_persistence::check_readable(&db_dir)?;
+            println!(
+                "{} opened and read back: {} documents and {} index entries decoded, {} rows \
+                 scanned",
+                db_dir.display(),
+                read.documents,
+                read.index_entries,
+                read.rows,
             );
         },
         other => anyhow::bail!("unknown command {other}. Try --help."),

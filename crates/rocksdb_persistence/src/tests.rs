@@ -1182,18 +1182,6 @@ async fn restore_refuses_a_non_empty_target() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A live backup and a stopped-writer backup share one chain.
-///
-/// This is the ordinary operational mix: a CronJob backs up through a secondary
-/// while the backend runs, and an operator occasionally takes one by hand with
-/// the writer stopped. Both must land in the same directory as successive
-/// generations, because the backup directory is claimed by database identity —
-/// and a secondary cannot mint that identity, so it has to already match.
-///
-/// An earlier revision asserted the opposite of this test: that "a secondary
-/// instance has no WAL and no business writing a backup". The premise was
-/// wrong. A secondary tails the primary's WAL, which is exactly what makes a
-
 /// Document retention deletes rows while exports and index backfills are
 /// scanning. A page cursor that seeks-and-steps skips the row *after* a deleted
 /// cursor row, which is a revision silently missing from an export or an index
@@ -1808,8 +1796,8 @@ async fn repeated_engine_write_failures_escalate() -> anyhow::Result<()> {
     let persistence = RocksDbPersistence::open_with(
         &dir.path().join("db"),
         OpenOptions {
-            sync: None,
             shutdown: Some(ShutdownSignal::new(tx)),
+            ..OpenOptions::default()
         },
     )?;
     let inner = &persistence.inner;
@@ -1870,21 +1858,6 @@ fn synthetic_engine_error() -> rocksdb::Error {
     )
     .expect_err("destroying a database under /proc must fail")
 }
-
-/// A backup taken while the primary is live must contain every acknowledged
-/// write, including ones the primary has never flushed.
-///
-/// This is the supported way to back up a running deployment, so it is worth
-/// stating what makes it work. RocksDB allows one writer, so a scheduled job
-/// cannot open the data directory read-write while the backend holds it. A
-/// secondary opens without the lock and tails the primary's write-ahead log —
-/// and under `SyncMode::Every` an acknowledged write is in that log before
-/// `write` returns. So the recovery point is the moment of the backup, not the
-/// moment the secondary opened, and not the last flush.
-///
-/// The writes below are deliberately never flushed: they exist only in the
-/// primary's memtable and its WAL when the backup is taken. Restoring through
-/// the real `restore` path — whose `RestoreOptions` differ from a hand-rolled
 
 /// `SyncMode::Never` must still survive a crash of *this* process.
 ///
@@ -1963,5 +1936,91 @@ async fn a_read_only_instance_refuses_to_back_up() -> anyhow::Result<()> {
         format!("{err}").contains("cannot take a consistent backup"),
         "the error must say why, so nobody removes the guard again: {err}"
     );
+    Ok(())
+}
+
+/// Every write path syncs the write-ahead log under `SyncMode::Every`, and none
+/// of them does under `Never`.
+///
+/// This is the crate's central durability claim, and until this test existed
+/// nothing asserted it. Whether `write_opt` was handed `sync(true)` leaves no
+/// trace in the data, so deleting `opts.set_sync(..)` from `write_options`, or
+/// making `sync_each_write` return `false`, passed the entire suite: the
+/// reopen tests close the handle cleanly, which flushes to the OS regardless,
+/// and `never_sync_survives_a_process_crash` asserts the *opposite* direction
+/// and is satisfied by a build that never syncs at all.
+///
+/// `WalFileSynced` is the one observable that separates the two, which is why
+/// [`OpenOptions::statistics`] exists.
+#[tokio::test]
+async fn every_write_path_syncs_the_wal_only_under_sync_mode_every() -> anyhow::Result<()> {
+    for mode in [SyncMode::Every, SyncMode::Never] {
+        let dir = tempfile::tempdir()?;
+        let persistence = RocksDbPersistence::open_with(
+            &dir.path().join("db"),
+            OpenOptions {
+                sync: Some(mode),
+                statistics: true,
+                ..OpenOptions::default()
+            },
+        )?;
+        let synced = || {
+            persistence
+                .ticker(rocksdb::statistics::Ticker::WalFileSynced)
+                .expect("opened with statistics on")
+        };
+        // Asserts the *delta*, not the total: `open` writes the format stamp
+        // and the backup identity with `sync(true)` unconditionally, so the
+        // counter is already non-zero under `Never`.
+        let mut before = synced();
+        let mut check = |what: &str| {
+            let after = synced();
+            let advanced = after > before;
+            assert_eq!(
+                advanced,
+                mode.sync_each_write(),
+                "{what} under {mode:?}: WAL syncs went {before} -> {after}, expected {}",
+                if mode.sync_each_write() {
+                    "an increase"
+                } else {
+                    "no change"
+                },
+            );
+            before = after;
+        };
+
+        let id = doc_id(1, 1);
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?, entry(1, 1, 20, "v2", Some(10))?],
+                &[
+                    index_entry(1, b"k", 10, Some(id)),
+                    index_entry(1, b"k", 20, Some(id)),
+                ],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        check("a document batch");
+
+        persistence
+            .write_persistence_global(
+                PersistenceGlobalKey::MaxRepeatableTimestamp,
+                serde_json::json!(10),
+            )
+            .await?;
+        check("a persistence global");
+
+        let chunk = persistence.load_index_chunk(None, 100).await?;
+        let expired: Vec<_> = chunk.into_iter().filter(|e| e.ts <= ts(10)).collect();
+        assert!(!expired.is_empty(), "nothing to delete: the test is inert");
+        persistence.delete_index_entries(expired).await?;
+        check("an index-entry delete");
+
+        persistence.delete(vec![(ts(10), id)]).await?;
+        check("a document delete");
+
+        persistence.delete_tablet_documents(tablet(1), 16).await?;
+        check("a tablet delete");
+    }
     Ok(())
 }

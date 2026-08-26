@@ -276,10 +276,39 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     db.set_max_total_wal_size(1 << 30);
     db.set_keep_log_file_num(8);
     db.set_max_open_files(-1);
-    // Recover as much of a torn tail as is consistent, then carry on. The
-    // alternative, `AbsoluteConsistency`, refuses to open at all after an
-    // unclean shutdown that left a partial record.
-    db.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
+    // Tolerate a torn tail; refuse anything worse.
+    //
+    // An unclean kill leaves a partial record at the end of the WAL, and the
+    // backend must come up from that — nothing calls `Persistence::shutdown()`,
+    // so *every* restart is unclean. `AbsoluteConsistency` refuses to open at
+    // all in that case and is therefore unusable here.
+    //
+    // `PointInTime` was the obvious remaining choice and is the wrong one. The
+    // two modes treat a torn tail identically — `log_reader.cc` reports
+    // `kBadHeader` and a mid-fragment `kEof` as corruption only under
+    // `kAbsoluteConsistency` and `kPointInTimeRecovery`, so
+    // `kTolerateCorruptedTailRecords` simply ignores it — but they diverge
+    // completely on a *checksum mismatch in the middle of the file*, which is
+    // media corruption rather than a crash. There, `db_impl_open.cc` under
+    // `kPointInTimeRecovery` sets `status = Status::OK()`, sets
+    // `stop_replay_for_corruption`, logs `"Point in time recovered to log #N"`
+    // at INFO, and opens successfully — discarding the rest of that WAL *and
+    // every later one*. Under `kTolerateCorruptedTailRecords` it returns the
+    // error and the open fails.
+    //
+    // Silently discarding is the worse failure for this backend specifically.
+    // A replicated store can lose a node's tail and refill it from a peer; this
+    // one has no replica, no lease and no failover, so the discarded commits
+    // are gone. Worse, they are gone *undetectably*: `MaxRepeatableTimestamp`
+    // lives in the same WAL, so it truncates in lockstep and the surviving
+    // state is entirely self-consistent. `max_ts()` comes back lower, the
+    // committer resumes from there, and nothing anywhere reports a fault.
+    //
+    // Failing to open is loud, and loud is recoverable: the pod crashloops, the
+    // operator sees it, and the volume snapshot or backup generation is still
+    // there. This is the same bargain Postgres makes when it refuses to start
+    // on `invalid record length at ...`.
+    db.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
 
     RocksOptions {
         db,

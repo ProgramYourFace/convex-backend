@@ -157,6 +157,39 @@ pub struct ReadCheck {
     pub index_entries: usize,
 }
 
+/// Opens the database at `path` and reads every row back, decoding as it goes.
+///
+/// This is [`crate::backup::rehearse`]'s check, pointed at a database
+/// directory instead of a backup generation — which is what a volume snapshot
+/// restores to. Without it the snapshot-based backup path, the only one that
+/// works against a running cell, has no way to be verified at all: every other
+/// verb in this crate takes a *backup* directory and a snapshot is not one.
+///
+/// It opens **read-write**, deliberately: that replays the write-ahead log,
+/// which is exactly what the backend does when it recovers from a
+/// crash-consistent snapshot, so this checks what recovery would actually
+/// produce rather than a weaker read-only view of it. Run it against a clone.
+/// Against the live volume it is refused by RocksDB's lock while the backend
+/// holds it, and against a stopped one it does no more than the next restart
+/// would.
+pub fn check_readable(path: &Path) -> anyhow::Result<ReadCheck> {
+    anyhow::ensure!(
+        path.join("CURRENT").exists(),
+        "no RocksDB database at {}. `check` takes a database directory — a restored volume \
+         snapshot — not a backup directory; for one of those use `rehearse`.",
+        path.display(),
+    );
+    let persistence = RocksDbPersistence::new(path).with_context(|| {
+        format!(
+            "could not open {} for writing. `check` replays the write-ahead log the way recovery \
+             does, so it needs exclusive access: point it at a clone of the snapshot, not at a \
+             volume a backend is using.",
+            path.display(),
+        )
+    })?;
+    persistence.inner.verify_readable()
+}
+
 /// How to open a database.
 ///
 /// A struct rather than a run of positional flags because these are two
@@ -168,6 +201,15 @@ pub struct OpenOptions {
     /// Where to report a latched background error. Without one, a database
     /// that has stopped accepting writes keeps the process alive.
     pub shutdown: Option<ShutdownSignal>,
+    /// Collect RocksDB's ticker statistics, readable with
+    /// [`RocksDbPersistence::ticker`].
+    ///
+    /// Off by default because it is not free. It exists because the durability
+    /// contract is otherwise unassertable: whether `write_opt` was handed
+    /// `sync(true)` leaves no trace in the data, so a build that stopped
+    /// syncing would pass every behavioural test in this crate. `WalFileSynced`
+    /// is the one observable that distinguishes them.
+    pub statistics: bool,
 }
 
 impl Default for OpenOptions {
@@ -175,6 +217,7 @@ impl Default for OpenOptions {
         Self {
             sync: None,
             shutdown: None,
+            statistics: false,
         }
     }
 }
@@ -195,6 +238,10 @@ pub(crate) struct Inner {
     /// memtable budget outlive the column families that reference them.
     _cache: rocksdb::Cache,
     _write_buffer_manager: rocksdb::WriteBufferManager,
+    /// The `Options` the database was opened with, kept only when statistics
+    /// are on: RocksDB hangs its ticker counters off them, so reading one
+    /// means holding them.
+    db_options: Option<rocksdb::Options>,
     /// Resolved once when the database is opened, rather than read from the
     /// environment per write, so a single process can hold databases in
     /// different modes — which is what makes the mode testable.
@@ -242,6 +289,15 @@ impl RocksDbPersistence {
     /// Open (or create) a database with explicit options.
     pub fn open_with(path: &Path, opts: OpenOptions) -> anyhow::Result<Self> {
         Self::open(path, true, opts)
+    }
+
+    /// Reads one of RocksDB's ticker counters, or `None` when the database was
+    /// not opened with [`OpenOptions::statistics`].
+    pub fn ticker(&self, ticker: rocksdb::statistics::Ticker) -> Option<u64> {
+        self.inner
+            .db_options
+            .as_ref()
+            .map(|opts| opts.get_ticker_count(ticker))
     }
 
     /// Open a read-only view of a database another process has open for
@@ -304,6 +360,7 @@ impl RocksDbPersistence {
                 path: path.to_path_buf(),
                 _cache: shared.cache,
                 _write_buffer_manager: shared.write_buffer_manager,
+                db_options: None,
                 // A secondary instance never writes, so it has no WAL to flush.
                 sync: options::SyncMode::Every,
                 shutdown: None,
@@ -325,7 +382,10 @@ impl RocksDbPersistence {
             anyhow::bail!("no RocksDB database at {}", path.display());
         }
 
-        let shared = options::build(create_if_missing, sync);
+        let mut shared = options::build(create_if_missing, sync);
+        if opts.statistics {
+            shared.db.enable_statistics();
+        }
         let cfs: Vec<_> = ALL_COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, options::column_family(name, &shared)))
@@ -372,6 +432,7 @@ impl RocksDbPersistence {
             path: path.to_path_buf(),
             _cache: shared.cache,
             _write_buffer_manager: shared.write_buffer_manager,
+            db_options: opts.statistics.then_some(shared.db),
             sync,
             shutdown: opts.shutdown,
             consecutive_write_failures: std::sync::atomic::AtomicU32::new(0),
@@ -380,11 +441,10 @@ impl RocksDbPersistence {
         });
 
         // Minted here, by the writer, rather than lazily on the first backup.
-        // A backup taken from a secondary — the supported way to back up a
-        // running deployment — cannot mint it, because a secondary cannot
-        // write. Doing it at open means the row always exists by the time a
-        // scheduled backup looks for it, and it costs one synced put per
-        // process start.
+        // A secondary cannot mint it, because a secondary cannot write, and a
+        // restored database has to carry an identity forward to continue its
+        // chain. Doing it at open means the row always exists by the time a
+        // backup looks for it, and it costs one synced put per process start.
         inner
             .identity()
             .context("failed to establish the database's backup identity")?;
