@@ -7,7 +7,10 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
-    path::Path,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -80,6 +83,9 @@ pub struct SqlitePersistence {
 struct Inner {
     newly_created: bool,
     connection: Connection,
+    /// Where the database file lives, for [`PersistenceReader::check_storage`].
+    /// `None` for `:memory:`, which has no device to check.
+    path: Option<PathBuf>,
 }
 
 impl SqlitePersistence {
@@ -94,6 +100,7 @@ impl SqlitePersistence {
             inner: Arc::new(Mutex::new(Inner {
                 newly_created,
                 connection,
+                path: (path != ":memory:").then(|| PathBuf::from(path)),
             })),
         })
     }
@@ -614,6 +621,36 @@ impl PersistenceReader for SqlitePersistence {
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
         self._get_persistence_global(key)
+    }
+
+    /// SQLite is file-backed, so it has the same failure as RocksDB: on a hung
+    /// mount a write blocks rather than erroring, and the process keeps
+    /// serving. The trait's `Ok(())` default is right for a backend whose
+    /// storage is another process across a socket, and wrong here.
+    ///
+    /// Same probe as the RocksDB backend: one small file written beside the
+    /// database, fsynced so it reaches the device, then removed.
+    async fn check_storage(&self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+
+        let Some(path) = self.inner.lock().path.clone() else {
+            return Ok(());
+        };
+        let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let probe = directory.join("convex-storage-probe");
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&probe)?;
+            file.write_all(b"convex storage probe\n")?;
+            file.sync_all()
+        })();
+        let _ = std::fs::remove_file(&probe);
+        written.with_context(|| {
+            format!(
+                "cannot write beside the database at {}",
+                directory.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn version(&self) -> PersistenceVersion {

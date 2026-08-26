@@ -264,12 +264,17 @@ pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
 /// `TolerateCorruptedTailRecords` is right under [`SyncMode::Every`] and wrong
 /// under [`SyncMode::Never`], and RocksDB's own documentation is what says so:
 /// the mode's guarantee holds "as long as `WritableFile::Append()` writes are
-/// durable", which is exactly the property `Never` gives up. Under `Never` an
-/// unsynced region up to `wal_bytes_per_sync` wide is expected to be lost on
-/// host loss — that is the mode's advertised cost — and a header that persisted
-/// without its payload there is an ordinary outcome, not corruption. Refusing
-/// to open for it would turn the documented cost ("whatever the OS had not
-/// written") into a database that will not start.
+/// durable", which is exactly the property `Never` gives up. There, losing an
+/// unsynced region on host loss is the mode's advertised cost — unbounded,
+/// since `wal_bytes_per_sync` only starts writeback via `sync_file_range` and
+/// never waits — and a header that persisted without its payload is an ordinary
+/// outcome of it rather than corruption. Refusing to open for that would turn a
+/// documented cost into a database that will not start.
+///
+/// It is a genuine trade, not a free one: `PointInTime` discards from the first
+/// bad record to the end of that WAL *and every later one*, which can be more
+/// than `Never` itself would have lost. That is why it is only the default for
+/// the mode that has already accepted unbounded loss, and why it warns.
 ///
 /// So the default follows the durability contract the operator chose, and
 /// `ROCKSDB_WAL_RECOVERY_MODE` overrides it either way — because without an

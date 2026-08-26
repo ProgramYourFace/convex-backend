@@ -259,9 +259,14 @@ fn backup_refuses_a_directory_that_is_not_a_database() {
 /// `check` is what turns a volume snapshot into a verified one, and the
 /// documented backup cycle depends on it, so it needs coverage of its own.
 ///
-/// A copy of a closed database stands in for a snapshot here: crash-consistent
-/// is a weaker guarantee than this, so a copy that `check` cannot read would
-/// mean something much worse than a flaky test.
+/// A copy of a *cleanly closed* database, which is a weaker exercise than it
+/// looks: RocksDB flushes every column family in `~DBImpl`, so the copy has its
+/// memtables in SSTs and a MANIFEST already past the WAL. It therefore never
+/// replays a write-ahead log — which is exactly what `check` does against a
+/// real crash-consistent snapshot. This is a smoke test for the verb, not a
+/// stand-in for a snapshot; the WAL-replay path is covered by
+/// `writes_survive_a_reopen_without_a_clean_shutdown` in the crate's own tests,
+/// which kills a child process with `_exit(0)`.
 #[tokio::test]
 async fn check_reads_back_a_copy_of_a_database() {
     let dir = tempfile::tempdir().unwrap();
@@ -290,11 +295,19 @@ async fn check_reads_back_a_copy_of_a_database() {
 /// Pointed at a backup directory instead of a database, `check` has to say so —
 /// it is the mistake the two directory shapes invite, and the error is the only
 /// thing standing between an operator and a CronJob that verifies nothing.
-#[test]
-fn check_refuses_a_backup_directory_and_names_the_right_verb() {
+#[tokio::test]
+async fn check_refuses_a_backup_directory_and_names_the_right_verb() {
     let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
     let backups = dir.path().join("backup");
-    std::fs::create_dir_all(&backups).unwrap();
+    // A real backup directory, not an empty one — otherwise this passes through
+    // the missing-`CURRENT` branch without ever meeting the shape it is named
+    // for.
+    {
+        let persistence = RocksDbPersistence::new(&db).expect("failed to create the database");
+        populate(&persistence).await.expect("failed to write");
+        persistence.backup(&backups, 4).expect("failed to back up");
+    }
 
     let out = cli(&["check", "--db", backups.to_str().unwrap()]);
     assert!(!out.status.success(), "check must refuse a non-database");

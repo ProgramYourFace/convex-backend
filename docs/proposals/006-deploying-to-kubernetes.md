@@ -101,19 +101,24 @@ answered `200` in microseconds on a volume nothing could reach. No RocksDB read 
 that — a cached block, a pinned index, or a bloom-filter miss on an absent key all
 short-circuit before the device.
 
-So `PersistenceReader::check_storage` does not read. On RocksDB it does two things a
-wedged volume cannot complete, both on the blocking pool:
+A `stat` does not fix it either, and a revision of this section claimed it did. The data
+directory's inode has been resident in the kernel's inode cache since the database was
+opened, so `stat` is answered from memory too — on a network filesystem it reaches the
+server once the attribute cache expires, and on the block volumes this document makes
+primary it never does.
 
-1. `metadata()` on the data directory. A hung mount — NFS, EBS, a disconnected CSI volume
-   — blocks every VFS call against it, in the kernel, before RocksDB is involved. This is
-   the case with no other detector.
-2. `flush_wal(true)`, an fsync of the write-ahead log, which reaches the block layer and
-   is where the parked writers are stuck. Cheap under `SyncMode::Every`, where the WAL is
-   already synced.
+So `PersistenceReader::check_storage` **writes**. On RocksDB it creates one small file in
+the data directory, fsyncs it, and removes it, on the blocking pool. That blocks on a hung
+mount of any kind, and it fails with `EROFS` on a volume remounted read-only — which
+nothing else here catches, since reads keep succeeding and the write escalation needs five
+*attempted* writes. It deliberately takes no RocksDB lock: `flush_wal(true)` would hold
+`log_write_mutex_` and wait on the condition variable the commit path waits on, and this
+endpoint is unauthenticated, so it must not be able to put load on commits.
 
-The method has a default of `Ok(())` on the trait, so the Postgres and SQLite backends are
-unaffected: their storage is a process on the far side of a socket, where a broken
-connection is already an error rather than a silence.
+The method has a default of `Ok(())` on the trait, so Postgres and MySQL are unaffected:
+their storage is a process on the far side of a socket, where a broken connection is
+already an error rather than a silence. **SQLite is file-backed and shares this failure
+mode**, and has its own implementation for that reason.
 
 **Unauthenticated**, because a liveness probe that can fail for any reason other than
 "this process is unwell" is a kill switch. The kubelet has no identity. It cannot read a
@@ -126,8 +131,8 @@ a projected-Secret refresh racing the probe — into a restart every two minutes
 restarting cannot fix. An earlier revision of this document recommended exactly that,
 against `/api/list_snapshot`.
 
-The cost is one `stat` and one fsync every 30 s, fixed: it does not grow with the
-database, allocates no iterator, and books no usage.
+The cost is one small file written, fsynced and removed every 30 s, fixed: it does not
+grow with the database, allocates no iterator, and books no usage.
 
 Being unauthenticated, it is also reachable by anyone who can reach the port, and each
 request occupies a blocking-pool thread and one of the 128 concurrency permits. Do not
@@ -163,9 +168,10 @@ clock, but it means the server-side timeout cannot be relied on to bound the pro
 
 ### What this does not cover
 
-**A volume that has gone read-only rather than unresponsive** still serves this probe,
-because the probe is a read. That case is caught inside the process instead: consecutive
-failed engine writes raise the backend's `ShutdownSignal` (§2a).
+**A volume that has gone read-only** *is* caught, because the probe is a write — this is
+what it adds over anything read-based. The in-process escalation covers it too, but only
+after five *attempted* writes, which a read-mostly cell will not produce for up to two
+hours (§2a).
 
 **A read-mostly cell.** On a cell with no user mutations the only persistence write is the
 committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and
@@ -234,9 +240,11 @@ empty vector never fires. Same silent-inertness as the casing bug above, one lay
 Alert below the HTTP layer instead, where there is one code path regardless of transport:
 
 ```promql
-# Mutations have collapsed.
-sum(rate(database_commit_seconds_count[5m]))
-  < 0.5 * sum(rate(database_commit_seconds_count[5m] offset 1h))
+# Mutations have collapsed. The status filter matters: `StatusTimer` records on
+# drop and defaults to error, so an unfiltered count includes failing commits
+# and stays flat through exactly the incident this is meant to catch.
+sum(rate(database_commit_seconds_count{status="success"}[5m]))
+  < 0.5 * sum(rate(database_commit_seconds_count{status="success"}[5m] offset 1h))
 
 # Heartbeat: the committer's idle timestamp bump has not succeeded in three hours.
 # It only records on success, so this covers the read-mostly cell that the probe
@@ -300,7 +308,7 @@ The whole cycle, as one `CronJob` per schedule:
 # 2. A CronJob that, per run:
 #      - provisions a PVC from the newest snapshot (a clone: no writer holds it)
 #      - runs: rocksdb-backup check --db /clone/db
-#      - optionally: rocksdb-backup backup /backup --db /clone
+#      - optionally: rocksdb-backup backup /backup --db /clone/db
 #      - deletes the clone
 # 3. Alert when the CronJob's lastSuccessfulTime falls behind its schedule.
 ```

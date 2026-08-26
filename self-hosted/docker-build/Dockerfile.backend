@@ -14,7 +14,11 @@ COPY rust-toolchain .
 # Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
 RUN rustup self update && rustup toolchain install
 COPY --parents crates* Cargo* ./
-RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend --bin rocksdb-backup
+# One --bin only: cargo-chef's `bin` is a clap `Option<String>`, so a second
+# occurrence is an ArgumentConflict and the build dies here. It is also
+# unnecessary — local_backend depends on db_connection, which depends on
+# rocksdb_persistence, so `rocksdb-backup`'s package is already in the recipe.
+RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
 
 # Build stage: Compiles the Rust backend with all dependencies
 # Uses cargo-chef's recipe from the previous stage for optimal caching

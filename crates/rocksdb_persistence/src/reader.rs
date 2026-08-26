@@ -25,10 +25,15 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
+    io::Write as _,
     sync::Arc,
 };
 
 use anyhow::Context as _;
+
+/// The file `check_storage` writes and removes. Named so that finding one left
+/// behind — which only happens if the process died mid-probe — says what it is.
+const PROBE_FILE: &str = "convex-storage-probe";
 use async_trait::async_trait;
 use common::{
     index::{
@@ -828,7 +833,7 @@ impl PersistenceReader for RocksDbPersistence {
         Ok(cmp::max(max_committed, max_repeatable))
     }
 
-    /// Reaches the filesystem, deliberately, rather than reading a key.
+    /// Reaches the device, deliberately, rather than reading a key.
     ///
     /// An earlier version of this probe was a point get of
     /// `MaxRepeatableTimestamp`, which is the worst possible choice: the
@@ -836,41 +841,68 @@ impl PersistenceReader for RocksDbPersistence {
     /// `MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY` (5 s) on any active cell, so
     /// it is always in the active memtable and the read is answered from
     /// memory in microseconds. The probe returned `200` on a volume nothing
-    /// could reach — exactly the property it existed to rule out. No
-    /// RocksDB read can be relied on here: a cached block, a pinned index,
-    /// or a bloom-filter miss on an absent key all short-circuit before the
-    /// device.
+    /// could reach — exactly the property it existed to rule
+    /// out. No RocksDB read can be relied on here: a cached block, a pinned
+    /// index, or a bloom-filter miss on an absent key all short-circuit before
+    /// the device.
     ///
-    /// So this does not read. It performs the two operations a wedged volume
-    /// cannot complete:
+    /// The version after that used `metadata` on the data directory, and had
+    /// the same defect one layer down. A `stat` of a path whose inode has been
+    /// resident in the kernel's inode cache since the database was opened is
+    /// served from memory too. On a network filesystem it reaches the server
+    /// once the attribute cache expires; on the block-volume topology these
+    /// documents make primary, it never does.
     ///
-    /// 1. `metadata` on the data directory. A hung mount — NFS, EBS, a
-    ///    disconnected CSI volume — blocks every VFS call against it, in the
-    ///    kernel, before RocksDB is involved at all. This is the case with no
-    ///    other detector.
-    /// 2. `flush_wal(true)` — an fsync of the write-ahead log, which reaches
-    ///    the block layer and is where the parked writers are stuck. Cheap on a
-    ///    healthy cell under `SyncMode::Every`, where the WAL is already
-    ///    synced.
+    /// So this writes. One small file, fsynced, then removed:
     ///
-    /// Both run on the blocking pool, so a probe that hangs holds one blocking
-    /// thread and nothing else. It is still a liveness probe's own timeout that
-    /// decides how long to wait: this call has no deadline of its own, because
-    /// a deadline here would report healthy on a volume that is merely
-    /// slow, and slow is the shape a wedge starts as.
+    /// - It blocks on a hung mount of any kind, which is the failure with no
+    ///   other detector.
+    /// - It fails with `EROFS` on a volume remounted read-only, which nothing
+    ///   else here catches: reads still succeed, and the write escalation needs
+    ///   five *attempted* writes, which a read-mostly cell does not produce for
+    ///   up to two hours.
+    /// - It takes no RocksDB lock. `flush_wal(true)` would: it holds
+    ///   `log_write_mutex_` and waits on `log_sync_cv_`, which the commit path
+    ///   waits on too, and RocksDB's own comment there notes that parallel
+    ///   `SyncWAL` and per-write sync are "usually not used together" — which
+    ///   is precisely this backend under `SyncMode::Every`. The endpoint is
+    ///   unauthenticated, so it must not be able to put load on the commit
+    ///   path.
+    ///
+    /// It runs on the blocking pool, so a probe that hangs holds one blocking
+    /// thread and nothing else. It has no deadline of its own: that belongs to
+    /// the liveness probe, because a deadline here would report healthy on a
+    /// volume that is merely slow, and slow is how a wedge starts.
     async fn check_storage(&self) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_check_storage", move || -> anyhow::Result<()> {
-            std::fs::metadata(&inner.path).with_context(|| {
-                format!("cannot stat the data directory {}", inner.path.display())
-            })?;
-            // A secondary owns no WAL and must not sync one.
-            if !inner.secondary {
-                inner
-                    .db
-                    .flush_wal(true)
-                    .context("cannot sync the write-ahead log")?;
+            // A secondary does not own the directory and must not write into
+            // it. Reading the primary's `CURRENT` is the closest equivalent: a
+            // real file read, on the same volume, of a file small enough that
+            // its cost never grows.
+            if inner.secondary {
+                std::fs::read(inner.path.join("CURRENT")).with_context(|| {
+                    format!("cannot read the database at {}", inner.path.display())
+                })?;
+                return Ok(());
             }
+            let probe = inner.path.join(PROBE_FILE);
+            let written = (|| -> std::io::Result<()> {
+                let mut file = std::fs::File::create(&probe)?;
+                file.write_all(b"convex storage probe\n")?;
+                // The fsync is the part that reaches the block layer. Without
+                // it the write lands in the page cache and proves nothing.
+                file.sync_all()
+            })();
+            // Best effort: on a wedged volume this will not complete either, and
+            // the error above is the one worth reporting.
+            let _ = std::fs::remove_file(&probe);
+            written.with_context(|| {
+                format!(
+                    "cannot write to the data directory {}",
+                    inner.path.display()
+                )
+            })?;
             Ok(())
         })
         .await?

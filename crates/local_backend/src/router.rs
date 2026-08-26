@@ -560,17 +560,20 @@ where
         // authenticated probe crashloops a healthy cell the moment a key
         // rotates, and cannot recover by restarting.
         //
-        // It reads no user data: one `globals` point get whose value is a
-        // timestamp the deployment publishes anyway.
+        // It reads no user data at all: the storage layer decides what proves
+        // its device is alive, and for RocksDB that is writing one small file,
+        // fsyncing it and removing it — nothing of the deployment's is touched
+        // or returned.
         .route(
             "/health/storage",
             get(|MtState(st): MtState<LocalAppState>| async move {
                 match st.application.check_storage().await {
                     Ok(()) => (StatusCode::OK, "ok"),
-                    // Reached only when the read *fails*. A wedged volume
-                    // blocks instead, and the probe hangs until the kubelet's
-                    // own `timeoutSeconds` fires — which is the intended
-                    // outcome, and the reason that field has to be set.
+                    // Reached when the check *fails* — a read-only volume, a
+                    // vanished directory. A wedged volume blocks instead, and
+                    // the probe hangs until the kubelet's own `timeoutSeconds`
+                    // fires, which is the intended outcome and the reason that
+                    // field has to be set.
                     Err(e) => {
                         tracing::error!("storage health check failed: {e:#}");
                         (StatusCode::SERVICE_UNAVAILABLE, "storage unavailable")

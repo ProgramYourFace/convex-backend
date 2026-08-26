@@ -125,11 +125,33 @@ pub(crate) fn is_rocksdb_artifact(name: &str) -> bool {
     const NUMBERED_PREFIXES: [&str; 2] = ["MANIFEST-", "OPTIONS-"];
     const NUMBERED_SUFFIXES: [&str; 4] = ["sst", "blob", "log", "ldb"];
 
-    if EXACT.contains(&name) || name.starts_with("LOG.old.") {
+    fn all_digits(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    // `<number>.dbtmp` and `OPTIONS-<number>.dbtmp` are written while CURRENT or
+    // an options file is being replaced, so a killed restore can leave one.
+    // Handled here rather than by stripping the suffix globally, which would
+    // also have accepted a bare `000123` — not a name RocksDB ever writes.
+    if let Some(base) = name.strip_suffix(".dbtmp") {
+        return all_digits(base)
+            || NUMBERED_PREFIXES
+                .iter()
+                .filter_map(|p| base.strip_prefix(p))
+                .any(all_digits);
+    }
+
+    if EXACT.contains(&name) {
         return true;
     }
+    // RocksDB rolls its info log as `LOG.old.<number>`. The number matters: a
+    // bare `starts_with("LOG.old.")` would accept `LOG.old.do-not-delete`,
+    // which is the same hole as matching on a bare extension.
+    if let Some(rest) = name.strip_prefix("LOG.old.") {
+        return all_digits(rest);
+    }
     if let Some(rest) = NUMBERED_PREFIXES.iter().find_map(|p| name.strip_prefix(p)) {
-        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+        return all_digits(rest);
     }
     // RocksDB numbers every data file, and the number is the *whole* stem:
     // `000123.sst`, `000123.log`, `000123.blob`. Requiring that is the entire
@@ -138,11 +160,7 @@ pub(crate) fn is_rocksdb_artifact(name: &str) -> bool {
     // operator keeps in a directory — and this whitelist decides what gets
     // deleted.
     match name.rsplit_once('.') {
-        Some((stem, extension)) => {
-            NUMBERED_SUFFIXES.contains(&extension)
-                && !stem.is_empty()
-                && stem.bytes().all(|b| b.is_ascii_digit())
-        },
+        Some((stem, extension)) => NUMBERED_SUFFIXES.contains(&extension) && all_digits(stem),
         None => false,
     }
 }
@@ -312,6 +330,12 @@ pub fn restore(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Res
             // could leave a *permanent* grant to delete that path — and the
             // path is typically the live data directory. `rehearse` a few
             // functions below already refuses that design in as many words.
+            // Note that this is all-or-nothing on purpose, and that a target
+            // mounted *directly* at a volume root will therefore never qualify:
+            // ext4 puts `lost+found` there, and one unrecognised entry makes the
+            // whole directory off-limits. That is the safe direction — the
+            // operator clears it by hand — and it is why the documented layout
+            // puts the database in a subdirectory of the mount.
             let interrupted = !names.iter().any(|n| n == "CURRENT")
                 && names.iter().all(|n| is_rocksdb_artifact(n));
             anyhow::ensure!(

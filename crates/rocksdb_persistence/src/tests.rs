@@ -2170,6 +2170,8 @@ fn only_rocksdb_file_names_make_a_directory_clearable() {
         "LOG.old.1712345678",
         "MANIFEST-000001",
         "OPTIONS-000005",
+        "OPTIONS-000005.dbtmp",
+        "000123.dbtmp",
         "000123.sst",
         "000123.log",
         "000123.blob",
@@ -2185,6 +2187,10 @@ fn only_rocksdb_file_names_make_a_directory_clearable() {
         "exports.tar.gz",
         "MANIFEST-backup",
         "OPTIONS-old",
+        "LOG.old.do-not-delete",
+        "lost+found",
+        "notes.dbtmp",
+        "000123",
         ".hidden",
         "readme",
         "x.sst",
@@ -2194,4 +2200,138 @@ fn only_rocksdb_file_names_make_a_directory_clearable() {
             "{name} is not a RocksDB file and must not license a delete",
         );
     }
+}
+
+/// The liveness probe's body has to actually reach the volume.
+///
+/// Two probes shipped broken before this test existed, both for the same
+/// reason: the operation chosen *sounded* like it must touch storage, and the
+/// kernel answered it from memory. First a point get of
+/// `MaxRepeatableTimestamp`, which is always in the active memtable; then a
+/// `stat` of the data directory, whose inode is cached from open. Neither had a
+/// test, so neither failure was visible until someone re-derived it by hand.
+///
+/// Renaming the directory away is the cheapest stand-in for a volume that is no
+/// longer there. A probe served from memory passes it; one that touches the
+/// filesystem cannot.
+#[tokio::test]
+async fn check_storage_fails_when_the_data_directory_is_gone() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let persistence = RocksDbPersistence::new(&db_path)?;
+    persistence
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    persistence
+        .check_storage()
+        .await
+        .expect("a healthy database must pass its own probe");
+
+    std::fs::rename(&db_path, dir.path().join("moved"))?;
+    let err = persistence
+        .check_storage()
+        .await
+        .expect_err("the probe must fail once the data directory is gone");
+    assert!(
+        format!("{err:#}").contains("cannot write"),
+        "the failure must name what it could not do: {err:#}"
+    );
+    Ok(())
+}
+
+/// The probe must not accumulate anything in the data directory, and must not
+/// leave a file RocksDB would then have to ignore.
+#[tokio::test]
+async fn check_storage_leaves_nothing_behind() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let persistence = RocksDbPersistence::new(&db_path)?;
+
+    let before: BTreeSet<_> = std::fs::read_dir(&db_path)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    for _ in 0..3 {
+        persistence.check_storage().await?;
+    }
+    let after: BTreeSet<_> = std::fs::read_dir(&db_path)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        before, after,
+        "the probe left something in the data directory"
+    );
+    Ok(())
+}
+
+/// The probe must actually attempt a write, not merely look at the path.
+///
+/// This is the test that separates the current probe from the two that shipped
+/// broken: a `stat` of the data directory succeeds here, and so does any read.
+/// Occupying the probe's path with a directory makes `File::create` fail with
+/// `EISDIR` — for root as well, which the permission-based test below cannot
+/// manage, and which is why this one carries the distinction.
+#[tokio::test]
+async fn check_storage_actually_writes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let persistence = RocksDbPersistence::new(&db_path)?;
+    persistence.check_storage().await?;
+
+    // Whatever the probe writes, it writes *here*.
+    std::fs::create_dir(db_path.join("convex-storage-probe"))?;
+    assert!(
+        std::fs::metadata(&db_path).is_ok(),
+        "the data directory is still perfectly stat-able, which is the point",
+    );
+
+    let err = persistence
+        .check_storage()
+        .await
+        .expect_err("the probe must fail when it cannot create its file");
+    assert!(
+        format!("{err:#}").contains("cannot write"),
+        "the failure must name what it could not do: {err:#}"
+    );
+    Ok(())
+}
+
+/// A read-only volume is the case the probe adds over anything read-based:
+/// reads keep succeeding, and the write escalation needs five *attempted*
+/// writes, which a read-mostly cell will not produce for up to two hours.
+#[tokio::test]
+async fn check_storage_fails_on_a_read_only_directory() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Root ignores the directory's write bit, so this cannot be exercised as
+    // root — and CI containers usually are. Skipping is honest; asserting
+    // would either fail there or, worse, be softened until it asserted nothing.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, which bypasses the permission check");
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let persistence = RocksDbPersistence::new(&db_path)?;
+    persistence.check_storage().await?;
+
+    let original = std::fs::metadata(&db_path)?.permissions();
+    let mut readonly = original.clone();
+    readonly.set_mode(0o555);
+    std::fs::set_permissions(&db_path, readonly)?;
+
+    let result = persistence.check_storage().await;
+    std::fs::set_permissions(&db_path, original)?;
+    assert!(
+        result.is_err(),
+        "the probe must fail when the data directory cannot be written to",
+    );
+    Ok(())
 }

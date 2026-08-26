@@ -82,7 +82,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | Knob | Default | Meaning |
 |---|---|---|
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
-| `ROCKSDB_WAL_RECOVERY_MODE` | by sync mode | `tolerate` (refuse to open on a corrupt WAL) or `point-in-time` (truncate and carry on) |
+| `ROCKSDB_WAL_RECOVERY_MODE` | `tolerate` under `sync=every`, `point-in-time` under `sync=never` | `tolerate` refuses to open on a corrupt WAL; `point-in-time` discards the rest of it and every later one, and carries on |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
 | `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | cached data, index and filter blocks *and* memtable charge; the largest, but not the only, consumer |
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
@@ -102,6 +102,12 @@ a re-provisioned claim — leaves an empty directory, RocksDB creates a fresh da
 in it, `Database::initialize` runs, and the cell comes up **healthy and empty**. Every
 probe passes, because there is nothing wrong with the process; the data is simply
 somewhere else. With it set, that is a refusal to start.
+
+The recovery default follows the durability contract: `sync=every` promises that an
+acknowledged write is on disk, so a corrupt WAL is a real fault and the open fails loudly.
+`sync=never` has already accepted unbounded loss on host loss, and refusing to open for it
+would turn that documented cost into a cell that will not start — so it truncates, and
+warns at every open that it can lose acknowledged commits undetectably.
 
 Values are validated where getting them wrong would be silent: `0` disables the write
 escalation rather than making it fire on the first failure, a negative
