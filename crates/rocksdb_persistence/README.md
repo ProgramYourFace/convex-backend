@@ -152,8 +152,10 @@ RocksDB reads no cgroup limit of its own, and an overrun kills the *backend* rat
 than a subprocess. So the cache is not left at a constant: unset, it is derived from
 the container's memory limit — cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`,
 walking up the hierarchy and taking the smallest limit that binds, capped at physical
-memory. `ROCKSDB_BLOCK_CACHE_PERCENT` (default 25) is the share taken, clamped to
-[64 MiB, 4 GiB]. The chosen size and where it came from are logged at startup.
+memory. `ROCKSDB_BLOCK_CACHE_PERCENT` (default 25) is the share taken, capped at 4 GiB and
+not floored — a small container is meant to get a small cache, which is the point of
+deriving from the limit at all. The chosen size and where it came from are logged at
+startup.
 
 A quarter rather than a half because the backend hosting this crate also runs V8
 isolates, whose heaps are the other large consumer in the process. Raise it on a

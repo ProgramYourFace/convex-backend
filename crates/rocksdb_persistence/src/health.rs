@@ -222,9 +222,13 @@ impl HealthMonitor {
         };
         for handle in handles {
             if handle.thread().id() == std::thread::current().id() {
-                // Dropping the handle here would detach the thread, which is
-                // fine — it is this thread, and it is already unwinding out of
-                // the loop. Joining it would deadlock.
+                // Joining this thread from this thread would deadlock, so the
+                // handle is detached instead. That is a last resort, not a
+                // design: it leaves work running past the caller's return, and
+                // when `Inner::drop` used to reach here it left the engine
+                // closing on a detached thread after `drop` had returned. The
+                // owning handle now stops the workers before any of that is
+                // reachable — see `RocksDbPersistence::drop`.
                 drop(handle);
             } else {
                 let _ = handle.join();
@@ -356,19 +360,6 @@ fn watchdog_pass(
         };
         metrics::log_backup_age(age);
     }
-
-    if let Some(dir) = backup_dir {
-        let age = match inner
-            .backup_worker
-            .get()
-            .and_then(|worker| worker.newest_backup_unix_secs())
-        {
-            Some(newest) => backup::age_seconds(newest),
-            None => started.elapsed().as_secs_f64(),
-        };
-        let _ = dir;
-        metrics::log_backup_age(age);
-    }
     false
 }
 
@@ -415,9 +406,6 @@ fn silence_deadline(interval: Duration) -> Duration {
         )
 }
 
-/// The checks that need to ask RocksDB something, on the thread that is allowed
-/// to block doing it. The stall ceiling is deliberately not among them — see
-/// [`watch_writes`] and the note in [`HealthMonitor::spawn`].
 /// The one check that needs to ask RocksDB a question, on the thread that is
 /// allowed to block doing it.
 ///
@@ -611,10 +599,7 @@ mod escalation_tests {
 mod watchdog_tests {
     use std::{
         sync::{
-            atomic::{
-                AtomicBool,
-                Ordering,
-            },
+            atomic::Ordering,
             Arc,
         },
         time::Duration,
@@ -746,27 +731,27 @@ mod watchdog_tests {
             // Give the delete paths something to delete, so they do real work.
             bulk_write(persistence.clone()).await?;
 
-            let inner = persistence.inner.clone();
-            let saw = Arc::new(AtomicBool::new(false));
-            let observing = saw.clone();
-            let done = Arc::new(AtomicBool::new(false));
-            let stop = done.clone();
-            let observer = std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if inner.write_watch.oldest_in_flight().is_some() {
-                        observing.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    std::thread::yield_now();
-                }
-            });
-
+            // Counted, not sampled. An observer thread spinning on
+            // `oldest_in_flight()` has to be scheduled *inside* the guard's
+            // lifetime to see it, which on a loaded box it often is not — that
+            // version of this test failed about one run in nine, and a test
+            // that flaky gets quarantined, after which guard deletions ship
+            // green again. Every `begin()` bumps `next_id`, so comparing it
+            // across the call answers the same question with no timing in it.
+            let before = persistence
+                .inner
+                .write_watch
+                .next_id
+                .load(Ordering::Relaxed);
             run(persistence.clone()).await?;
-            done.store(true, Ordering::Relaxed);
-            observer.join().expect("observer thread panicked");
+            let after = persistence
+                .inner
+                .write_watch
+                .next_id
+                .load(Ordering::Relaxed);
 
             assert!(
-                saw.load(Ordering::Relaxed),
+                after > before,
                 "{name} took no WriteWatch guard, so a stall in it is invisible to the watchdog \
                  and the stall ceiling is dead code for that path"
             );

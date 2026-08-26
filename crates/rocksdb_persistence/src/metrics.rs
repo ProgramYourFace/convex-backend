@@ -97,9 +97,6 @@ register_convex_gauge!(
     "Seconds since the RocksDB health poller last completed a pass"
 );
 
-/// The signal a stall actually produces. A write RocksDB cannot make progress
-/// for blocks rather than failing, so no error counter moves and no `Result` is
-/// ever returned — only this number grows.
 /// Age of the oldest write still in flight, or zero when none is.
 ///
 /// The signal a stall actually produces. A wedged volume does not fail writes,

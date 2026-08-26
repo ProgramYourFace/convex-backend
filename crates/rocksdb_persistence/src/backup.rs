@@ -607,9 +607,13 @@ impl BackupWorker {
             // `join` panics). Signalling is enough in that case: the loop is
             // already unwinding.
             if handle.thread().id() == std::thread::current().id() {
-                // Dropping the handle here would detach the thread, which is
-                // fine — it is this thread, and it is already unwinding out of
-                // the loop. Joining it would deadlock.
+                // Joining this thread from this thread would deadlock, so the
+                // handle is detached instead. That is a last resort, not a
+                // design: it leaves work running past the caller's return, and
+                // when `Inner::drop` used to reach here it left the engine
+                // closing on a detached thread after `drop` had returned. The
+                // owning handle now stops the workers before any of that is
+                // reachable — see `RocksDbPersistence::drop`.
                 drop(handle);
             } else {
                 let _ = handle.join();

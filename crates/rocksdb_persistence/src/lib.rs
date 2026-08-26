@@ -202,6 +202,54 @@ impl Default for OpenOptions {
 /// An embedded RocksDB [`Persistence`].
 pub struct RocksDbPersistence {
     pub(crate) inner: Arc<Inner>,
+    /// Whether this handle is the one that opened the database, and so the one
+    /// responsible for stopping its background workers.
+    ///
+    /// Readers made by [`Persistence::reader`] share the same [`Inner`] and set
+    /// this false: a reader going away must not stop the writer's workers, and
+    /// a reader outliving the writer keeps the engine open for reads after they
+    /// have been stopped.
+    owns_workers: bool,
+}
+
+impl Drop for RocksDbPersistence {
+    fn drop(&mut self) {
+        if !self.owns_workers {
+            return;
+        }
+        // Stop and join the workers *here*, on whatever thread is dropping the
+        // owning handle — which is never a worker thread, because no worker
+        // holds a `RocksDbPersistence`.
+        //
+        // Doing it in `Inner::drop` instead was a real bug. Each worker
+        // upgrades its `Weak<Inner>` to a strong `Arc` for the duration of a
+        // tick, so if the owner released the last other reference inside that
+        // window, `Inner::drop` ran *on the worker's own thread*. `stop()` then
+        // found itself and detached rather than joining — it cannot join
+        // itself — so the owner's `drop` had already returned while that thread
+        // still had the WAL flush and the whole engine close ahead of it.
+        //
+        // Measured at a 200µs flush interval: 17 of 400 open/write/drop/reopen
+        // cycles failed with `LOCK: No locks available`, and the suite
+        // intermittently aborted with `pthread lock: Invalid argument` — glibc
+        // reporting a lock taken on an already-destroyed mutex. In
+        // `SyncMode::Interval` an orderly exit could also finish before that
+        // deferred `flush_wal`, losing exactly the acknowledged writes
+        // `Inner::drop` exists to protect.
+        //
+        // Joining from here makes that unreachable rather than unlikely: once
+        // these return, no worker holds a reference, so the `Arc<Inner>`
+        // released below can only reach zero on this thread.
+        if let Some(monitor) = self.inner.health.get() {
+            monitor.stop();
+        }
+        if let Some(worker) = self.inner.backup_worker.get() {
+            worker.stop();
+        }
+        if let Some(flusher) = self.inner.wal_flusher.get() {
+            flusher.stop();
+        }
+    }
 }
 
 pub(crate) struct Inner {
@@ -333,6 +381,7 @@ impl RocksDbPersistence {
         db.try_catch_up_with_primary()?;
         check_format_version(&db, path, false)?;
         Ok(Self {
+            owns_workers: true,
             inner: Arc::new(Inner {
                 db,
                 newly_created: false,
@@ -451,7 +500,10 @@ impl RocksDbPersistence {
             let _ = inner.health.set(monitor);
         }
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            owns_workers: true,
+        })
     }
 }
 
@@ -474,6 +526,11 @@ impl RocksDbPersistence {
 /// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
 impl Drop for Inner {
     fn drop(&mut self) {
+        // The workers are stopped by `RocksDbPersistence::drop`, not here — see
+        // the note there for why doing it in this function was a bug. These
+        // calls remain as a backstop for an `Inner` built without an owning
+        // handle, and are idempotent no-ops on the normal path, where the
+        // handles have already been taken and joined.
         if let Some(monitor) = self.health.get() {
             monitor.stop();
         }
@@ -848,6 +905,7 @@ impl Persistence for RocksDbPersistence {
     fn reader(&self) -> Arc<dyn PersistenceReader> {
         Arc::new(RocksDbPersistence {
             inner: self.inner.clone(),
+            owns_workers: false,
         })
     }
 
@@ -972,6 +1030,11 @@ impl Persistence for RocksDbPersistence {
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
                 let _guard = inner.write_watch.begin();
+                // Collapse to the highest expired timestamp per document: one
+                // id can be named more than once across the input, and each
+                // revision must count once — which is what Postgres's
+                // `DELETE ... WHERE (a) OR (b)` does, since a row matched by
+                // two clauses is still one deleted row.
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
                 for (ts, id) in documents {
                     highest_expired

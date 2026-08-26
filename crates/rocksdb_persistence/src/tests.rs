@@ -62,7 +62,11 @@ use value::{
 use crate::{
     backup,
     keys,
-    options::SyncMode,
+    options::{
+        self,
+        SyncMode,
+    },
+    OpenOptions,
     RocksDbPersistence,
 };
 
@@ -1955,5 +1959,62 @@ async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<
         "a retry after a failed shutdown must not report success: the guard latched before the \
          flush, so this returns Ok having flushed nothing"
     );
+    Ok(())
+}
+
+/// Dropping the persistence must close the database before `drop` returns, so
+/// the very next open of the same path succeeds.
+///
+/// This is the shape of a real teardown-and-reopen — a restore, a restart into
+/// the same volume, a test harness — and it used to be a race. Each worker
+/// upgrades its `Weak<Inner>` to a strong `Arc` for the duration of a tick, so
+/// when the owner released the last other reference inside that window,
+/// `Inner::drop` ran on the worker's own thread, `stop()` detached rather than
+/// joined itself, and the owner's `drop` returned with the engine still open on
+/// a thread nobody held a handle to. Measured at 17 failures in 400 cycles
+/// before the fix, with `LOCK: No locks available`, and an intermittent
+/// `pthread lock: Invalid argument` abort from locking a destroyed mutex.
+///
+/// The interval is deliberately tiny so the flusher is almost always mid-tick,
+/// which is what makes the race reachable at all: at a long interval the
+/// flusher is parked in `park()` holding nothing, and the bug never appears.
+#[tokio::test]
+async fn dropping_the_persistence_closes_the_database_before_it_returns() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+
+    for round in 0..120 {
+        let persistence = RocksDbPersistence::open_with(
+            &path,
+            OpenOptions {
+                sync: Some(options::SyncMode::Interval(Duration::from_micros(200))),
+                shutdown: None,
+                background: true,
+            },
+        )?;
+        // Enough work that a flush tick lands inside the window.
+        let documents: Vec<_> = (0..64u32)
+            .map(|n| {
+                Ok(DocumentLogEntry {
+                    ts: ts(round + 1),
+                    id: doc_id(1, n),
+                    value: Some(document(1, n, "body")?),
+                    prev_ts: None,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        persistence
+            .write(&documents, &[], ConflictStrategy::Overwrite)
+            .await?;
+        drop(persistence);
+
+        // No sleep, no retry: `drop` returning is the contract under test.
+        RocksDbPersistence::open_with(&path, OpenOptions::default()).map_err(|e| {
+            anyhow::anyhow!(
+                "round {round}: reopening immediately after drop failed, so drop returned before \
+                 the engine was closed: {e}"
+            )
+        })?;
+    }
     Ok(())
 }
