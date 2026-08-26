@@ -300,9 +300,12 @@ async fn check_refuses_a_backup_directory_and_names_the_right_verb() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db");
     let backups = dir.path().join("backup");
-    // A real backup directory, not an empty one — otherwise this passes through
-    // the missing-`CURRENT` branch without ever meeting the shape it is named
-    // for.
+    // A real backup directory rather than an empty one. It takes the same
+    // branch either way — a `BackupEngine` directory holds `meta/`, `private/`
+    // and `shared/`, and the backed-up `CURRENT` lives at `private/<id>/`, so
+    // there is no top-level `CURRENT` for `check` to find — but the point is
+    // that the operator's actual mistake is pointing `check` at a directory
+    // full of backups, and that is what this now hands it.
     {
         let persistence = RocksDbPersistence::new(&db).expect("failed to create the database");
         populate(&persistence).await.expect("failed to write");

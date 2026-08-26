@@ -449,6 +449,12 @@ impl RocksDbPersistence {
             _secondary_scratch: None,
         });
 
+        // A probe file only survives if the process died between the fsync and
+        // the unlink, so it is always stale. Left alone it is an unexplained
+        // file in the operator's data directory that `is_rocksdb_artifact`
+        // deliberately refuses to recognise.
+        let _ = std::fs::remove_file(path.join(reader::PROBE_FILE));
+
         // Minted here, by the writer, rather than lazily on the first backup.
         // A secondary cannot mint it, because a secondary cannot write, and a
         // restored database has to carry an identity forward to continue its

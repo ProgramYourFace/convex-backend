@@ -139,7 +139,12 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
     chmod +x /usr/bin/npx
 COPY --from=build --chmod=744 /convex/convex-local-backend .
 COPY --from=build --chmod=744 /convex/generate_key .
-COPY --from=build --chmod=744 /convex/rocksdb-backup .
+COPY --from=build --chmod=755 /convex/rocksdb-backup .
+# On PATH and group/other-executable, because the documented commands are bare
+# (`rocksdb-backup check --db …`) and a backup CronJob normally runs as a
+# non-root user under a restricted PodSecurity policy — 744 would not be
+# executable for it.
+RUN ln -s /convex/rocksdb-backup /usr/local/bin/rocksdb-backup
 COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
 COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
 COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .

@@ -45,7 +45,10 @@ use common::{
         TimestampRange,
     },
     query::Order,
-    runtime::CoopStreamExt as _,
+    runtime::{
+        tokio_spawn_blocking,
+        CoopStreamExt as _,
+    },
     try_anyhow,
     types::{
         IndexId,
@@ -78,14 +81,50 @@ use serde_json::Value as JsonValue;
 // we can't really make queries concurrent.
 pub struct SqlitePersistence {
     inner: Arc<Mutex<Inner>>,
+    /// Where to write the storage probe, or `None` when there is no file.
+    ///
+    /// Deliberately outside the mutex: the probe is reachable from an
+    /// unauthenticated liveness endpoint and must not contend with the lock
+    /// every query and commit takes.
+    probe_directory: Option<PathBuf>,
 }
 
 struct Inner {
     newly_created: bool,
     connection: Connection,
-    /// Where the database file lives, for [`PersistenceReader::check_storage`].
-    /// `None` for `:memory:`, which has no device to check.
-    path: Option<PathBuf>,
+}
+
+/// Which directory to write the storage probe into, or `None` when the spec
+/// names no file on disk.
+///
+/// `Connection::open` uses `OpenFlags::default()`, which includes
+/// `SQLITE_OPEN_URI`, so `:memory:` is not the only spelling that produces a
+/// database with no file. Getting this wrong is not harmless: the probe would
+/// write into the process's working directory and report the health of whatever
+/// filesystem *that* is — a health check that passes while the real storage is
+/// gone.
+fn probe_directory(path: &str) -> Option<PathBuf> {
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    if let Some(uri) = path.strip_prefix("file:") {
+        let (file, query) = uri.split_once('?').unwrap_or((uri, ""));
+        if file.is_empty() || file == ":memory:" || query.contains("mode=memory") {
+            return None;
+        }
+        return directory_of(file);
+    }
+    directory_of(path)
+}
+
+fn directory_of(path: &str) -> Option<PathBuf> {
+    // `Path::new("db.sqlite3").parent()` is `Some("")`, not `None`, so a bare
+    // filename has to be mapped to the working directory explicitly.
+    match Path::new(path).parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        Some(parent) => Some(parent.to_path_buf()),
+        None => None,
+    }
 }
 
 impl SqlitePersistence {
@@ -100,8 +139,8 @@ impl SqlitePersistence {
             inner: Arc::new(Mutex::new(Inner {
                 newly_created,
                 connection,
-                path: (path != ":memory:").then(|| PathBuf::from(path)),
             })),
+            probe_directory: probe_directory(path),
         })
     }
 
@@ -260,6 +299,7 @@ impl Persistence for SqlitePersistence {
     fn reader(&self) -> Arc<dyn PersistenceReader> {
         Arc::new(Self {
             inner: self.inner.clone(),
+            probe_directory: self.probe_directory.clone(),
         })
     }
 
@@ -633,24 +673,33 @@ impl PersistenceReader for SqlitePersistence {
     async fn check_storage(&self) -> anyhow::Result<()> {
         use std::io::Write as _;
 
-        let Some(path) = self.inner.lock().path.clone() else {
+        let Some(directory) = self.probe_directory.clone() else {
             return Ok(());
         };
-        let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let probe = directory.join("convex-storage-probe");
-        let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&probe)?;
-            file.write_all(b"convex storage probe\n")?;
-            file.sync_all()
-        })();
-        let _ = std::fs::remove_file(&probe);
-        written.with_context(|| {
-            format!(
-                "cannot write beside the database at {}",
-                directory.display()
-            )
-        })?;
-        Ok(())
+        // On the blocking pool, for the reason the probe exists: it is designed
+        // to be reached when I/O does not return. Run inline it would park a
+        // runtime worker rather than a blocking thread, and since the endpoint
+        // is unauthenticated with 128 requests allowed in flight, a wedged
+        // volume would take out the whole reactor — at which point the process
+        // can serve nothing at all, including the failure it is being killed
+        // for.
+        tokio_spawn_blocking("sqlite_check_storage", move || -> anyhow::Result<()> {
+            let probe = directory.join("convex-storage-probe");
+            let written = (|| -> std::io::Result<()> {
+                let mut file = std::fs::File::create(&probe)?;
+                file.write_all(b"convex storage probe\n")?;
+                file.sync_all()
+            })();
+            let _ = std::fs::remove_file(&probe);
+            written.with_context(|| {
+                format!(
+                    "cannot write beside the database at {}",
+                    directory.display()
+                )
+            })?;
+            Ok(())
+        })
+        .await?
     }
 
     fn version(&self) -> PersistenceVersion {
@@ -802,3 +851,74 @@ WHERE
     ts = $3
 ORDER BY ts ASC, table_id ASC, id ASC
 "#;
+
+#[cfg(test)]
+mod tests {
+    use common::persistence::PersistenceReader as _;
+
+    use super::{
+        probe_directory,
+        SqlitePersistence,
+    };
+
+    /// The probe has to write beside the *database*, and has to know when there
+    /// is no database file at all.
+    ///
+    /// `Connection::open` enables `SQLITE_OPEN_URI`, so `:memory:` is not the
+    /// only spelling with no file. Getting this wrong writes the probe into the
+    /// process's working directory and reports the health of whatever
+    /// filesystem that is — a check that passes while the real storage is gone.
+    #[test]
+    fn probe_directory_follows_the_database() {
+        for spec in [
+            ":memory:",
+            "",
+            "file::memory:",
+            "file:x?mode=memory&cache=shared",
+        ] {
+            assert_eq!(probe_directory(spec), None, "{spec} names no file");
+        }
+        assert_eq!(
+            probe_directory("/convex/data/db.sqlite3"),
+            Some("/convex/data".into()),
+        );
+        assert_eq!(
+            probe_directory("file:/convex/data/db.sqlite3"),
+            Some("/convex/data".into())
+        );
+        // A bare filename's parent is `Some("")`, not `None`.
+        assert_eq!(probe_directory("db.sqlite3"), Some(".".into()));
+    }
+
+    /// SQLite is file-backed, so it has RocksDB's failure: on a wedged mount a
+    /// write blocks rather than erroring. The probe must therefore actually
+    /// write — a read or a `stat` is answered from cache, which is how the
+    /// RocksDB probe shipped broken twice.
+    #[tokio::test]
+    async fn check_storage_actually_writes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("db.sqlite3");
+        let persistence = SqlitePersistence::new(db.to_str().unwrap())?;
+        persistence.check_storage().await?;
+
+        // Nothing accumulates.
+        assert!(!dir.path().join("convex-storage-probe").exists());
+
+        // Occupying the probe's path fails a write and not a read.
+        std::fs::create_dir(dir.path().join("convex-storage-probe"))?;
+        assert!(
+            persistence.check_storage().await.is_err(),
+            "the probe must fail when it cannot create its file",
+        );
+        Ok(())
+    }
+
+    /// An in-memory database has no device, and must not report on the working
+    /// directory's instead.
+    #[tokio::test]
+    async fn check_storage_is_a_no_op_in_memory() -> anyhow::Result<()> {
+        let persistence = SqlitePersistence::new(":memory:")?;
+        persistence.check_storage().await?;
+        Ok(())
+    }
+}

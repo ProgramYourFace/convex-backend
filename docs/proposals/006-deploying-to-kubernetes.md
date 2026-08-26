@@ -111,7 +111,8 @@ So `PersistenceReader::check_storage` **writes**. On RocksDB it creates one smal
 the data directory, fsyncs it, and removes it, on the blocking pool. That blocks on a hung
 mount of any kind, and it fails with `EROFS` on a volume remounted read-only — which
 nothing else here catches, since reads keep succeeding and the write escalation needs five
-*attempted* writes. It deliberately takes no RocksDB lock: `flush_wal(true)` would hold
+*consecutive failed* writes — 5 to 10 hours on a read-mostly cell, where the only writes
+are the committer's idle bump. It deliberately takes no RocksDB lock: `flush_wal(true)` would hold
 `log_write_mutex_` and wait on the condition variable the commit path waits on, and this
 endpoint is unauthenticated, so it must not be able to put load on commits.
 
@@ -131,13 +132,22 @@ a projected-Secret refresh racing the probe — into a restart every two minutes
 restarting cannot fix. An earlier revision of this document recommended exactly that,
 against `/api/list_snapshot`.
 
-The cost is one small file written, fsynced and removed every 30 s, fixed: it does not
-grow with the database, allocates no iterator, and books no usage.
+The cost is one 21-byte file written, fsynced and removed every 30 s. Fixed in *size* —
+it allocates no iterator, books no usage, and does not grow with the database — but not
+fixed in latency: on ext4 with the default `data=ordered`, an fsync commits the running
+journal transaction, which first writes back the ordered data buffers attached to it. So
+the probe's duration tracks the cell's write rate. Size `timeoutSeconds` against a busy
+cell, not an idle one.
 
 Being unauthenticated, it is also reachable by anyone who can reach the port, and each
-request occupies a blocking-pool thread and one of the 128 concurrency permits. Do not
-expose port 3210 beyond the cluster, and keep `failureThreshold` at 4 or higher so a
-transient saturation cannot restart a healthy pod.
+request costs a blocking-pool thread, one of the 128 concurrency permits, and a device
+flush. Do not expose port 3210 beyond the cluster, and keep `failureThreshold` at 4 or
+higher so a transient saturation cannot restart a healthy pod.
+
+**One configuration where this is not a check at all:** a data directory on `tmpfs` —
+`emptyDir: {medium: Memory}`. `fsync` there is a no-op, so the probe proves nothing. There
+is also no device to wedge, so nothing is lost; it is worth knowing before reading a green
+probe as evidence about storage.
 
 **`timeoutSeconds` is not optional.** Kubernetes defaults it to **1 second**. (An earlier
 revision of this section claimed the probe would otherwise inherit
@@ -169,9 +179,9 @@ clock, but it means the server-side timeout cannot be relied on to bound the pro
 ### What this does not cover
 
 **A volume that has gone read-only** *is* caught, because the probe is a write — this is
-what it adds over anything read-based. The in-process escalation covers it too, but only
-after five *attempted* writes, which a read-mostly cell will not produce for up to two
-hours (§2a).
+what it adds over anything read-based. The in-process escalation covers it too, but it
+needs five *consecutive failed* writes, and on a read-mostly cell the only writes are the
+committer's idle bump at 1–2 h apart: 5 to 10 hours (§2a).
 
 **A read-mostly cell.** On a cell with no user mutations the only persistence write is the
 committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and
@@ -392,9 +402,10 @@ change it when you restore into a new cell.
   dependency (`get-convex/saffron`, a GitHub tarball) is unreachable through this
   environment's proxy. `Database::check_storage`, which holds the actual logic,
   does compile. Build the backend before relying on the manifest above.
-- **No metric counts failed engine writes** (§2a), so the intermittent-fault case
-  the counter deliberately does not escalate is also invisible. One counter in
-  `engine_write`'s error arm would close it.
+- **A secondary's probe is weaker than a primary's.** A read replica cannot write
+  into the primary's directory, so its check drops `CURRENT`'s page cache and
+  re-reads it. `POSIX_FADV_DONTNEED` is advisory, and the read cannot detect a
+  read-only remount. Nothing in this tree opens a secondary reader today.
 - **`Persistence::shutdown()` is dead** (§4). Wiring SIGTERM to it would make
   restarts clean and shrink §4's window considerably — but it also changes the
   teardown path, which is where several defects have lived, so it wants its own

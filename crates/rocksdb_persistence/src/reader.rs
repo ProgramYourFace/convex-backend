@@ -26,14 +26,11 @@ use std::{
         BTreeSet,
     },
     io::Write as _,
+    os::unix::io::AsRawFd as _,
     sync::Arc,
 };
 
 use anyhow::Context as _;
-
-/// The file `check_storage` writes and removes. Named so that finding one left
-/// behind — which only happens if the process died mid-probe — says what it is.
-const PROBE_FILE: &str = "convex-storage-probe";
 use async_trait::async_trait;
 use common::{
     index::{
@@ -74,6 +71,10 @@ use futures::StreamExt;
 use futures_async_stream::try_stream;
 use serde::Deserialize as _;
 use serde_json::Value as JsonValue;
+
+/// The file `check_storage` writes and removes. Named so that finding one left
+/// behind — which only happens if the process died mid-probe — says what it is.
+pub(crate) const PROBE_FILE: &str = "convex-storage-probe";
 
 use crate::{
     codec,
@@ -877,11 +878,32 @@ impl PersistenceReader for RocksDbPersistence {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_check_storage", move || -> anyhow::Result<()> {
             // A secondary does not own the directory and must not write into
-            // it. Reading the primary's `CURRENT` is the closest equivalent: a
-            // real file read, on the same volume, of a file small enough that
-            // its cost never grows.
+            // it, so it cannot use the probe below. What it must *not* do is
+            // read `CURRENT` and call that a device check: that file is ~16
+            // bytes, was read during `open_secondary`, and its page, inode and
+            // dentry have been resident ever since. A plain read of it is
+            // answered entirely from memory — the same defect as the two probes
+            // this one replaced, for the third time.
+            //
+            // So drop the cached page first. `POSIX_FADV_DONTNEED` on a clean
+            // file evicts its pages, and the read that follows has to go to the
+            // device. It is advisory, so this is weaker than the primary's
+            // write — it cannot detect a read-only remount, and a filesystem
+            // that ignores the hint makes it a cache hit again — but it is the
+            // strongest thing available to a process that is not allowed to
+            // write here.
             if inner.secondary {
-                std::fs::read(inner.path.join("CURRENT")).with_context(|| {
+                let current = inner.path.join("CURRENT");
+                let file = std::fs::File::open(&current).with_context(|| {
+                    format!("cannot open the database at {}", inner.path.display())
+                })?;
+                // Safe: `fd` is owned by `file` and outlives the call, and
+                // `posix_fadvise` only ever advises.
+                unsafe {
+                    libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                }
+                drop(file);
+                std::fs::read(&current).with_context(|| {
                     format!("cannot read the database at {}", inner.path.display())
                 })?;
                 return Ok(());

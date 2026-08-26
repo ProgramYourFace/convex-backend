@@ -2335,3 +2335,64 @@ async fn check_storage_fails_on_a_read_only_directory() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Opening a database clears a probe file a previous process died holding.
+///
+/// It can only exist if the process was killed between the fsync and the
+/// unlink, so it is always stale — and left behind it is an unexplained file in
+/// the operator's data directory that `is_rocksdb_artifact` deliberately
+/// refuses to recognise.
+#[tokio::test]
+async fn opening_sweeps_a_stale_probe_file() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    drop(RocksDbPersistence::new(&db_path)?);
+
+    let stale = db_path.join("convex-storage-probe");
+    std::fs::write(&stale, b"left by a killed process")?;
+    let persistence = RocksDbPersistence::new(&db_path)?;
+    assert!(!stale.exists(), "a stale probe file survived the next open",);
+    persistence.check_storage().await?;
+    Ok(())
+}
+
+/// A secondary cannot write into the primary's directory, so its probe is a
+/// read — and this pins that asymmetry rather than letting it be discovered.
+///
+/// The read is preceded by `POSIX_FADV_DONTNEED` so it has to go back to the
+/// device, but that is advisory: unlike the primary's write, it cannot detect a
+/// volume remounted read-only. A read-only directory is exactly the case that
+/// separates them, so it is what this asserts.
+#[tokio::test]
+async fn a_secondary_probes_by_reading_and_a_primary_by_writing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let primary = RocksDbPersistence::new(&db_path)?;
+    primary
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[],
+            ConflictStrategy::Error,
+        )
+        .await?;
+    primary.check_storage().await?;
+
+    let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
+    secondary
+        .check_storage()
+        .await
+        .expect("a secondary must be able to probe a healthy database");
+
+    // Occupying the probe's path is what the primary's write trips over. The
+    // secondary never writes, so it is unaffected — which is the asymmetry.
+    std::fs::create_dir(db_path.join("convex-storage-probe"))?;
+    assert!(
+        primary.check_storage().await.is_err(),
+        "the primary probes by writing, so it must fail here",
+    );
+    secondary
+        .check_storage()
+        .await
+        .expect("the secondary probes by reading, so it is unaffected");
+    Ok(())
+}
