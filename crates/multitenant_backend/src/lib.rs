@@ -85,6 +85,12 @@ use runtime::prod::ProdRuntime;
 
 use crate::api::MultitenantApplicationApi;
 
+// Release-mode layout computation of the deeply nested async blocks behind
+// `ApplicationApi::execute_public_query` overflows the default query depth
+// ("queries overflow the depth limit!", first release build 2026-08-26);
+// dev/test profiles never hit it because they don't compute those layouts.
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod config;
 pub mod host;
