@@ -340,15 +340,23 @@ fn engine_is_applying_backpressure(inner: &Inner, progress: &mut Progress, now: 
             .flatten()
             .unwrap_or(0)
     };
-    // Explicit throttling by the write controller. This drains by construction,
-    // and needs no corroboration.
-    if property("rocksdb.is-write-stopped") > 0 || property("rocksdb.actual-delayed-write-rate") > 0
-    {
-        return true;
-    }
+    // The write controller's stop and delay tokens are latched levels, not
+    // self-draining ones: they are only ever reassigned by
+    // `RecalculateWriteStallConditions`, which RocksDB calls from
+    // `InstallSuperVersion` — that is, when a flush or compaction *completes*.
+    // On a volume that has stopped making progress nothing installs a
+    // superversion, so a token taken while compaction was merely falling
+    // behind is never released and the property reads throttled forever. That
+    // is the same trap `num-running-*` sets, and a degrading disk is likely to
+    // be holding one of these tokens at the moment it finally wedges.
+    let controller = property("rocksdb.is-write-stopped") > 0
+        || property("rocksdb.actual-delayed-write-rate") > 0;
     let running = property("rocksdb.num-running-flushes") > 0
         || property("rocksdb.num-running-compactions") > 0;
-    running && progress.completing_work(inner, now)
+    // So no engine self-report excuses a stalled write on its own. Each is a
+    // reason writes might be held back; only a moving superversion says the
+    // backlog they are waiting on is actually draining.
+    (controller || progress.job_seen_recently(running, now)) && progress.completing_work(inner, now)
 }
 
 /// Tracks whether RocksDB's background machinery is still completing work.
@@ -358,6 +366,7 @@ fn engine_is_applying_backpressure(inner: &Inner, progress: &mut Progress, now: 
 pub(crate) struct Progress {
     last_super_version: Option<u64>,
     last_advance: Instant,
+    last_job_seen: Option<Instant>,
 }
 
 impl Progress {
@@ -365,7 +374,25 @@ impl Progress {
         Self {
             last_super_version: None,
             last_advance: now,
+            last_job_seen: None,
         }
+    }
+
+    /// Whether a background job has been observed open inside the stall budget.
+    ///
+    /// `num-running-*` is an instantaneous sample, and its partner here is a
+    /// window. Measured against sustained ingest through this crate's own
+    /// configuration, a job is open in under 10% of samples on a busy engine —
+    /// so comparing an instant against a window would let a 15-second poll
+    /// decide, by whether it happened to land inside a flush, that a
+    /// legitimately backpressured writer was a hang. Both halves are windowed
+    /// so they answer the same question over the same span.
+    fn job_seen_recently(&mut self, running_now: bool, now: Instant) -> bool {
+        if running_now {
+            self.last_job_seen = Some(now);
+        }
+        self.last_job_seen
+            .is_some_and(|seen| now.saturating_duration_since(seen) < *options::WRITE_STALL_TIMEOUT)
     }
 
     /// Whether a flush or compaction has completed inside the stall budget.
@@ -552,6 +579,37 @@ mod progress_tests {
             !progress.completing_work(inner, stale),
             "an engine that has completed no background work for longer than the stall timeout \
              must not read as backpressure"
+        );
+
+        // The write controller's own report cannot excuse a stall either. Round
+        // 6 hardened the background-job branch and left this one returning
+        // `true` outright, on the reasoning that throttling "drains by
+        // construction" — but the stop and delay tokens are released only by
+        // `RecalculateWriteStallConditions`, which runs from
+        // `InstallSuperVersion`. A volume that has stopped completing work
+        // never releases them, so the branch latched on precisely the hang it
+        // was supposed to let through. Both halves now require a moving
+        // superversion; this asserts the conjunction, not the branch, so it
+        // fails if either half is ever restored to an unconditional `true`.
+        assert!(
+            !progress.completing_work(inner, stale),
+            "no engine self-report may excuse a stall while the superversion is frozen"
+        );
+
+        // A background job observed open is remembered for the stall budget
+        // rather than sampled at an instant, so a poll that lands between two
+        // flushes on a busy engine does not read as a hang.
+        assert!(progress.job_seen_recently(true, stale));
+        assert!(
+            progress.job_seen_recently(false, stale + Duration::from_secs(1)),
+            "a job seen inside the budget must still count a moment later"
+        );
+        assert!(
+            !progress.job_seen_recently(
+                false,
+                stale + *options::WRITE_STALL_TIMEOUT + Duration::from_secs(1)
+            ),
+            "a job last seen longer ago than the stall budget must not still count"
         );
 
         // A completed flush installs a new superversion, which restarts the

@@ -226,6 +226,9 @@ pub(crate) struct Inner {
     health: std::sync::OnceLock<health::HealthMonitor>,
     /// In-flight write durations, so a stalled write is visible as a level.
     pub(crate) write_watch: health::WriteWatch,
+    /// Latched by the first `shutdown()`, so a second is a no-op rather than an
+    /// error. See the note there.
+    shutdown_done: std::sync::atomic::AtomicBool,
 }
 
 impl RocksDbPersistence {
@@ -309,6 +312,7 @@ impl RocksDbPersistence {
                 backup_worker: std::sync::OnceLock::new(),
                 health: std::sync::OnceLock::new(),
                 write_watch: health::WriteWatch::default(),
+                shutdown_done: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -376,6 +380,7 @@ impl RocksDbPersistence {
             backup_worker: std::sync::OnceLock::new(),
             health: std::sync::OnceLock::new(),
             write_watch: health::WriteWatch::default(),
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
         });
 
         if opts.background
@@ -984,10 +989,14 @@ impl Persistence for RocksDbPersistence {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
             let _guard = inner.write_watch.begin();
-            // `atomic_flush` routes any single-family flush through
-            // `AtomicFlushMemTables` over all of them, so the first call does
-            // the work and the rest are near-no-ops. Kept as a loop only
-            // because the binding exposes no multi-family flush.
+            // Every family, explicitly. `atomic_flush` does *not* widen a
+            // single-family flush: `DBImpl::Flush` passes a one-element
+            // candidate list into `SelectColumnFamiliesForAtomicFlush`, so
+            // flushing `dlog` leaves the other four memtables where they are.
+            // (The backup path's flush is different, and genuinely does cover
+            // every family — `GetLiveFilesStorageInfo` selects with no
+            // candidate list at all.) This loop is doing the work, not
+            // repeating it.
             for name in ALL_COLUMN_FAMILIES {
                 inner.db.flush_cf(&inner.cf(name)?)?;
             }
@@ -1000,6 +1009,18 @@ impl Persistence for RocksDbPersistence {
     async fn shutdown(&self) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_shutdown", move || -> anyhow::Result<()> {
+            // Idempotent, because the trait's default is: the relational
+            // backends inherit a no-op, so a deployment that wires SIGTERM to
+            // `shutdown()` alongside an existing teardown path can call this
+            // twice and must not get an error on the second. It would:
+            // `cancel_all_background_work` sets RocksDB's `shutting_down_`
+            // flag, after which every `flush_cf` returns `ShutdownInProgress`.
+            if inner
+                .shutdown_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             // Stop the background threads before touching the database, so
             // neither a timed flush nor a backup can land in the middle of the
             // close below. The `flush_wal` that follows covers whatever the

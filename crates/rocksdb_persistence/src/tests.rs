@@ -1906,3 +1906,24 @@ async fn empty_writes_are_accepted() -> anyhow::Result<()> {
     assert!(f.log(TimestampRange::all(), Order::Asc).await?.is_empty());
     Ok(())
 }
+
+/// `Persistence::shutdown` must be idempotent, because the trait's default is:
+/// the relational backends inherit a no-op. `cancel_all_background_work` sets
+/// RocksDB's `shutting_down_` flag, after which every `flush_cf` fails with
+/// `ShutdownInProgress` — so a deployment wiring SIGTERM to `shutdown()`
+/// alongside an existing teardown path used to get an error on the second call.
+#[tokio::test]
+async fn shutdown_is_idempotent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+    persistence.shutdown().await?;
+    persistence
+        .shutdown()
+        .await
+        .expect("a second shutdown must succeed");
+    persistence
+        .shutdown()
+        .await
+        .expect("and a third, for good measure");
+    Ok(())
+}
