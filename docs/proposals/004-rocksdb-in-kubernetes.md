@@ -23,7 +23,7 @@ items below need action rather than tuning:
 | §2 | The relay checkpoint stops sharing a durability domain with Convex | **correctness** | rule below; keep `ROCKSDB_SYNC_WRITES=true` |
 | §3 | Memory is one budget, and RocksDB reads no cgroup limit | **bug** | fixed: the cache is derived from the container limit |
 | §4 | Crash recovery stops being unbounded | win | no action |
-| §4b | No Postgres lease: a wedged volume costs up to 20 min, not seconds | **regression vs PG** | in-process ceiling; no HTTP probe can see a wedge today |
+| §4b | No Postgres lease, so a wedged volume needs the orchestrator to notice | superseded | see [006](./006-deploying-to-kubernetes.md) §2 — the in-process ceiling was deleted; the probe exists |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
 | §6 | No backup or point-in-time restore | **gap** | backup/restore/rehearsal implemented per [005](./005-backup-and-restore.md); no PITR, and none possible at this layer |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |

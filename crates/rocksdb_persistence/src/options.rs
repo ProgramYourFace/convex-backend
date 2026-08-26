@@ -181,9 +181,8 @@ fn explicit_cache_bytes() -> Option<usize> {
 /// as *disabled*, not as zero, so setting it to 0 to "turn the buffer off"
 /// removes the cross-column-family memtable ceiling entirely and leaves memory
 /// bounded only by `MEMTABLE_BYTES * max_write_buffer_number * 5`.
-pub static WRITE_BUFFER_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    env_config("ROCKSDB_WRITE_BUFFER_BYTES", *BLOCK_CACHE_BYTES / 4).max(8 << 20)
-});
+pub static WRITE_BUFFER_BYTES: LazyLock<usize> =
+    LazyLock::new(|| env_config("ROCKSDB_WRITE_BUFFER_BYTES", *BLOCK_CACHE_BYTES / 4).max(8 << 20));
 
 /// Per-column-family memtable size, in bytes.
 /// Floored: RocksDB's own sanitiser clamps `write_buffer_size` up to 64 KiB
@@ -226,9 +225,9 @@ pub static SCAN_PAGE_ROWS: LazyLock<usize> =
 /// `open` is always called with `create_if_missing`, which is right for a first
 /// boot and dangerous afterwards: if the PVC fails to bind, a `subPath` is
 /// mistyped, or the volume is re-provisioned, the path resolves to an empty
-/// directory, RocksDB creates a fresh database, `Database::initialize` runs, and
-/// the cell comes up **healthy and empty**. Every probe passes. Set this on a
-/// cell whose volume already holds data and that failure becomes a refusal to
+/// directory, RocksDB creates a fresh database, `Database::initialize` runs,
+/// and the cell comes up **healthy and empty**. Every probe passes. Set this on
+/// a cell whose volume already holds data and that failure becomes a refusal to
 /// start.
 pub static REQUIRE_EXISTING: LazyLock<bool> =
     LazyLock::new(|| env_config("ROCKSDB_REQUIRE_EXISTING", false));
@@ -259,6 +258,59 @@ pub static WRITE_FAILURES_TO_ESCALATE: LazyLock<u32> =
 pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64).clamp(1, 300))
 });
+
+/// Which WAL recovery mode to open with, defaulting by sync mode.
+///
+/// `TolerateCorruptedTailRecords` is right under [`SyncMode::Every`] and wrong
+/// under [`SyncMode::Never`], and RocksDB's own documentation is what says so:
+/// the mode's guarantee holds "as long as `WritableFile::Append()` writes are
+/// durable", which is exactly the property `Never` gives up. Under `Never` an
+/// unsynced region up to `wal_bytes_per_sync` wide is expected to be lost on
+/// host loss — that is the mode's advertised cost — and a header that persisted
+/// without its payload there is an ordinary outcome, not corruption. Refusing
+/// to open for it would turn the documented cost ("whatever the OS had not
+/// written") into a database that will not start.
+///
+/// So the default follows the durability contract the operator chose, and
+/// `ROCKSDB_WAL_RECOVERY_MODE` overrides it either way — because without an
+/// override, a cell that hits the strict mode's refusal has no supported way to
+/// say "yes, truncate, I know", and the answer would be to edit the source.
+fn wal_recovery_mode(sync: SyncMode) -> rocksdb::DBRecoveryMode {
+    let default = match sync {
+        SyncMode::Every => "tolerate",
+        SyncMode::Never => "point-in-time",
+    };
+    let configured = env_config("ROCKSDB_WAL_RECOVERY_MODE", default.to_owned());
+    let mode = match configured.as_str() {
+        "tolerate" => rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords,
+        "point-in-time" => rocksdb::DBRecoveryMode::PointInTime,
+        other => {
+            tracing::warn!(
+                "ignoring ROCKSDB_WAL_RECOVERY_MODE={other:?}: expected \"tolerate\" or \
+                 \"point-in-time\". Using {default:?}."
+            );
+            match default {
+                "tolerate" => rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords,
+                _ => rocksdb::DBRecoveryMode::PointInTime,
+            }
+        },
+    };
+    if matches!(mode, rocksdb::DBRecoveryMode::PointInTime) {
+        // Worth saying out loud every time, because the failure it permits is
+        // otherwise invisible: RocksDB logs its truncation at INFO, and since
+        // `MaxRepeatableTimestamp` lives in the same WAL and truncates
+        // alongside, the surviving state is self-consistent and nothing above
+        // this layer can tell that acknowledged commits are missing.
+        tracing::warn!(
+            "rocksdb WAL recovery: point-in-time. A checksum failure inside a WAL will be \
+             recovered from by discarding the rest of it, and every later WAL, without failing \
+             the open — acknowledged commits can be lost undetectably."
+        );
+    } else {
+        tracing::info!("rocksdb WAL recovery: tolerate a torn tail, refuse anything worse");
+    }
+    mode
+}
 
 fn background_jobs() -> i32 {
     match *BACKGROUND_JOBS {
@@ -345,7 +397,7 @@ pub fn build(create_if_missing: bool, sync: SyncMode) -> RocksOptions {
     // operator sees it, and the volume snapshot or backup generation is still
     // there. This is the same bargain Postgres makes when it refuses to start
     // on `invalid record length at ...`.
-    db.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
+    db.set_wal_recovery_mode(wal_recovery_mode(sync));
 
     RocksOptions {
         db,

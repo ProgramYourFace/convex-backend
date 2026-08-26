@@ -14,7 +14,7 @@ COPY rust-toolchain .
 # Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
 RUN rustup self update && rustup toolchain install
 COPY --parents crates* Cargo* ./
-RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
+RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend --bin rocksdb-backup
 
 # Build stage: Compiles the Rust backend with all dependencies
 # Uses cargo-chef's recipe from the previous stage for optimal caching
@@ -99,9 +99,15 @@ cargo build --release -p local_backend --bin convex-local-backend
 cp target/release/convex-local-backend .
 cargo build --release -p keybroker --bin generate_key
 cp target/release/generate_key .
+# The operator side of the RocksDB backend: take a backup, check a restored
+# volume snapshot, restore. Every backup and restore instruction in
+# docs/proposals/005 and 006 runs this, from a CronJob, an init container or a
+# maintenance window, so it has to be in the image they already have.
+cargo build --release -p rocksdb_persistence --bin rocksdb-backup
+cp target/release/rocksdb-backup .
 EOF
 ARG debug
-RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./generate_key; fi
+RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./generate_key; strip ./rocksdb-backup; fi
 
 # Final stage: Creates minimal runtime image with only necessary components
 # Uses Ubuntu Noble (24.04) as the base image
@@ -129,6 +135,7 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
     chmod +x /usr/bin/npx
 COPY --from=build --chmod=744 /convex/convex-local-backend .
 COPY --from=build --chmod=744 /convex/generate_key .
+COPY --from=build --chmod=744 /convex/rocksdb-backup .
 COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
 COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
 COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .

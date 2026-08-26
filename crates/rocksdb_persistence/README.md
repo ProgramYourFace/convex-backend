@@ -82,6 +82,7 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | Knob | Default | Meaning |
 |---|---|---|
 | `ROCKSDB_SYNC_WRITES` | `true` | fsync the WAL before `write` returns |
+| `ROCKSDB_WAL_RECOVERY_MODE` | by sync mode | `tolerate` (refuse to open on a corrupt WAL) or `point-in-time` (truncate and carry on) |
 | `ROCKSDB_CHECK_CONFLICTS` | `true` | enforce `ConflictStrategy::Error` |
 | `ROCKSDB_BLOCK_CACHE_BYTES` | derived from the cgroup limit | cached data, index and filter blocks *and* memtable charge; the largest, but not the only, consumer |
 | `ROCKSDB_BLOCK_CACHE_PERCENT` | 25 | share of the container's memory limit to derive that from, when it is not set explicitly |
@@ -173,14 +174,23 @@ rocksdb-backup backup   /convex/backup --db /convex/data/db   # backend must be 
 rocksdb-backup list     /convex/backup
 rocksdb-backup verify   /convex/backup [--id N]      # check every file is present and sized
 rocksdb-backup rehearse /convex/backup --scratch /tmp/r   # restore and read it
+rocksdb-backup check    --db /clone/db               # read back a restored volume snapshot
 rocksdb-backup restore  /convex/backup --to /convex/data/db
 ```
+
+It is built into the backend image alongside `convex-local-backend`, so the CronJob and
+the init container run the image the deployment already has.
 
 Separate because a restore rewrites a database directory and RocksDB holds that
 directory's lock while a database is open, so it cannot run inside the backend it is
 restoring for — it belongs in an init container or a one-shot job. `restore` refuses a
-non-empty target: move the old directory aside instead, so a live database is never
-written underneath and the current one stays recoverable.
+target that already holds a database: RocksDB renames `CURRENT` into place last,
+deliberately "in case the restore process is interrupted", so its presence means a restore
+finished there. A target holding RocksDB files but *no* `CURRENT` is a restore that was
+killed part-way, and is cleared and retried — otherwise an init container crashloops
+through the whole incident. Anything else is refused rather than guessed about. Move the
+old directory aside, so a live database is never written underneath and the current one
+stays recoverable.
 
 `rehearse` never deletes anything at the path you give it. It restores into a
 uniquely-named subdirectory it creates and removes only that, leaving the rest of the
@@ -282,10 +292,11 @@ timeout layer, and answers `200 OK` in about a millisecond on a wedged volume.
 
 ## Backups
 
-`rocksdb-backup` is a standalone binary with `backup`, `list`, `verify`, `rehearse` and
-`restore`. `backup` and `restore` open the database **read-write**, so the backend must be
-stopped; `list`, `verify` and `rehearse` only read the backup directory and run against a
-live deployment.
+`rocksdb-backup` is a standalone binary with `backup`, `list`, `verify`, `rehearse`,
+`check` and `restore`. `backup`, `check` and `restore` open a database **read-write**, so
+the backend must be stopped — or, for `check`, pointed at a clone that has no writer;
+`list`, `verify` and `rehearse` only read the backup directory and run against a live
+deployment.
 
 ### Backing up a running deployment
 
@@ -294,7 +305,14 @@ write-ahead log before `write` returns, so a crash-consistent snapshot recovers 
 an unclean restart does — which this crate tests directly, with a child process calling
 `_exit(0)` and no destructors at all.
 
-**`rocksdb-backup` cannot substitute for that, and a read-only instance is not a
+`rocksdb-backup check --db <dir>` is how a snapshot gets verified: it is `rehearse`'s
+read-back pointed at a database directory, since every other verb here takes a *backup*
+directory and a snapshot is not one. Provision a PVC from the snapshot, run `check`
+against the database inside it, and delete the clone — that is the whole cycle, and
+[`docs/proposals/005-backup-and-restore.md`](../../docs/proposals/005-backup-and-restore.md) §E
+writes it out as a `CronJob`.
+
+**`rocksdb-backup backup` cannot substitute for that, and a read-only instance is not a
 workaround.** `BackupEngine` copies a file list it has asked the database to hold still,
 and holding it still is `DisableFileDeletions`, which a secondary answers with
 `NotSupported` — RocksDB's comment: *"the secondary instance does not own the database

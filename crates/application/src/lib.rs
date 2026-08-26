@@ -1070,12 +1070,12 @@ impl<RT: Runtime> Application<RT> {
         &self.audit_log_client
     }
 
-
     /// One bounded persistence read, for the storage liveness probe. See
     /// [`Database::check_storage`].
     pub async fn check_storage(&self) -> anyhow::Result<()> {
         self.database.check_storage().await
     }
+
     pub fn now_ts_for_reads(&self) -> RepeatableTimestamp {
         self.database.now_ts_for_reads()
     }

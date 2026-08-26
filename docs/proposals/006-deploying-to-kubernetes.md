@@ -26,7 +26,7 @@ checklist.
 | §4 | `startupProbe` sized for WAL replay | Nothing calls `Persistence::shutdown()`, so every restart is unclean. | **required** |
 | §5 | Volume snapshots + a `check` CronJob | `rocksdb-backup backup` needs the writer stopped; a snapshot needs verifying. | **required** |
 | §6 | Memory limits and the cache | The cache is derived from the cgroup limit; table readers are not. | recommended |
-| §7 | First-boot step on an upgraded volume | The backup identity is minted at open. | one-off |
+| §7 | One backup directory per cell | The identity travels with the data, so a restored or cloned cell shares its parent's chain. | **required** |
 
 ---
 
@@ -92,11 +92,28 @@ livenessProbe:
   failureThreshold: 4      # ~2 min before restart
 ```
 
-It is unauthenticated and it touches storage, and it has to be both.
+It is unauthenticated and it touches the filesystem, and it has to be both.
 
-**Storage-touching**, because that is the entire point: it performs one `globals` point
-get through `PersistenceReader`, on the blocking pool, so on a wedged volume the request
-blocks on the same device the writers are parked on and the probe times out.
+**Filesystem-touching, not a read.** An earlier revision of this probe did one `globals`
+point get, and that was worthless: it read `MaxRepeatableTimestamp`, which the committer
+rewrites every 5 s on any active cell, so it sat in the active memtable and the probe
+answered `200` in microseconds on a volume nothing could reach. No RocksDB read fixes
+that — a cached block, a pinned index, or a bloom-filter miss on an absent key all
+short-circuit before the device.
+
+So `PersistenceReader::check_storage` does not read. On RocksDB it does two things a
+wedged volume cannot complete, both on the blocking pool:
+
+1. `metadata()` on the data directory. A hung mount — NFS, EBS, a disconnected CSI volume
+   — blocks every VFS call against it, in the kernel, before RocksDB is involved. This is
+   the case with no other detector.
+2. `flush_wal(true)`, an fsync of the write-ahead log, which reaches the block layer and
+   is where the parked writers are stuck. Cheap under `SyncMode::Every`, where the WAL is
+   already synced.
+
+The method has a default of `Ok(())` on the trait, so the Postgres and SQLite backends are
+unaffected: their storage is a process on the far side of a socket, where a broken
+connection is already an error rather than a silence.
 
 **Unauthenticated**, because a liveness probe that can fail for any reason other than
 "this process is unwell" is a kill switch. The kubelet has no identity. It cannot read a
@@ -109,8 +126,13 @@ a projected-Secret refresh racing the probe — into a restart every two minutes
 restarting cannot fix. An earlier revision of this document recommended exactly that,
 against `/api/list_snapshot`.
 
-The cost is one point get every 30 s, fixed: it does not grow with the database, allocates
-no iterator, and books no usage.
+The cost is one `stat` and one fsync every 30 s, fixed: it does not grow with the
+database, allocates no iterator, and books no usage.
+
+Being unauthenticated, it is also reachable by anyone who can reach the port, and each
+request occupies a blocking-pool thread and one of the 128 concurrency permits. Do not
+expose port 3210 beyond the cluster, and keep `failureThreshold` at 4 or higher so a
+transient saturation cannot restart a healthy pod.
 
 **`timeoutSeconds` is not optional.** Kubernetes defaults it to **1 second**. (An earlier
 revision of this section claimed the probe would otherwise inherit
@@ -143,7 +165,7 @@ clock, but it means the server-side timeout cannot be relied on to bound the pro
 
 **A volume that has gone read-only rather than unresponsive** still serves this probe,
 because the probe is a read. That case is caught inside the process instead: consecutive
-failed engine writes raise the backend's `ShutdownSignal` (§4a).
+failed engine writes raise the backend's `ShutdownSignal` (§2a).
 
 **A read-mostly cell.** On a cell with no user mutations the only persistence write is the
 committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and
@@ -166,8 +188,13 @@ points:
 
 The counter resets on any success, which is deliberate — one bad write should not take a
 cell down — but it means an intermittent fault that fails half of all writes never
-escalates. Nothing counts write failures as a metric today, so that state is currently
-unobservable; treat it as a gap.
+escalates. That state is observable even though it never stops the process:
+
+```promql
+rate(rocksdb_write_failures_total[5m]) > 0
+```
+
+which is the alert for a volume that has gone read-only or is failing intermittently.
 
 **The process then exits with status 0.** `preempt_rx` fires, the shutdown loop breaks,
 and `main` returns `Ok(())`. In `kubectl describe pod` this reads as
@@ -195,18 +222,33 @@ emitted by `RequestStatsGuard::drop`, which records `408` for a timed-out
 request and `499` for a client-cancelled one. On a stalled cell you see 499s
 first — clients give up long before the 300 s server timeout.
 
-Alert on the collapse of successful mutations rather than on the errors alone:
+**Do not alert on `endpoint="/api/mutation"` alone.** The `endpoint` label is the matched
+axum path, and mutations arrive by at least four of them — `/api/mutation`,
+`/api/function`, `/api/run/{*functionIdentifier}`, and the `/api/{version}/sync` WebSocket,
+which records one sample per *connection* at close with status 101 and so hides its
+mutations entirely — plus any run inside an HTTP action, which the mapper collapses to
+`/http/:user_http_action`. A cell driven by a reactive client or by HTTP actions never
+produces `/api/mutation` at all, the series is never created, and a comparison over an
+empty vector never fires. Same silent-inertness as the casing bug above, one layer up.
+
+Alert below the HTTP layer instead, where there is one code path regardless of transport:
 
 ```promql
-sum(rate(http_handle_duration_seconds_count{endpoint="/api/mutation", status="200"}[5m]))
-  < 0.5 * sum(rate(http_handle_duration_seconds_count{endpoint="/api/mutation", status="200"}[5m] offset 1h))
+# Mutations have collapsed.
+sum(rate(database_commit_seconds_count[5m]))
+  < 0.5 * sum(rate(database_commit_seconds_count[5m] offset 1h))
+
+# Heartbeat: the committer's idle timestamp bump has not succeeded in three hours.
+# It only records on success, so this covers the read-mostly cell that the probe
+# and the mutation-rate alert both miss.
+increase(bump_repeatable_ts_seconds_count[3h]) < 1
 ```
 
-This matters most for the case the probe handles poorly: **a read-mostly cell**.
-Persistence writes there come only from the committer's idle timestamp bump,
-jittered between 1× and 2× a one-hour base — so one to two hours — and a wedged
-volume produces very few failing mutations to alert on. Neither mechanism covers
-that window well; see §2's "What this does not cover".
+The heartbeat is what covers **a read-mostly cell**. Persistence writes there come only
+from the committer's idle timestamp bump, jittered between 1× and 2× a one-hour base, so
+there are almost no mutations to observe a collapse in. `bump_repeatable_ts_seconds_count`
+only increments once that write *succeeds*, so a three-hour window catches a latched or
+wedged engine just past its longest jitter.
 
 ## 4. Startup, and why the window has to be generous
 
@@ -257,7 +299,7 @@ The whole cycle, as one `CronJob` per schedule:
 # 1. A VolumeSnapshot on a schedule, via your CSI driver's snapshot class.
 # 2. A CronJob that, per run:
 #      - provisions a PVC from the newest snapshot (a clone: no writer holds it)
-#      - runs: rocksdb-backup check --db /clone
+#      - runs: rocksdb-backup check --db /clone/db
 #      - optionally: rocksdb-backup backup /backup --db /clone
 #      - deletes the clone
 # 3. Alert when the CronJob's lastSuccessfulTime falls behind its schedule.

@@ -55,9 +55,12 @@ restart does.
 actually need to know — that a database restored from them opens and reads —
 and is what belongs on a schedule. A backup nobody has restored is not a backup.
 
-`restore` requires an empty or absent target: move the existing directory aside
-rather than deleting it, since until the restore is confirmed good it is the only
-other copy you have.
+`restore` refuses a target that already holds a database — RocksDB renames `CURRENT`
+into place last, so its presence means a restore finished there. A target holding
+RocksDB files but no `CURRENT` is a restore that was killed part-way, and is cleared
+and retried; anything else is refused rather than guessed about. Move the existing
+directory aside rather than deleting it, since until the restore is confirmed good it
+is the only other copy you have.
 
 `rehearse` clears its scratch directory, but only one it created itself — so
 repeated rehearsals work and pointing it at a populated directory refuses rather
@@ -173,8 +176,8 @@ fn run() -> anyhow::Result<()> {
             // The cost is that this fails while the backend is running, since
             // RocksDB allows one writer. That is intended: backing up a live
             // deployment is a volume snapshot's job, not this tool's.
-            let persistence = rocksdb_persistence::RocksDbPersistence::new(&db_dir)
-                .with_context(|| {
+            let persistence =
+                rocksdb_persistence::RocksDbPersistence::new(&db_dir).with_context(|| {
                     format!(
                         "could not open {} for writing. `backup` needs exclusive access, so the \
                          backend must be stopped; to back up a running deployment, snapshot the \

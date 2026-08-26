@@ -828,6 +828,54 @@ impl PersistenceReader for RocksDbPersistence {
         Ok(cmp::max(max_committed, max_repeatable))
     }
 
+    /// Reaches the filesystem, deliberately, rather than reading a key.
+    ///
+    /// An earlier version of this probe was a point get of
+    /// `MaxRepeatableTimestamp`, which is the worst possible choice: the
+    /// committer rewrites that key every
+    /// `MAX_REPEATABLE_TIMESTAMP_COMMIT_DELAY` (5 s) on any active cell, so
+    /// it is always in the active memtable and the read is answered from
+    /// memory in microseconds. The probe returned `200` on a volume nothing
+    /// could reach — exactly the property it existed to rule out. No
+    /// RocksDB read can be relied on here: a cached block, a pinned index,
+    /// or a bloom-filter miss on an absent key all short-circuit before the
+    /// device.
+    ///
+    /// So this does not read. It performs the two operations a wedged volume
+    /// cannot complete:
+    ///
+    /// 1. `metadata` on the data directory. A hung mount — NFS, EBS, a
+    ///    disconnected CSI volume — blocks every VFS call against it, in the
+    ///    kernel, before RocksDB is involved at all. This is the case with no
+    ///    other detector.
+    /// 2. `flush_wal(true)` — an fsync of the write-ahead log, which reaches
+    ///    the block layer and is where the parked writers are stuck. Cheap on a
+    ///    healthy cell under `SyncMode::Every`, where the WAL is already
+    ///    synced.
+    ///
+    /// Both run on the blocking pool, so a probe that hangs holds one blocking
+    /// thread and nothing else. It is still a liveness probe's own timeout that
+    /// decides how long to wait: this call has no deadline of its own, because
+    /// a deadline here would report healthy on a volume that is merely
+    /// slow, and slow is the shape a wedge starts as.
+    async fn check_storage(&self) -> anyhow::Result<()> {
+        let inner = self.inner.clone();
+        tokio_spawn_blocking("rocksdb_check_storage", move || -> anyhow::Result<()> {
+            std::fs::metadata(&inner.path).with_context(|| {
+                format!("cannot stat the data directory {}", inner.path.display())
+            })?;
+            // A secondary owns no WAL and must not sync one.
+            if !inner.secondary {
+                inner
+                    .db
+                    .flush_wal(true)
+                    .context("cannot sync the write-ahead log")?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     fn version(&self) -> PersistenceVersion {
         PersistenceVersion::V5
     }

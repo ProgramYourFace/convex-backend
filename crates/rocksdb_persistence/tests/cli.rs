@@ -78,10 +78,7 @@ async fn populate(persistence: &RocksDbPersistence) -> anyhow::Result<()> {
         .map(|n| {
             Ok(DocumentLogEntry {
                 ts: Timestamp::try_from(u64::from(n) * 10)?,
-                id: InternalDocumentId::new(
-                    TabletId(InternalId([1u8; ID_LEN])),
-                    internal_id(n),
-                ),
+                id: InternalDocumentId::new(TabletId(InternalId([1u8; ID_LEN])), internal_id(n)),
                 value: Some(document(n, "body")?),
                 prev_ts: None,
             })
@@ -147,10 +144,10 @@ fn backup_succeeds_against_a_stopped_database() {
         stdout(&out),
         stderr(&out),
     );
+    let reported = stdout(&out);
     assert!(
-        stdout(&out).contains("written"),
-        "backup did not report a generation: {}",
-        stdout(&out),
+        reported.contains("written") && reported.contains("backup 1"),
+        "backup did not report a generation by id: {reported}",
     );
 
     let listed = cli(&["list", backups.to_str().unwrap()]);
@@ -185,9 +182,14 @@ fn backup_refuses_while_the_backend_is_running_and_says_why() {
         "backup must not claim success while another process holds the write lock",
     );
     let message = stderr(&out);
+    // Assert on the *lock contention* wording, not on "stopped"/"snapshot".
+    // The defect this file exists for — opening a secondary — also fails, and
+    // its refusal says "Take this backup with the writer stopped, or snapshot
+    // the volume instead", which satisfies both of those words. Matching them
+    // would make this test pass against the broken binary.
     assert!(
-        message.contains("stopped") || message.contains("snapshot"),
-        "the failure must tell the operator what to do instead: {message}",
+        message.contains("exclusive access") || message.contains("could not open"),
+        "the failure must be the write lock, not a secondary refusal: {message}",
     );
 }
 
@@ -252,4 +254,65 @@ fn backup_refuses_a_directory_that_is_not_a_database() {
         "the refusal must name the reason: {}",
         stderr(&out),
     );
+}
+
+/// `check` is what turns a volume snapshot into a verified one, and the
+/// documented backup cycle depends on it, so it needs coverage of its own.
+///
+/// A copy of a closed database stands in for a snapshot here: crash-consistent
+/// is a weaker guarantee than this, so a copy that `check` cannot read would
+/// mean something much worse than a flaky test.
+#[tokio::test]
+async fn check_reads_back_a_copy_of_a_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let clone = dir.path().join("clone");
+    {
+        let persistence = RocksDbPersistence::new(&db).expect("failed to create the database");
+        populate(&persistence).await.expect("failed to write");
+    }
+    copy_dir(&db, &clone);
+
+    let out = cli(&["check", "--db", clone.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "check failed against a copy of a closed database.\nstdout: {}\nstderr: {}",
+        stdout(&out),
+        stderr(&out),
+    );
+    assert!(
+        stdout(&out).contains("read back") && stdout(&out).contains("4 documents"),
+        "check did not report what it decoded: {}",
+        stdout(&out),
+    );
+}
+
+/// Pointed at a backup directory instead of a database, `check` has to say so —
+/// it is the mistake the two directory shapes invite, and the error is the only
+/// thing standing between an operator and a CronJob that verifies nothing.
+#[test]
+fn check_refuses_a_backup_directory_and_names_the_right_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backup");
+    std::fs::create_dir_all(&backups).unwrap();
+
+    let out = cli(&["check", "--db", backups.to_str().unwrap()]);
+    assert!(!out.status.success(), "check must refuse a non-database");
+    let message = stderr(&out);
+    assert!(
+        message.contains("rehearse"),
+        "the refusal must point at the verb that does take a backup directory: {message}",
+    );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }

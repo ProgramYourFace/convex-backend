@@ -565,12 +565,33 @@ pub trait PersistenceReader: Send + Sync + 'static {
         Ok(max_ts)
     }
 
+    /// Touches the underlying storage device, for a liveness probe to hang on.
+    ///
+    /// An embedded engine has a failure the networked backends do not: on a
+    /// hung mount RocksDB does not fail a write, it blocks, so nothing errors,
+    /// nothing crashes, and the process keeps answering health checks while
+    /// doing no work. Detecting that from inside is not possible — the signals
+    /// an engine exposes for it are maintained by the machinery that stopped —
+    /// so it falls to the orchestrator, which needs a request whose success
+    /// actually depends on the device.
+    ///
+    /// A *read* is not enough on its own and must not be used as one: an engine
+    /// serves recently written or cached keys entirely from memory, so a read
+    /// can succeed in microseconds on a volume nothing else can reach. An
+    /// implementation of this must reach the filesystem.
+    ///
+    /// The default is `Ok(())`, which is right for a backend whose storage is
+    /// another process on the far side of a socket: there, a broken connection
+    /// is already an error rather than a silence.
+    async fn check_storage(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn version(&self) -> PersistenceVersion;
 
     async fn table_size_stats(&self) -> anyhow::Result<Vec<PersistenceTableSize>> {
         Ok(vec![])
     }
-
 }
 
 /// Timestamp that is repeatable because the caller is holding the lease and

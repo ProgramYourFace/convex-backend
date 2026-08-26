@@ -137,14 +137,26 @@ init container or a one-shot `Job`:
 rocksdb-backup list     <backup-dir>
 rocksdb-backup verify   <backup-dir> [--id N]
 rocksdb-backup rehearse <backup-dir> --scratch <dir> [--id N]
+rocksdb-backup check    --db <db-dir>
 rocksdb-backup restore  <backup-dir> --to <db-dir> [--id N]
 ```
 
-`restore` refuses a non-empty target directory. There is no reliable way to ask whether
+It is built into the backend image alongside `convex-local-backend`, so the same image
+runs the CronJob and the init container.
+
+`restore` refuses a target that holds a database. There is no reliable way to ask whether
 another process holds RocksDB's directory lock — the `LOCK` file exists either way, and
 the only way to find out is to take it, which is exactly what must not happen during a
-restore. Requiring an empty target sidesteps the question and rules out the worse
-mistake of writing into a live database.
+restore. So it uses the artefact RocksDB itself makes atomic: a restore copies `CURRENT`
+last, renaming it into place from `CURRENT.tmp` specifically "in case the restore process
+is interrupted". A target holding `CURRENT` is therefore a finished database and is
+refused.
+
+The one exception is a target holding RocksDB files but *no* `CURRENT` — a restore that
+was killed part-way. That is cleared and retried, because otherwise the init container
+below crashloops through the whole incident with no way out but a human with a shell. A
+target holding anything RocksDB would not have written is refused rather than guessed
+about, so pointing `--to` at a directory of your own does not empty it.
 
 **D. The rehearsal, which §7 called the highest-value gap.** `rocksdb-backup rehearse`
 restores a generation into a scratch directory, opens it, and iterates every column
@@ -184,14 +196,16 @@ That gives one cycle with no gap in it:
 
 1. **Snapshot** the data volume on a schedule, through your CSI driver's
    `VolumeSnapshotClass`. This is the only backup that can be taken from a running cell.
-2. **Provision a PVC from the snapshot** in a `CronJob`. It is a clone, so no writer holds
-   it.
-3. **`rocksdb-backup check --db /clone`.** Opens the clone read-write — replaying its
+2. **Provision a PVC from the snapshot** in a `CronJob` and mount it at `/clone`. It is a
+   clone, so no writer holds it. Note the path: §2 puts the database at
+   `/convex/data/db`, so a snapshot of that volume mounted at `/clone` holds it at
+   `/clone/db`, and that — the directory containing `CURRENT` — is what `--db` takes.
+3. **`rocksdb-backup check --db /clone/db`.** Opens the clone read-write — replaying its
    write-ahead log exactly as recovery would — and decodes every row. This is the step
    that turns a snapshot into a *tested* snapshot. Note that under
    `TolerateCorruptedTailRecords` a genuinely corrupt WAL makes the open fail here rather
    than silently truncating, which is the point.
-4. **Optionally `rocksdb-backup backup /backup --db /clone`** from that same clone, if you
+4. **Optionally `rocksdb-backup backup /backup --db /clone/db`** from that same clone, if you
    want `BackupEngine` generations without a maintenance window. The clone has no writer,
    so the read-write open succeeds.
 5. **Delete the clone.**
@@ -206,6 +220,30 @@ had not written". Nothing warns about this at snapshot time and nothing in the s
 records which mode produced it.
 
 ## 4. Restore runbook
+
+Two of them, because there are two kinds of artefact and the commands are not
+interchangeable. **Read §4A if you have been taking volume snapshots** — which is what §E
+makes the primary mechanism, and therefore the case most operators will be in. §4B is for
+`BackupEngine` generations, which exist only if you enabled §E step 4 or took one by hand
+in a maintenance window.
+
+### 4A. Restoring a volume snapshot
+
+There is no `rocksdb-backup restore` in this path: a snapshot restores to a *volume*, and
+Kubernetes does the restoring.
+
+1. **Stop the writer.** `kubectl scale statefulset/<cell> --replicas=0`, and wait for the
+   pod to terminate.
+2. **Provision a PVC from the `VolumeSnapshot`**, via its `dataSource`. Keep the old claim
+   until the restore is confirmed — it is the only other copy you have.
+3. **Check it before you point the cell at it.** Mount it in a one-shot `Job` and run
+   `rocksdb-backup check --db <mount>/db`. This opens it read-write, replays the WAL
+   exactly as the backend would, and decodes every row. A snapshot that fails here fails
+   the same way in the backend, and finding that out in a `Job` costs nothing.
+4. **Point the `StatefulSet`'s claim at the new PVC** and `kubectl scale --replicas=1`.
+5. **Reconcile the upstream log**, as in §4B step 6 — the same gap, for the same reason.
+
+### 4B. Restoring a `BackupEngine` generation
 
 For a `StatefulSet` with `replicas: 1` and `updateStrategy: OnDelete`, where the pod
 holds the volume:
@@ -223,9 +261,11 @@ holds the volume:
    proves the generation decodes. A restore that overwrites a live directory with an
    unverified backup can turn a recoverable incident into an unrecoverable one.
 4. **Restore into a fresh path**, not over the live one, if there is disk for it. Then
-   swap directories. If there is not, take a `Checkpoint` of the live database first —
-   hard links, so it costs almost nothing — and keep it until the restore is confirmed
-   good.
+   swap directories. If there is not, hard-link the stopped database aside first —
+   `cp -al /convex/data/db /convex/data/db.aside`, which costs almost nothing — and keep
+   it until the restore is confirmed good. (An earlier revision said to take a RocksDB
+   `Checkpoint` here. Nothing in this crate implements one and the CLI has no such verb,
+   so `cp -al` against the stopped directory is the actual procedure.)
 5. **Start the writer.** `kubectl scale statefulset/<cell> --replicas=1`. The backend
    opens the restored directory and comes up normally; nothing above `Persistence` knows
    a restore happened.

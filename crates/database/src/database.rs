@@ -1642,17 +1642,12 @@ impl<RT: Runtime> Database<RT> {
     /// and the orchestrator needs an endpoint whose success actually depends on
     /// the volume.
     ///
-    /// This is that endpoint's body. A single `globals` point get: no scan, no
-    /// pagination, no cursor cache, no usage metering, and a fixed cost that
-    /// does not grow with the database. It is a *read*, so it cannot detect an
-    /// engine that has latched read-only — `Persistence`'s write path escalates
-    /// that separately — but it does block on exactly the volume a wedged mount
-    /// would park, which is the case with no other detector.
+    /// This is that endpoint's body. What it costs and what it proves are the
+    /// storage layer's to decide — see [`PersistenceReader::check_storage`] —
+    /// but it is fixed-cost by contract: no scan, no pagination, no cursor
+    /// cache, no usage metering, and nothing that grows with the database.
     pub async fn check_storage(&self) -> anyhow::Result<()> {
-        self.reader
-            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
-            .await?;
-        Ok(())
+        self.reader.check_storage().await
     }
 
     pub fn persistence_version(&self) -> PersistenceVersion {

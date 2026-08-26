@@ -1992,7 +1992,10 @@ async fn every_write_path_syncs_the_wal_only_under_sync_mode_every() -> anyhow::
         let id = doc_id(1, 1);
         persistence
             .write(
-                &[entry(1, 1, 10, "v1", None)?, entry(1, 1, 20, "v2", Some(10))?],
+                &[
+                    entry(1, 1, 10, "v1", None)?,
+                    entry(1, 1, 20, "v2", Some(10))?,
+                ],
                 &[
                     index_entry(1, b"k", 10, Some(id)),
                     index_entry(1, b"k", 20, Some(id)),
@@ -2050,15 +2053,13 @@ async fn an_interrupted_restore_can_be_retried() -> anyhow::Result<()> {
         persistence.backup(&backup_dir, 4)?;
     }
 
-    // Exactly what a `SIGKILL` mid-restore leaves: partial content in the
-    // target and the marker still in the backup directory.
+    // Exactly what a `SIGKILL` mid-restore leaves: RocksDB files in the target
+    // and no `CURRENT`, because the restore renames that in last.
     let target = dir.path().join("restored");
     std::fs::create_dir_all(&target)?;
     std::fs::write(target.join("000123.sst"), b"half a restore")?;
-    std::fs::write(
-        backup_dir.join("convex-restore-in-progress"),
-        target.to_string_lossy().as_bytes(),
-    )?;
+    std::fs::write(target.join("MANIFEST-000001"), b"half a manifest")?;
+    std::fs::write(target.join("CURRENT.tmp"), b"not renamed yet")?;
 
     backup::restore(&backup_dir, &target, None)?;
 
@@ -2072,17 +2073,21 @@ async fn an_interrupted_restore_can_be_retried() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Without the marker, a populated target is still refused — that guard is what
-/// stops a restore from being written over a live database.
+/// A target holding `CURRENT` is a database, and is still refused — that guard
+/// is what stops a restore from being written over a live deployment.
 #[tokio::test]
-async fn restore_still_refuses_a_populated_target_with_no_marker() -> anyhow::Result<()> {
+async fn restore_still_refuses_a_target_that_holds_a_database() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("db");
     let backup_dir = dir.path().join("backup");
     {
         let persistence = RocksDbPersistence::new(&db_path)?;
         persistence
-            .write(&[entry(1, 1, 10, "v1", None)?], &[], ConflictStrategy::Error)
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[],
+                ConflictStrategy::Error,
+            )
             .await?;
         persistence.backup(&backup_dir, 4)?;
     }
@@ -2092,7 +2097,7 @@ async fn restore_still_refuses_a_populated_target_with_no_marker() -> anyhow::Re
     std::fs::write(target.join("CURRENT"), b"someone else's database")?;
 
     let err = backup::restore(&backup_dir, &target, None)
-        .expect_err("a populated target with no marker must be refused");
+        .expect_err("a target holding a database must be refused");
     assert!(
         format!("{err}").contains("is not empty"),
         "the refusal must say why: {err}"
@@ -2100,6 +2105,49 @@ async fn restore_still_refuses_a_populated_target_with_no_marker() -> anyhow::Re
     assert!(
         target.join("CURRENT").exists(),
         "the refusal must not have touched the target",
+    );
+    Ok(())
+}
+
+/// A populated target that is *not* a half-restored database is refused, not
+/// cleared.
+///
+/// The interrupted-restore path deletes the target's contents, so what counts
+/// as "interrupted" has to be a whitelist. A directory holding anything RocksDB
+/// would not have written is somebody's, and the answer is to refuse and say so
+/// rather than to guess.
+#[tokio::test]
+async fn restore_refuses_a_target_holding_files_it_does_not_recognise() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+    {
+        let persistence = RocksDbPersistence::new(&db_path)?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        persistence.backup(&backup_dir, 4)?;
+    }
+
+    let target = dir.path().join("someones-directory");
+    std::fs::create_dir_all(&target)?;
+    // A plausible mistake: the operator's own notes next to a stray SST.
+    std::fs::write(target.join("000123.sst"), b"looks like rocksdb")?;
+    std::fs::write(target.join("do-not-delete.txt"), b"three years of exports")?;
+
+    let err = backup::restore(&backup_dir, &target, None)
+        .expect_err("a directory holding unrecognised files must be refused");
+    assert!(
+        format!("{err}").contains("is not empty"),
+        "the refusal must say why: {err}"
+    );
+    assert!(
+        target.join("do-not-delete.txt").exists(),
+        "the refusal must not have deleted anything",
     );
     Ok(())
 }
