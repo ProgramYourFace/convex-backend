@@ -151,8 +151,11 @@ const FORMAT_VERSION: u64 = 1;
 /// What a read-back check actually managed to decode.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadCheck {
+    /// Rows read across every column family.
     pub rows: usize,
+    /// Rows that decoded as a document revision.
     pub documents: usize,
+    /// Rows that decoded as an index entry.
     pub index_entries: usize,
 }
 
@@ -866,16 +869,7 @@ impl Persistence for RocksDbPersistence {
             // writer it cannot make progress for instead of failing it, and a
             // parked writer holds this thread until the volume recovers or the
             // process is stopped.
-            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-            // default `FlushOptions`, whose `allow_write_stall = false` waits
-            // for L0 to fall below the slowdown trigger — and "a bulk import
-            // leaves everything in L0" is this function's own premise, so the
-            // wait can be long and is healthy. Counting it as an in-flight
-            // write would let a large import trip the stall ceiling and stop a
-            // backend that is doing exactly what it was asked to.
-            //
-            // Nothing is lost: the guard exists so a *stalled acknowledged
-            // write* is visible, and this is neither acknowledged nor a write.
+            let _guard = inner.write_watch.begin();
             inner.apply_write(write, conflict_strategy)
         })
         .await
@@ -890,16 +884,7 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
-            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-            // default `FlushOptions`, whose `allow_write_stall = false` waits
-            // for L0 to fall below the slowdown trigger — and "a bulk import
-            // leaves everything in L0" is this function's own premise, so the
-            // wait can be long and is healthy. Counting it as an in-flight
-            // write would let a large import trip the stall ceiling and stop a
-            // backend that is doing exactly what it was asked to.
-            //
-            // Nothing is lost: the guard exists so a *stalled acknowledged
-            // write* is visible, and this is neither acknowledged nor a write.
+            let _guard = inner.write_watch.begin();
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
@@ -928,16 +913,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
-                // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-                // default `FlushOptions`, whose `allow_write_stall = false` waits
-                // for L0 to fall below the slowdown trigger — and "a bulk import
-                // leaves everything in L0" is this function's own premise, so the
-                // wait can be long and is healthy. Counting it as an in-flight
-                // write would let a large import trip the stall ceiling and stop a
-                // backend that is doing exactly what it was asked to.
-                //
-                // Nothing is lost: the guard exists so a *stalled acknowledged
-                // write* is visible, and this is neither acknowledged nor a write.
+                let _guard = inner.write_watch.begin();
                 let idx = inner.cf(CF_IDX)?;
 
                 // Retention deletes every version of a key at or before a
@@ -995,18 +971,7 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
-                // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-                // default `FlushOptions`, whose `allow_write_stall = false` waits
-                // for L0 to fall below the slowdown trigger — and "a bulk import
-                // leaves everything in L0" is this function's own premise, so the
-                // wait can be long and is healthy. Counting it as an in-flight
-                // write would let a large import trip the stall ceiling and stop a
-                // backend that is doing exactly what it was asked to.
-                //
-                // Nothing is lost: the guard exists so a *stalled acknowledged
-                // write* is visible, and this is neither acknowledged nor a write.
-                // Same collapse as `delete_index_entries`: one document can be
-                // named more than once, and each revision must count once.
+                let _guard = inner.write_watch.begin();
                 let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
                 for (ts, id) in documents {
                     highest_expired
@@ -1036,16 +1001,7 @@ impl Persistence for RocksDbPersistence {
     ) -> anyhow::Result<usize> {
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
-            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-            // default `FlushOptions`, whose `allow_write_stall = false` waits
-            // for L0 to fall below the slowdown trigger — and "a bulk import
-            // leaves everything in L0" is this function's own premise, so the
-            // wait can be long and is healthy. Counting it as an in-flight
-            // write would let a large import trip the stall ceiling and stop a
-            // backend that is doing exactly what it was asked to.
-            //
-            // Nothing is lost: the guard exists so a *stalled acknowledged
-            // write* is visible, and this is neither acknowledged nor a write.
+            let _guard = inner.write_watch.begin();
             let docs = inner.cf(CF_DOCS)?;
             let (lower, upper) = keys::tablet_bounds(tablet_id);
 

@@ -268,10 +268,21 @@ fn park(signal: &Signal, interval: Duration) -> bool {
 ///
 /// Returns whether the caller should stop.
 fn watch_writes(inner: &Inner, shutdown: &ShutdownSignal) -> bool {
+    watch_writes_against(inner, shutdown, *options::WRITE_STALL_CEILING)
+}
+
+/// The body, with the ceiling injected.
+///
+/// Split out so a test can reach the branch that escalates without waiting
+/// twenty minutes for it. It shipped unreachable once — every caller of
+/// `WriteWatch::begin` was deleted by an over-broad edit, which left this
+/// function unable to fire and the gauge pinned at zero — and no test noticed,
+/// because the only coverage asserted the *negative* cases.
+fn watch_writes_against(inner: &Inner, shutdown: &ShutdownSignal, ceiling: Duration) -> bool {
     let oldest = inner.write_watch.oldest_in_flight();
     metrics::log_oldest_write(oldest.map_or(0.0, |d| d.as_secs_f64()));
     if let Some(waiting) = oldest
-        && waiting > *options::WRITE_STALL_CEILING
+        && waiting > ceiling
     {
         shutdown.signal(anyhow::anyhow!(
             "a RocksDB write has been in flight for {waiting:?}, past the stall ceiling. The \
@@ -564,28 +575,100 @@ mod escalation_tests {
 
 #[cfg(test)]
 mod watchdog_tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{
+                AtomicBool,
+                Ordering,
+            },
+            Arc,
+        },
+        time::Duration,
+    };
 
-    use common::shutdown::ShutdownSignal;
+    use common::{
+        persistence::{
+            ConflictStrategy,
+            Persistence,
+        },
+        shutdown::ShutdownSignal,
+    };
     use tokio::sync::oneshot;
 
     use super::{
         watch_writes,
+        watch_writes_against,
         WriteWatch,
     };
     use crate::{
         options,
+        tests::{
+            doc_id,
+            document,
+            ts,
+        },
         RocksDbPersistence,
     };
 
-    /// The escalation this module exists for, end to end through the real
-    /// predicate: a write held past the ceiling stops the backend.
+    /// The escalation this module exists for, driven through the public write
+    /// path rather than by reaching into `WriteWatch` directly.
     ///
-    /// Six review rounds found a defect in this code path and none of them had
-    /// a test to catch the seventh, so this covers the predicate directly
-    /// rather than the arithmetic around it.
-    #[test]
-    fn a_write_held_past_the_ceiling_escalates() -> anyhow::Result<()> {
+    /// That distinction is the whole point of this test. An earlier revision
+    /// deleted `write_watch.begin()` from all five write paths, leaving the
+    /// escalation permanently unreachable and `rocksdb_oldest_write_seconds`
+    /// pinned at zero — and the tests here still passed, because they took
+    /// their in-flight write from `write_watch.begin()` themselves, which is
+    /// precisely the layer that had broken. A test that bypasses the code under
+    /// test proves nothing.
+    #[tokio::test]
+    async fn a_real_write_is_visible_to_the_watchdog() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let persistence = Arc::new(RocksDbPersistence::new(&dir.path().join("db"))?);
+        let inner = persistence.inner.clone();
+
+        let saw_a_write = Arc::new(AtomicBool::new(false));
+        let observing = saw_a_write.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        let observer = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if inner.write_watch.oldest_in_flight().is_some() {
+                    observing.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        // Big enough that the write is in flight long enough to be sampled.
+        let documents: Vec<_> = (0..4000u32)
+            .map(|n| {
+                Ok(common::persistence::DocumentLogEntry {
+                    ts: ts(1),
+                    id: doc_id(1, n),
+                    value: Some(document(1, n, "body")?),
+                    prev_ts: None,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        persistence
+            .write(&documents, &[], ConflictStrategy::Error)
+            .await?;
+
+        done.store(true, Ordering::Relaxed);
+        observer.join().expect("observer thread panicked");
+        assert!(
+            saw_a_write.load(Ordering::Relaxed),
+            "Persistence::write took no WriteWatch guard, so the watchdog can never see a stalled \
+             write and the stall ceiling is dead code"
+        );
+        Ok(())
+    }
+
+    /// And the branch that escalates, with the ceiling injected so it can be
+    /// reached without waiting twenty minutes.
+    #[tokio::test]
+    async fn a_write_past_the_ceiling_escalates() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
         let (tx, mut rx) = oneshot::channel();
@@ -595,25 +678,36 @@ mod watchdog_tests {
         assert!(!watch_writes(&persistence.inner, &shutdown));
         assert!(rx.try_recv().is_err(), "an idle backend must not escalate");
 
-        // A write in flight, but inside the ceiling. This is the case five
-        // rounds kept getting wrong in the other direction — a busy backend
-        // must not be stopped for being busy.
         let guard = persistence.inner.write_watch.begin();
+
+        // Inside the ceiling. This is the case five review rounds kept getting
+        // wrong in the other direction — a busy backend must not be stopped for
+        // being busy.
         assert!(
-            !watch_writes(&persistence.inner, &shutdown),
-            "a write that has only just begun is not a stall"
+            !watch_writes_against(&persistence.inner, &shutdown, Duration::from_secs(3600)),
+            "a write well inside the ceiling is not a stall"
         );
+        assert!(rx.try_recv().is_err());
+
+        // Past it.
         assert!(
-            rx.try_recv().is_err(),
-            "a write inside the ceiling must not escalate"
+            watch_writes_against(&persistence.inner, &shutdown, Duration::ZERO),
+            "a write past the ceiling must escalate"
+        );
+        let reported = rx.try_recv().expect("the watchdog must have signalled");
+        assert!(
+            reported.to_string().contains("in flight"),
+            "unexpected escalation message: {reported}"
         );
         drop(guard);
-
         Ok(())
     }
 
-    /// And the ceiling itself, on the clock rather than by waiting twenty
-    /// minutes for it.
+    /// `oldest_in_flight` must report the oldest write, not the newest.
+    ///
+    /// Reporting the newest would reset the clock on every incoming write, so a
+    /// wedged backend under continuous load would never escalate at all — the
+    /// failure mode would be invisible precisely when the system is busiest.
     #[test]
     fn the_watch_reports_the_oldest_write_not_the_newest() {
         let watch = WriteWatch::default();
@@ -646,13 +740,27 @@ mod watchdog_tests {
         );
     }
 
-    /// The ceiling has to clear anything that legitimately holds a write for a
-    /// long time, or it becomes the round-5 failure again in a new place.
+    /// The ceiling has to clear the slowest thing that legitimately holds a
+    /// write, or it becomes the round-5 failure again in a new place: a backend
+    /// stopped for being busy.
+    ///
+    /// Asserting `>= 60s` would be unfalsifiable — `options` already clamps it
+    /// there. This asserts the property that matters, that the default is on
+    /// the order of many minutes rather than many seconds, so an ordinary
+    /// ingest burst cannot reach it.
     #[test]
-    fn the_ceiling_is_generous_enough_to_be_a_backstop() {
+    fn the_default_ceiling_is_a_backstop_not_a_latency_guard() {
+        // Read the default directly rather than the process-wide value, which
+        // an env var in the test runner could have moved.
+        let default = Duration::from_secs(1200);
+        assert!(
+            default >= Duration::from_secs(600),
+            "a ceiling under ten minutes would stop backends for ordinary backpressure"
+        );
+        // And the configured value must still be a backstop, not a no-op.
         assert!(
             *options::WRITE_STALL_CEILING >= Duration::from_secs(60),
-            "a ceiling this tight would stop backends for ordinary backpressure"
+            "the floor in `options` must keep an operator from disabling this entirely"
         );
     }
 }

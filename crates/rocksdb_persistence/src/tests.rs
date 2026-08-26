@@ -82,7 +82,7 @@ fn internal_id(n: u32) -> InternalId {
     InternalId(bytes)
 }
 
-fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
+pub(crate) fn doc_id(tablet_n: u8, n: u32) -> InternalDocumentId {
     InternalDocumentId::new(tablet(tablet_n), internal_id(n))
 }
 
@@ -90,11 +90,11 @@ fn index_id(n: u8) -> IndexId {
     IndexId(InternalId([0xA0 | n; keys::ID_LEN]))
 }
 
-fn ts(n: u64) -> Timestamp {
+pub(crate) fn ts(n: u64) -> Timestamp {
     Timestamp::try_from(n).unwrap()
 }
 
-fn document(tablet_n: u8, n: u32, body: &str) -> anyhow::Result<ResolvedDocument> {
+pub(crate) fn document(tablet_n: u8, n: u32, body: &str) -> anyhow::Result<ResolvedDocument> {
     let id = ResolvedDocumentId {
         tablet_id: tablet(tablet_n),
         developer_id: DeveloperDocumentId::new(

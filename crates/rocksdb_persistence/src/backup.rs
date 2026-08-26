@@ -67,10 +67,15 @@ use crate::{
 /// One generation, as `BackupEngine` records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackupInfo {
+    /// The engine's own identifier for this generation, and the handle every
+    /// other operation takes.
     pub backup_id: u32,
     /// Seconds since the Unix epoch, as recorded by the engine.
     pub timestamp: i64,
+    /// Size of this generation's files. Incremental, so generations sharing an
+    /// SST each report it.
     pub size_bytes: u64,
+    /// How many files this generation references.
     pub num_files: u32,
 }
 
@@ -430,10 +435,15 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
 // The periodic worker
 // ---------------------------------------------------------------------------
 
+/// What the periodic backup worker was told to do.
 #[derive(Clone, Debug)]
 pub struct BackupConfig {
+    /// Where generations are written. One database per directory: the worker
+    /// claims it on first use and refuses a directory another database owns.
     pub dir: PathBuf,
+    /// How long to wait between generations.
     pub interval: Duration,
+    /// How many generations to retain. Zero keeps every one.
     pub keep: usize,
 }
 
