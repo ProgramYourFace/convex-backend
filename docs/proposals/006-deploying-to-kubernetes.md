@@ -19,11 +19,12 @@ checklist.
 
 | | Item | Why | Status |
 |---|---|---|---|
-| §1 | `replicas: 1`, `Recreate` strategy | RocksDB allows one writer. Two pods on one volume corrupt it. | **required** |
-| §2 | `livenessProbe` on `/api/list_snapshot` | Nothing in-process detects a wedged volume. `/version` and `/health` cannot. | **required** |
-| §3 | Alert on `HTTP_HANDLE_DURATION_SECONDS` | Catches degradation the probe misses, and read-mostly cells. | strongly recommended |
+| §1 | One writer, enforced by the object kind | RocksDB allows one writer. Two pods on one volume corrupt it. | **required** |
+| §2 | `livenessProbe` on `/health/storage` | Nothing in-process detects a wedged volume, and no in-memory endpoint can. | **required** |
+| §2a | Know that the fatal-error exit code is `0` | It reads as a graceful shutdown, so exit-code alerts stay silent. | **required** |
+| §3 | Alert on `http_handle_duration_seconds` | Catches degradation the probe misses, and read-mostly cells. | strongly recommended |
 | §4 | `startupProbe` sized for WAL replay | Nothing calls `Persistence::shutdown()`, so every restart is unclean. | **required** |
-| §5 | Volume snapshots for live backups | `rocksdb-backup` needs the writer stopped. | **required** |
+| §5 | Volume snapshots + a `check` CronJob | `rocksdb-backup backup` needs the writer stopped; a snapshot needs verifying. | **required** |
 | §6 | Memory limits and the cache | The cache is derived from the cgroup limit; table readers are not. | recommended |
 | §7 | First-boot step on an upgraded volume | The backup identity is minted at open. | one-off |
 
@@ -34,95 +35,161 @@ checklist.
 RocksDB takes a `LOCK` file in the data directory and permits exactly one
 read-write process. That is not advisory: a second writer does not start.
 
+Which field enforces it depends on the object kind, and [004](./004-rocksdb-in-kubernetes.md) §1
+takes a `StatefulSet` as the reference topology:
+
 ```yaml
+# StatefulSet — the reference topology
+spec:
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: OnDelete
+
+# Deployment — if you use one instead
 spec:
   replicas: 1
   strategy:
     type: Recreate        # NOT RollingUpdate
 ```
 
-`RollingUpdate` is the trap. It starts the new pod before the old one
+`spec.strategy` is a Deployment field; `kubectl apply` rejects it on a
+StatefulSet. Use whichever matches your object.
+
+`RollingUpdate` is the Deployment trap. It starts the new pod before the old one
 terminates, so the new pod fails to open the database and crashloops until the
 old one goes away — a self-inflicted outage on every deploy. `Recreate` stops
-first, starts second.
+first, starts second. A `StatefulSet` with `replicas: 1` already terminates
+before replacing, so it does not have this failure mode.
 
 This is the same invariant the Postgres topology already satisfies with
 `replicas: 1`; the difference is that Postgres would let a second replica start
 and fail later, while RocksDB refuses immediately.
 
-## 2. The liveness probe, and why the obvious endpoints are wrong
+## 2. The liveness probe
 
-**RocksDB does not fail on a wedged volume — it blocks.** A full disk or a hung
-mount makes `write_opt` never return. No error surfaces, no counter moves,
-nothing crashes. Every writer parks on a blocking-pool thread while the process
-keeps answering health checks and doing no work.
+**RocksDB does not fail on a wedged volume — it blocks.** A full disk or a hung mount
+makes `write_opt` never return. No error surfaces, no counter moves, nothing crashes.
+Every writer parks on a blocking-pool thread while the process keeps answering health
+checks and doing no work.
 
-Nothing inside the process reliably detects this, and that is a deliberate
-conclusion rather than an omission: every signal RocksDB exposes for it
-(`num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
-`actual-delayed-write-rate`, `current-super-version-number`) is maintained by
-the machinery that has stopped, so each latches in exactly the state it is meant
-to report. Five successive attempts at an in-process detector each failed in a
-new way. Liveness is the cluster's job.
+Nothing inside the process reliably detects this, and that is a deliberate conclusion
+rather than an omission: every signal RocksDB exposes for it (`num-running-flushes`,
+`num-running-compactions`, `is-write-stopped`, `actual-delayed-write-rate`,
+`current-super-version-number`) is maintained by the machinery that has stopped, so each
+latches in exactly the state it is meant to report. Five successive attempts at an
+in-process detector each failed in a new way. Liveness is the cluster's job.
 
-**Do not probe `/version` or `/health`.** Measured: `/version` answers `200 OK`
-in about a millisecond with the blocking pool fully parked and every concurrency
-permit taken. It is a pure async closure returning a cached string, and it is
-merged into the router *after* the timeout and concurrency layers, so it sits
-outside both. `health_check_routes` — `/instance_name`, `/instance_version`,
-`/` and `/echo` — has the same shape. A probe pointed at any of them reports the
-cell healthy for exactly as long as the cell is dead.
-
-Only two routes are outside the layer stack: `/version` and `/metrics`.
-Everything under `/api` is inside it.
-
-**Probe `/api/list_snapshot`.** It qualifies on three counts, all verified:
-
-- It reads persistence rather than the index cache, through
-  `Database::table_iterator` — the same path streaming export uses to walk
-  history.
-- Every RocksDB read in that path goes through `tokio_spawn_blocking`, so on a
-  wedged volume the request queues behind the parked writers and never runs.
-- It is inside the `TimeoutLayer`, so a hung read becomes `408 REQUEST_TIMEOUT`
-  and the probe fails.
-
-Measured: `200` in 12 ms on an empty database, 43 ms with 2 000 events, needing
-only the admin key and no deployed function.
+### Probe `/health/storage`
 
 ```yaml
 livenessProbe:
   httpGet:
-    path: /api/list_snapshot
+    path: /health/storage
     port: 3210
-    httpHeaders:
-      - name: Authorization
-        value: "Convex $(CONVEX_ADMIN_KEY)"   # from a Secret
   periodSeconds: 30
-  timeoutSeconds: 10       # the probe is the clock, not HTTP_SERVER_TIMEOUT_SECONDS
+  timeoutSeconds: 10
   failureThreshold: 4      # ~2 min before restart
 ```
 
-`timeoutSeconds` matters. Without it the probe inherits
-`HTTP_SERVER_TIMEOUT_SECONDS` (default 300), so each failed probe costs five
-minutes.
+It is unauthenticated and it touches storage, and it has to be both.
 
-**What this does not cover.** A volume that has gone *read-only* rather than
-unresponsive still serves this probe. That case is caught inside the process
-instead: five consecutive failed engine writes raise the backend's
-`ShutdownSignal`. The two mechanisms are complementary — the probe catches
-"stopped responding", the escalation catches "refusing writes".
+**Storage-touching**, because that is the entire point: it performs one `globals` point
+get through `PersistenceReader`, on the blocking pool, so on a wedged volume the request
+blocks on the same device the writers are parked on and the probe times out.
 
-**Cost.** One real persistence read every 30 s. Small at 2 000 events, but it
-iterates tablets, so measure it at your data volume before settling on the
-period.
+**Unauthenticated**, because a liveness probe that can fail for any reason other than
+"this process is unwell" is a kill switch. The kubelet has no identity. It cannot read a
+Secret into a probe header — Kubernetes expands `$(VAR)` in `command`, `args` and
+`env[].value`, and **nowhere else**, so a header written as
+`Authorization: Convex $(CONVEX_ADMIN_KEY)` is sent as that literal string and rejected.
+And it cannot distinguish 401 from a hung disk: both are "not 2xx". An authenticated probe
+therefore turns any credential change — an `INSTANCE_SECRET` rotation, a remounted Secret,
+a projected-Secret refresh racing the probe — into a restart every two minutes that
+restarting cannot fix. An earlier revision of this document recommended exactly that,
+against `/api/list_snapshot`.
+
+The cost is one point get every 30 s, fixed: it does not grow with the database, allocates
+no iterator, and books no usage.
+
+**`timeoutSeconds` is not optional.** Kubernetes defaults it to **1 second**. (An earlier
+revision of this section claimed the probe would otherwise inherit
+`HTTP_SERVER_TIMEOUT_SECONDS`, which is backwards — that knob bounds how long the *server*
+keeps working and reaches the kubelet through no channel at all. The two clocks are
+unrelated.) One second is too tight for a cold start; 10 s is a reasonable floor.
+
+### Why not the endpoints that look like health checks
+
+`/version` and `/metrics` are the **only** two routes outside the timeout and concurrency
+layers — they are merged in `serve()`, after the stack is applied. `/version` is a pure
+async closure returning a cached string and answers `200 OK` in about a millisecond with
+the blocking pool fully parked. Measured.
+
+`health_check_routes` — `/instance_name`, `/instance_version`, `/` and `/echo` — is merged
+*inside* the stack, not outside it. (An earlier revision of this section said it "has the
+same shape" as `/version`; that was wrong, and it contradicted the correct statement four
+lines below it.) Being inside the stack is necessary but not sufficient: all four still
+answer from memory, so they report a dead cell healthy for as long as it stays dead.
+`/health/storage` is in the same router precisely so it inherits that stack while actually
+reading the volume.
+
+Within that stack, note the ordering: `GlobalConcurrencyLimitLayer` is declared *before*
+`TimeoutLayer` and is therefore the **outer** service. A request that cannot get one of the
+128 permits waits upstream of the timeout and never becomes a `408` — it simply hangs.
+That is fine for a liveness probe, because the kubelet's own `timeoutSeconds` is the real
+clock, but it means the server-side timeout cannot be relied on to bound the probe.
+
+### What this does not cover
+
+**A volume that has gone read-only rather than unresponsive** still serves this probe,
+because the probe is a read. That case is caught inside the process instead: consecutive
+failed engine writes raise the backend's `ShutdownSignal` (§4a).
+
+**A read-mostly cell.** On a cell with no user mutations the only persistence write is the
+committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and
+2× `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` (3600 s) — so **one to two hours**, not "up to
+an hour" as an earlier revision said. During that window a latched engine serves every
+read, the probe stays green, and §3's mutation-rate alert has no mutations to observe.
+This is the largest detection hole left after the in-process supervision layer was
+removed. Lowering `MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY` on RocksDB cells shortens it
+directly.
+
+## 2a. What the in-process escalation does, and its exit code
+
+Two mechanisms raise `ShutdownSignal` on a failing write, and they fire at very different
+points:
+
+- On the **commit path**, the *first* failed persistence write does it. `Committer::go`
+  propagates the error and signals; there is no retry.
+- On **retention deletes and the idle bump**, the persistence layer's own counter does it,
+  after `ROCKSDB_WRITE_FAILURES_TO_ESCALATE` (default 5) *consecutive* failures.
+
+The counter resets on any success, which is deliberate — one bad write should not take a
+cell down — but it means an intermittent fault that fails half of all writes never
+escalates. Nothing counts write failures as a metric today, so that state is currently
+unobservable; treat it as a gap.
+
+**The process then exits with status 0.** `preempt_rx` fires, the shutdown loop breaks,
+and `main` returns `Ok(())`. In `kubectl describe pod` this reads as
+`Reason: Completed, Exit Code: 0` — a graceful shutdown, not a storage fault. Any fleet
+alert keyed on a non-zero exit code or on
+`kube_pod_container_status_last_terminated_reason{reason="Error"}` stays silent, and under
+any `restartPolicy` other than `Always` the process does not come back at all. Alert on
+§3's mutation-rate collapse, not on the exit code.
 
 ## 3. Alerting, which the probe does not replace
 
 Convex already instruments every request:
 
 ```
-HTTP_HANDLE_DURATION_SECONDS{endpoint, method, status, client_version, is_test}
+http_handle_duration_seconds{endpoint, method, status, client_version, is_test}
 ```
+
+The name is lower_snake_case in Prometheus: `register_convex_histogram_owned!` exports
+`stringify!([<$NAME:lower>])`, so the Rust constant `HTTP_HANDLE_DURATION_SECONDS` becomes
+`http_handle_duration_seconds`. Metric names are case-sensitive and a comparison over an
+empty vector never fires, so an alert written in the constant's casing — as an earlier
+revision of this section had it — is silently inert.
 
 emitted by `RequestStatsGuard::drop`, which records `408` for a timed-out
 request and `499` for a client-cancelled one. On a stalled cell you see 499s
@@ -131,14 +198,15 @@ first — clients give up long before the 300 s server timeout.
 Alert on the collapse of successful mutations rather than on the errors alone:
 
 ```promql
-sum(rate(HTTP_HANDLE_DURATION_SECONDS_count{endpoint="/api/mutation", status="200"}[5m]))
-  < 0.5 * sum(rate(HTTP_HANDLE_DURATION_SECONDS_count{endpoint="/api/mutation", status="200"}[5m] offset 1h))
+sum(rate(http_handle_duration_seconds_count{endpoint="/api/mutation", status="200"}[5m]))
+  < 0.5 * sum(rate(http_handle_duration_seconds_count{endpoint="/api/mutation", status="200"}[5m] offset 1h))
 ```
 
 This matters most for the case the probe handles poorly: **a read-mostly cell**.
 Persistence writes there come only from the committer's idle timestamp bump,
-randomised up to an hour, so a wedged volume produces very few failing mutations
-to alert on — and the probe is what carries the detection.
+jittered between 1× and 2× a one-hour base — so one to two hours — and a wedged
+volume produces very few failing mutations to alert on. Neither mechanism covers
+that window well; see §2's "What this does not cover".
 
 ## 4. Startup, and why the window has to be generous
 
@@ -177,9 +245,34 @@ acknowledged write is in the WAL before `write` returns, so a crash-consistent
 snapshot recovers exactly as an unclean restart does — which the crate tests
 directly, with a child process calling `_exit(0)` and no destructors.
 
+But a snapshot is only a backup once something has read it back, and the verbs
+that do that (`verify`, `rehearse`) all take a *backup* directory — a snapshot
+restores to a *database* directory. The two halves do not compose on their own,
+which is what `rocksdb-backup check --db <dir>` is for: it is `rehearse`'s
+read-back, pointed at a database directory.
+
+The whole cycle, as one `CronJob` per schedule:
+
 ```yaml
-# VolumeSnapshot on a schedule, via your CSI driver's snapshot class.
+# 1. A VolumeSnapshot on a schedule, via your CSI driver's snapshot class.
+# 2. A CronJob that, per run:
+#      - provisions a PVC from the newest snapshot (a clone: no writer holds it)
+#      - runs: rocksdb-backup check --db /clone
+#      - optionally: rocksdb-backup backup /backup --db /clone
+#      - deletes the clone
+# 3. Alert when the CronJob's lastSuccessfulTime falls behind its schedule.
 ```
+
+`check` opens the clone **read-write**, replaying its write-ahead log exactly as
+recovery would, then decodes every row. That is what turns a snapshot into a
+tested snapshot. Step 2's optional `backup` is how you get `BackupEngine`
+generations without a maintenance window: the clone has no writer, so the
+read-write open succeeds.
+
+**This rests on `SyncMode::Every`,** the default. Under `ROCKSDB_SYNC_WRITES=false`
+a snapshot is host loss from the engine's point of view, and `Never`'s durability
+row gives host loss as unbounded. Nothing warns at snapshot time, and the
+snapshot does not record which mode produced it.
 
 **Do not try to make `rocksdb-backup` do this from a read-only instance.** A
 revision of this backend allowed it; a single flush landing in the window
@@ -191,8 +284,10 @@ between catch-up and the file listing produced a generation that was created
 hard error with a test pinning it.
 
 A `verify` pass is **not** a restore test: it checks that every file is present
-and the expected size, not checksums. Run `rehearse` on a schedule — it restores
-into a scratch directory and decodes every row.
+and the expected size, not checksums — the `rocksdb` crate exposes no way to turn
+checksum verification on. `rehearse` (for backup generations) and `check` (for
+snapshots) are the two verbs that actually decode the data, and one of them
+belongs on a schedule.
 
 ## 6. Memory
 
@@ -203,22 +298,33 @@ get a small cache.
 What that budget does *not* cover: `max_open_files = -1` keeps every table
 reader open, and those structures live outside the cache and scale with file
 count. This is unbounded by configuration and unmeasured at production data
-volume. If the pod is OOMKilled with the cache well under its share, this is the
-first thing to check.
+volume. Nor does it cover the blocking pool's stacks — tokio's default cap is 512
+threads at `RUNTIME_STACK_SIZE` (4 MiB), so the virtual reservation can reach
+2 GiB, and every RocksDB read and write runs on one of those threads. If the pod
+is OOMKilled with the cache well under its share, these two are the first things
+to check.
 
-## 7. First boot on a volume from an older build
+## 7. Backup directory ownership, and the fork it does not catch
 
 The backup directory is claimed by a database identity row, minted when the
-database is opened read-write. A volume created by a build that predates that
-change has no such row, and a backup taken with the writer stopped will fail
-with:
+database is opened read-write. It exists so that two cells pointed at one backup
+directory — a shared volume, a templated env var, a copy-pasted manifest — cannot
+interleave their generations into one chain, where `purge_old_backups` would age
+out the other database's generations and nobody would find out until a restore.
 
-> this database has no backup identity yet, and a read-only instance cannot mint
-> one. Start the backend against it once — it mints the identity at open — or
-> take this backup with the writer stopped.
+An earlier revision of this section prescribed a mandatory first-boot step
+against a "no backup identity yet" error. That step is no longer needed: `backup`
+opens read-write, which mints the identity at open, so an upgraded volume gets
+one on the first `backup` as well as on the first normal start.
 
-One normal start on the current build fixes it permanently. Do this before
-pointing any backup automation at an upgraded cell.
+**What the check does not catch is a fork.** The identity lives in `globals`, so
+it travels with the data — deliberately, so a restored database can continue its
+chain. A database and a *copy* of it are therefore indistinguishable. Restore a
+generation into a staging cell deployed from the same chart, and staging's
+backups land in production's chain with a matching identity; `list`, `verify` and
+`rehearse` all pass, because staging's data is perfectly valid data. A CSI clone
+of the data volume does the same. Give each cell its own backup directory, and
+change it when you restore into a new cell.
 
 ---
 
@@ -230,6 +336,15 @@ pointing any backup automation at an upgraded cell.
 - **Never run on the target cluster.** Different kernel, storage class and
   memory limits. The cgroup cache derivation has unit tests but has never met a
   real container limit.
+- **`/health/storage` has not been compiled in this container.** The route and
+  `Application::check_storage` could not be typechecked here: `crates/isolate`'s
+  build script runs `pnpm install --frozen-lockfile`, and one transitive
+  dependency (`get-convex/saffron`, a GitHub tarball) is unreachable through this
+  environment's proxy. `Database::check_storage`, which holds the actual logic,
+  does compile. Build the backend before relying on the manifest above.
+- **No metric counts failed engine writes** (§2a), so the intermittent-fault case
+  the counter deliberately does not escalate is also invisible. One counter in
+  `engine_write`'s error arm would close it.
 - **`Persistence::shutdown()` is dead** (§4). Wiring SIGTERM to it would make
   restarts clean and shrink §4's window considerably — but it also changes the
   teardown path, which is where several defects have lived, so it wants its own

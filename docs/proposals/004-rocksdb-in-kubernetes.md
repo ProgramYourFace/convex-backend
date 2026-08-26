@@ -1,9 +1,10 @@
 # Running the RocksDB backend in a self-hosted Kubernetes cell
 
 **Status:** operational analysis; one code change (memtable memory ceiling), no migration tooling yet
+**Superseded in part:** §4b, by [006-deploying-to-kubernetes.md](./006-deploying-to-kubernetes.md) §2 — everything about liveness detection. Read 006 first for anything probe- or shutdown-related.
 **Date:** 2026-08-25
 **Follows:** [002-storage-engine.md](./002-storage-engine.md) (the backend), [003-beyond-the-storage-layer.md](./003-beyond-the-storage-layer.md) (the measurements)
-**Followed by:** [005-backup-and-restore.md](./005-backup-and-restore.md), the design for §6's gap
+**Followed by:** [005-backup-and-restore.md](./005-backup-and-restore.md), the design for §6's gap; [006-deploying-to-kubernetes.md](./006-deploying-to-kubernetes.md), the deployment checklist
 **Reference topology:** a per-cell `StatefulSet` with `replicas: 1`, a native Postgres
 sidecar on pod-localhost, a Convex backend and a relay, with `pg-data` and `convex-data`
 PVCs.
@@ -122,7 +123,11 @@ per-write uniqueness check depends on — precisely when writes were heaviest.
 **This is now derived rather than configured.** Left unset, the cache is sized from the
 container's own memory limit — cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`,
 walking up the hierarchy so a limit on any ancestor binds, capped at physical memory and
-clamped to [64 MiB, 4 GiB]. `ROCKSDB_BLOCK_CACHE_PERCENT` is the share, defaulting to 25.
+capped at 4 GiB and **not** floored. `ROCKSDB_BLOCK_CACHE_PERCENT` is the share,
+defaulting to 25. (An earlier revision of this section said the result was clamped to
+[64 MiB, 4 GiB]. There is no floor: it was removed deliberately, so that a small container
+gets a small cache rather than one that ignores its limit. Size a 128 MiB sidecar-style
+container expecting 32 MiB of cache, not 64.)
 For the reference backend container at `limits: { memory: 4Gi }` that is 1 GiB of cache,
 chosen without anyone setting anything, and logged at startup with the limit it came
 from.
@@ -155,10 +160,11 @@ checkpoint, and with `max_wal_size=4GB` and `checkpoint_completion_target=0.9` t
 distance between checkpoints under write load is large.
 
 RocksDB replays only the WAL segments in front of the memtables that had not been
-flushed — bounded by `ROCKSDB_WRITE_BUFFER_BYTES`, which is now 256 MiB at the default
-cache size, not by a checkpoint interval. Recovery is seconds, and bounded by
-configuration rather than by how long the process had been running. `PointInTime`
-recovery mode also means a torn tail from an unclean kill truncates at the last
+flushed — typically `ROCKSDB_WRITE_BUFFER_BYTES`, 256 MiB at the default cache size, with
+`max_total_wal_size` (1 GiB) as the hard ceiling; not a checkpoint interval. Recovery is
+seconds, and bounded by configuration rather than by how long the process had been
+running. `TolerateCorruptedTailRecords` recovery mode also means a torn tail from an
+unclean kill truncates at the last
 consistent record instead of refusing to open, so there is no "won't start after a hard
 kill" state to be in.
 
@@ -168,64 +174,18 @@ the death spiral it was defending against is gone.
 
 ---
 
-## 4b. No lease, so a wedged volume takes twenty minutes to recover
+## 4b. Superseded — liveness is [006](./006-deploying-to-kubernetes.md) §2
 
-Postgres gives the cell a failure model for free: a wedged node loses its lease, the pod
-dies, and another takes over. An embedded engine has no lease, so the backend carries an
-in-process backstop instead — a write in flight past
-`ROCKSDB_WRITE_STALL_CEILING_SECONDS` (default 1200) raises the same `ShutdownSignal` the
-relational backends raise on lease loss, and the process exits so the kubelet restarts it.
+This section described an in-process wedge backstop, and none of it survives.
+`ROCKSDB_WRITE_STALL_CEILING_SECONDS`, `rocksdb_oldest_write_seconds` and
+`rocksdb_health_poll_age_seconds` were all deleted with the supervision layer and are
+read by nothing; an operator alerting on those two metrics gets "no data", which never
+fires. There is no twenty-minute ceiling.
 
-**Why the ceiling is twenty minutes rather than two.** RocksDB blocks writers both
-deliberately, as backpressure, and permanently, on a hung volume. Four review rounds each
-produced a new defect trying to tell those apart from inside, because every RocksDB signal
-that could — `num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
-`actual-delayed-write-rate`, `current-super-version-number` — is updated by the machinery
-that has stopped, and so latches in exactly the failure being detected. That
-classification was removed. What survives is duration alone, on a clock the crate owns
-rather than one RocksDB maintains, set generously enough that no legitimate ingest burst
-reaches it.
-
-So the honest number for the manifest: **a wedged volume leaves the cell unavailable for
-up to twenty minutes.** Postgres's lease is faster.
-
-Worse on an idle cell. The watchdog only sees a write that is in flight, and a cell
-serving reads without mutations issues persistence writes only from the committer's idle
-timestamp bump — randomised up to an hour. So an idle-but-serving cell can sit **one to
-two hours** with every read hanging before the twenty-minute clock starts. A cell taking
-steady relay ingest, which is the case here, does not have this gap; a cell that has gone
-quiet does.
-
-**A liveness probe does not close this gap, and the obvious one is a trap.** An earlier
-revision of this proposal recommended `livenessProbe` on `/version` as a replacement for
-the lease. That is wrong: `/version` is a pure async closure returning a cached string,
-serving on a tokio async worker rather than the blocking pool, and merged into the router
-after the timeout and concurrency layers are applied — so it sits outside both. On a
-wedged volume it answers `200 OK` in about a millisecond, indefinitely. Measured. A probe
-pointed at it reports the cell healthy for exactly as long as the cell is dead.
-
-Nothing currently exposed performs a storage round-trip on the blocking pool, so no HTTP
-probe can detect a wedge today. Adding such an endpoint would let the probe beat the
-twenty-minute ceiling, and is the natural follow-up if that number is too slow for the
-fleet's availability target.
-
-What is worth configuring now:
-
-- Keep the existing **readiness** probe on `/version` — it correctly answers "is this
-  process up and routing".
-- Alert on **`rocksdb_oldest_write_seconds`**, published by a watchdog thread that never
-  calls into RocksDB. Sustained growth means writers are parked, and it is the earliest
-  signal available — minutes before the ceiling fires. It cannot tell you *why*: a
-  backpressured burst and a dead volume look identical in it.
-- Alert on **`rocksdb_health_poll_age_seconds`** too. The polling thread can block inside
-  RocksDB, and a Prometheus gauge that stops being written still scrapes its last sample,
-  so this is what distinguishes "everything is fine" from "the monitor died and its
-  gauges froze looking fine".
-- Keep §4's generous **startup** probe. Recovery still has to open and load the database
-  before the port binds, and a liveness probe without a startup probe in front of it will
-  CrashLoopBackOff a large cell during boot.
-
----
+It also concluded that "no HTTP probe can detect a wedge today". That is no longer true:
+`/health/storage` performs one bounded persistence read on the blocking pool and is the
+recommended `livenessProbe`. See [006](./006-deploying-to-kubernetes.md) §2 for the probe
+and §2a for what the in-process escalation still covers.
 
 ## 5. Disk
 
@@ -347,15 +307,18 @@ to the safe one:
 | `sync=<interval>` | `manual_wal_flush(true)` plus a background thread flushing on a timer | bounded by the interval |
 | `sync=never` | OS buffers only | unbounded |
 
-This backend now has all three. The safe end is equivalent work by a different route:
+This backend has the two ends, not the middle. The safe end is equivalent work by a
+different route:
 rather than an explicit coordinator, `WriteOptions::set_sync(true)` lets RocksDB's own
 write groups coalesce concurrent writers and fsync the shared WAL once, which suits a
 committer that already batches. SurrealDB needs the explicit coordinator because each of
 its optimistic transactions commits on its own thread.
 
-`ROCKSDB_SYNC_INTERVAL_MS` adds the middle: `manual_wal_flush` plus a background thread
-calling `flush_wal(true)` on the interval, which turns an unbounded loss window into a
-number.
+The middle — `manual_wal_flush` plus a background thread calling `flush_wal(true)` on an
+interval, turning an unbounded loss window into a number — was built as
+`ROCKSDB_SYNC_INTERVAL_MS` and then deleted. It bought little at this deployment's commit
+rate (see below), and it cost a worker thread on the teardown path, which is where several
+defects on this branch have lived. The knob is read by nothing today.
 
 **What it is worth, measured.** The answer is "it depends on the commit rate, and for
 this deployment's shape, not much" — see the crate README for the table. At one commit

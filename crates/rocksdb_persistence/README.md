@@ -339,8 +339,15 @@ returns. RocksDB coalesces concurrent writers into one write group and syncs the
 shared WAL once for all of them, which suits the committer's up-to-16 concurrent
 writes.
 
-WAL recovery uses `PointInTime` mode: a torn tail from an unclean shutdown is
-truncated at the last consistent record rather than refusing to open.
+WAL recovery uses `TolerateCorruptedTailRecords`: a torn tail from an unclean
+shutdown is ignored rather than refusing to open — which matters, because nothing
+calls `Persistence::shutdown()`, so every restart is unclean. A checksum mismatch
+*inside* a WAL is a different thing, and there the open fails. `PointInTime`,
+which this used before, would instead have opened successfully and discarded the
+rest of that WAL and every later one, logging it at INFO. Since
+`MaxRepeatableTimestamp` lives in the same WAL and truncates alongside, the
+surviving state is self-consistent and the loss of acknowledged commits is
+undetectable — an unacceptable trade for a store with no replica to refill from.
 
 ## Threading
 

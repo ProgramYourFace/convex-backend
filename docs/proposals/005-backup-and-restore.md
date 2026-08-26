@@ -1,6 +1,6 @@
 # The RocksDB backup and restore path
 
-**Status:** **implemented.** `src/backup.rs` and the `rocksdb-backup` binary; §3's three pieces are built, §7's gaps are not. Tests cover the generation/retention/rehearsal/restore lifecycle, the refusal to restore over a populated directory, and a full destroy-and-restore across every column family including blob files.
+**Status:** **implemented.** `src/backup.rs` and the `rocksdb-backup` binary; §3's A, C and D are built, §3.B is deliberately the orchestrator's job, and §7's gaps are open. Tests cover the generation/retention/rehearsal/restore lifecycle, the refusal to restore over a populated directory, and a full destroy-and-restore across every column family including blob files.
 **Date:** 2026-08-25
 **Follows:** [004-rocksdb-in-kubernetes.md](./004-rocksdb-in-kubernetes.md) §6, which identifies this as the largest gap in adopting the backend
 **Scope:** the persistence layer only. See §6 for what this deliberately does not cover.
@@ -21,9 +21,9 @@ running pod holds a lock on. That is what is written here.
 |---|---|
 | **Mechanism** | `BackupEngine`, incremental, to a second local directory |
 | **Off-node** | an external sync of that directory; not this backend's job |
-| **Cadence** | a background worker in the backend, on an interval knob |
+| **Cadence** | the orchestrator's, not the backend's — a `CronJob`, or a CSI `VolumeSnapshot` schedule |
 | **Restore** | offline, before the backend opens the database — an init container or a one-shot job |
-| **RPO** | the backup interval, narrowed by whatever the upstream log can replay |
+| **RPO** | for volume snapshots, the snapshot interval; for `BackupEngine` generations, the last maintenance window |
 | **Does not cover** | file storage, which lives outside persistence (§6) |
 
 ---
@@ -103,18 +103,28 @@ Convex file is touched.
 `purge_old_backups(keep)`. It needs the live database handle, held read-write, so it lives on the
 persistence object rather than in a standalone tool. A secondary instance refuses.
 
-**B. A background worker** that calls it on an interval, with these knobs:
+**B. Scheduling, which is deliberately not in the backend.**
 
-| Knob | Suggested default | Meaning |
+| Knob | Default | Meaning |
 |---|--:|---|
-| `ROCKSDB_BACKUP_DIR` | unset | where backups go; unset disables backups entirely |
-| `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often to take one |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained before `purge_old_backups` |
 
-Unset-means-off matters: a backend that silently starts writing backups into an
-unconfigured path is worse than one that does nothing. The worker should log each
-backup's id, size and duration at info, and its failures at error — a backup system that
-fails quietly is the one failure mode worse than not having one.
+That is the only knob. An earlier revision of this document specified
+`ROCKSDB_BACKUP_DIR` and `ROCKSDB_BACKUP_INTERVAL_SECONDS` driving a worker thread
+inside the backend, and an earlier revision of the crate implemented it. Both are gone:
+the worker put backup timing, retention and failure handling on the critical path of the
+backend's own teardown — a shutdown had to wait out an in-flight generation, minutes wide
+on a real database — and it is work an orchestrator already knows how to do.
+
+Nothing reads those two variables now. Setting them has no effect and produces no
+warning, which is the most dangerous shape a stale runbook can have: an operator who sets
+them believes hourly backups are running and has none. If you find them in a manifest,
+delete them and schedule the job described in §E instead.
+
+Alert on the job, not on the database: a `CronJob` whose `lastSuccessfulTime` is older
+than its interval is the signal, and it is one the orchestrator already computes. There
+is no `rocksdb_backup_age_seconds` metric — an earlier revision of §7 promised one, and
+it was removed with the worker that published it.
 
 **C. A restore entry point.** `restore_from_latest_backup` and `restore_from_backup` must
 run with **no open database** — RocksDB holds a directory lock and a restore rewrites the
@@ -139,8 +149,10 @@ mistake of writing into a live database.
 **D. The rehearsal, which §7 called the highest-value gap.** `rocksdb-backup rehearse`
 restores a generation into a scratch directory, opens it, and iterates every column
 family touching values as well as keys — so a blob-stored document body is a read that
-actually happens rather than one a key-only scan would skip. `verify` checks that every file is present and the expected size — **not** checksums;
-this proves a database restored from them opens and can be read.
+actually happens rather than one a key-only scan would skip. `verify` checks that every file is present and the expected size — **not** checksums.
+The `rocksdb` crate exposes no way to turn checksum verification on: the C API defaults
+`verify_with_checksum` to false and the binding has no override. So `verify` cannot catch
+bit rot, and `rehearse` — which decodes every row — is the only thing here that can.
 
 ---
 
@@ -159,6 +171,40 @@ crate allowed it anyway; a single flush landing in the window produced a
 generation that was created `Ok`, passed `verify_backup`, and restored 10 of 210
 acknowledged documents. The guard is now a hard refusal with a test pinning it.
 
+#### The cycle that is actually schedulable
+
+`backup`, `verify`, `rehearse` and `restore` all take a *backup* directory, and a volume
+snapshot is not one — it restores to a *database* directory. So the two halves do not
+compose on their own, and an operator who schedules a snapshot and then points `rehearse`
+at a backup directory nothing has ever written gets `no backups in <dir>` on every run,
+forever. `rocksdb-backup check --db <dir>` is the missing verb: it is `rehearse`'s
+read-back, pointed at a database directory.
+
+That gives one cycle with no gap in it:
+
+1. **Snapshot** the data volume on a schedule, through your CSI driver's
+   `VolumeSnapshotClass`. This is the only backup that can be taken from a running cell.
+2. **Provision a PVC from the snapshot** in a `CronJob`. It is a clone, so no writer holds
+   it.
+3. **`rocksdb-backup check --db /clone`.** Opens the clone read-write — replaying its
+   write-ahead log exactly as recovery would — and decodes every row. This is the step
+   that turns a snapshot into a *tested* snapshot. Note that under
+   `TolerateCorruptedTailRecords` a genuinely corrupt WAL makes the open fail here rather
+   than silently truncating, which is the point.
+4. **Optionally `rocksdb-backup backup /backup --db /clone`** from that same clone, if you
+   want `BackupEngine` generations without a maintenance window. The clone has no writer,
+   so the read-write open succeeds.
+5. **Delete the clone.**
+
+Steps 2–5 are one `CronJob`. Alert on it not having succeeded within its interval.
+
+**`SyncMode::Never` invalidates step 1.** Everything above rests on an acknowledged write
+being in the WAL before `write` returns, which is only true under the default
+`SyncMode::Every`. A volume snapshot is host loss from the engine's point of view, and
+`Never`'s own row in the durability table gives host loss as "unbounded — whatever the OS
+had not written". Nothing warns about this at snapshot time and nothing in the snapshot
+records which mode produced it.
+
 ## 4. Restore runbook
 
 For a `StatefulSet` with `replicas: 1` and `updateStrategy: OnDelete`, where the pod
@@ -171,9 +217,11 @@ holds the volume:
    `get_backup_info`) against the backup directory and pick an id. Backup ids are
    always-increasing, so "latest" is well-defined; a corrupted-data incident is the case
    where you want an older one.
-3. **Verify it before you destroy anything.** `verify_backup(id)` checksums the backup's
-   files. A restore that overwrites a live directory with an unverified backup can turn a
-   recoverable incident into an unrecoverable one.
+3. **Verify it before you destroy anything.** `rocksdb-backup verify <dir> --id N` checks
+   that every file is present and the expected size. It does **not** checksum them (§3.D),
+   so it cannot detect bit rot; `rocksdb-backup rehearse` into a scratch directory is what
+   proves the generation decodes. A restore that overwrites a live directory with an
+   unverified backup can turn a recoverable incident into an unrecoverable one.
 4. **Restore into a fresh path**, not over the live one, if there is disk for it. Then
    swap directories. If there is not, take a `Checkpoint` of the live database first —
    hard links, so it costs almost nothing — and keep it until the restore is confirmed
@@ -285,15 +333,26 @@ which decodes rather than counts and refuses an empty result — but building th
 is not the same as running it. It has to be on a schedule, and the schedule is still
 yours to create.
 
-**Nothing measures the backup's age.** *Now published* as `rocksdb_backup_age_seconds`,
-on every worker tick whether the backup succeeded or not, because failures are events you
-can miss and age is a level you cannot. The alert on it is still the deliverable, and is
-still yours.
+**Nothing in the backend measures the backup's age**, and nothing will: the worker that
+would have published `rocksdb_backup_age_seconds` was deleted, and with no in-process
+scheduler there is no tick to publish it on. Age is a level rather than an event, so it
+still needs an alert — but the level now lives in the orchestrator, as the `CronJob`'s
+`lastSuccessfulTime`. Alerting on it is still the deliverable, and is still yours.
 
 **Concurrent access is refused rather than coordinated.** One advisory lock per backup
 directory means a listing during a backup fails instead of corrupting, which is the right
-default but is still an error an operator will hit. Two backends must never share a
-`ROCKSDB_BACKUP_DIR`.
+default but is still an error an operator will hit. Two cells must never share a backup
+directory.
+
+**The ownership check does not survive a fork.** A backup directory is claimed by a
+database identity row, and that row lives in `globals` so it travels with the data —
+deliberately, so a restored database can continue its chain. The consequence is that a
+database and a *copy* of it are indistinguishable: restore a generation into a staging
+cell deployed from the same chart, and staging's backups land in production's chain with a
+matching identity, where `purge_old_backups` ages production's generations out behind
+them. `list`, `verify` and `rehearse` all pass, because staging's data is perfectly valid
+data. A CSI clone of the data volume does the same thing. The check catches two
+independently created databases, which is the easy case; it does not catch a fork.
 
 **Backups are unencrypted.** RocksDB's backup files are the SSTs, in the clear. Whatever
 holds them off-node needs encryption at rest and access control at least as tight as the
