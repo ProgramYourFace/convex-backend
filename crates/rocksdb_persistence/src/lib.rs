@@ -216,6 +216,8 @@ pub(crate) struct Inner {
     sync: options::SyncMode,
     /// Where to report a database that has stopped accepting writes.
     shutdown: Option<ShutdownSignal>,
+    /// Engine writes that have failed since the last one that succeeded.
+    consecutive_write_failures: std::sync::atomic::AtomicU32,
     /// Latched by the first `shutdown()`, so a second is a no-op rather than an
     /// error. See the note there.
     shutdown_done: std::sync::atomic::AtomicBool,
@@ -322,6 +324,7 @@ impl RocksDbPersistence {
                 // A secondary instance never writes, so it has no WAL to flush.
                 sync: options::SyncMode::Every,
                 shutdown: None,
+                consecutive_write_failures: std::sync::atomic::AtomicU32::new(0),
                 shutdown_done: std::sync::atomic::AtomicBool::new(false),
                 _secondary_scratch: scratch,
             }),
@@ -388,31 +391,25 @@ impl RocksDbPersistence {
             _write_buffer_manager: shared.write_buffer_manager,
             sync,
             shutdown: opts.shutdown,
+            consecutive_write_failures: std::sync::atomic::AtomicU32::new(0),
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
             _secondary_scratch: None,
         });
+
+        // Minted here, by the writer, rather than lazily on the first backup.
+        // A backup taken from a secondary — the supported way to back up a
+        // running deployment — cannot mint it, because a secondary cannot
+        // write. Doing it at open means the row always exists by the time a
+        // scheduled backup looks for it, and it costs one synced put per
+        // process start.
+        inner
+            .identity()
+            .context("failed to establish the database's backup identity")?;
 
         Ok(Self { inner })
     }
 }
 
-/// Stops the background threads and flushes the write-ahead log before
-/// `Inner`'s fields — `db` among them — are dropped.
-///
-/// `Persistence::shutdown` is the intended teardown, but nothing in the tree
-/// calls it: `Database::shutdown` stops the committer and its workers and
-/// returns, and no relational backend overrides `shutdown` either, so the hook
-/// was never wired up. Dropping the handle is the closest thing to a teardown
-/// that runs, so it has to be the safe one.
-///
-/// It is not guaranteed to run either. `local_backend` installs no SIGTERM
-/// handler, so a Kubernetes pod stop terminates the process with no destructor
-/// executing at all — which under `SyncMode::Interval` costs up to one interval
-/// on every rolling restart. Under the default `SyncMode::Every` nothing is
-/// lost. Wiring a signal handler to `Persistence::shutdown` is an upstream gap
-/// affecting every backend, not just this one. Without this, `db` — the
-/// first field — would close while the workers were still running, and in
-/// `SyncMode::Interval` the WAL buffer would be discarded rather than written.
 /// Refuses a directory whose on-disk layout this build does not understand, and
 /// stamps the version on one that has none.
 ///
@@ -459,8 +456,8 @@ fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow:
 }
 
 impl Inner {
-    /// Escalates a write failure that means the database has stopped accepting
-    /// writes altogether, rather than that one write was bad.
+    /// Runs one engine write, escalating if the engine has stopped accepting
+    /// writes altogether rather than rejecting this one.
     ///
     /// RocksDB latches read-only on a background error — a full disk, an SST
     /// checksum failure — and stays there. Every subsequent write fails, the
@@ -468,41 +465,50 @@ impl Inner {
     /// pod that dies and a database another node can take over; an embedded one
     /// would fail every mutation indefinitely until somebody looked.
     ///
-    /// Checked here rather than on a timer, and only when a write has *already*
-    /// failed, for two reasons. It costs nothing on the path that matters:
-    /// `property_int_value` takes the engine's mutex, so polling it per write
-    /// would tax every commit. And it asks a question that is true *now* — this
-    /// write just failed and the engine reports itself in error — instead of
-    /// reading `background-errors` as a level. That counter is cumulative and
-    /// never cleared, while RocksDB auto-resumes retryable errors by default
-    /// (`max_bgerror_resume_count` is `INT_MAX`), so one transient EIO that the
-    /// engine itself recovered from leaves it permanently non-zero. Escalating
-    /// on the counter alone would kill a healthy backend; escalating on a
-    /// failed write plus a non-zero counter cannot.
-    fn escalate_if_read_only(&self, cause: &rocksdb::Error) {
-        let Some(shutdown) = &self.shutdown else {
-            return;
-        };
-        // The default column family, deliberately. `rocksdb.background-errors`
-        // is served per column family but RocksDB only ever increments it on
-        // `default`: `DBImpl` holds a single `default_cf_internal_stats_` and
-        // every bump goes through it. Asking any of the five this backend
-        // defines returns a permanent zero. Verified against a full filesystem:
-        // those five read `0` while `default` read `3`.
-        let errors = self
-            .db
-            .property_int_value(rocksdb::properties::BACKGROUND_ERRORS)
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        if errors == 0 {
-            return;
+    /// The signal is **consecutive failures across independent writes**, not
+    /// any property RocksDB exposes. An earlier version gated on
+    /// `rocksdb.background-errors` and was dead code for the case it was
+    /// written for: that counter is bumped in exactly two places, both of them
+    /// a failed background *flush* or *compaction*
+    /// (`db_impl_compaction_flush.cc`), and never by a foreground write or by
+    /// `ErrorHandler::SetBGError`. On ENOSPC the failing write never reaches
+    /// the memtable, so no flush is ever scheduled and the counter stays zero
+    /// while every write fails forever. Measured on an 8 MiB tmpfs: 20 rounds
+    /// of failing writes, `background-errors` reading `0` throughout, no
+    /// signal raised — and still refusing writes after 7 MiB was freed.
+    ///
+    /// Counting failures asks the question directly, needs no property read on
+    /// any path, and cannot be tripped by one bad write: the counter resets on
+    /// every success, so reaching the threshold means this many *in a row* got
+    /// nothing through.
+    fn engine_write<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce() -> Result<T, rocksdb::Error>,
+    ) -> anyhow::Result<T> {
+        match f() {
+            Ok(value) => {
+                self.consecutive_write_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                Ok(value)
+            },
+            Err(e) => {
+                let failures = self
+                    .consecutive_write_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if failures >= *options::WRITE_FAILURES_TO_ESCALATE
+                    && let Some(shutdown) = &self.shutdown
+                {
+                    shutdown.signal(anyhow::anyhow!(
+                        "{failures} consecutive RocksDB writes have failed (most recently {what}: \
+                         {e}); the engine is refusing writes, so stopping to let the deployment \
+                         restart or fail over rather than failing every mutation from here on"
+                    ));
+                }
+                Err(e.into())
+            },
         }
-        shutdown.signal(anyhow::anyhow!(
-            "a RocksDB write failed ({cause}) and the engine has latched {errors} background \
-             error(s), so it is refusing writes: stopping so the deployment restarts or fails \
-             over rather than failing every mutation from here on"
-        ));
     }
 
     pub(crate) fn cf(&self, name: &str) -> anyhow::Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
@@ -583,6 +589,16 @@ impl Inner {
         if let Some(bytes) = self.db.get_cf(&globals, IDENTITY_KEY)? {
             return Ok(String::from_utf8(bytes)?);
         }
+        // A secondary cannot mint one — it cannot write at all — and must not
+        // guess. Falling back to reading the `IDENTITY` file here would produce
+        // a value the primary might later mint differently, and the backup
+        // directory would then reject the database it was taken from. The
+        // primary mints this at open (see `open`), so an absent row means the
+        // database has never been opened read-write by this build.
+        anyhow::ensure!(
+            !self.secondary,
+            "this database has no backup identity yet, and a read-only instance cannot mint one.              Start the backend against it once, or take the backup with the writer stopped."
+        );
         // First call on this database: mint one and keep it. Derived from the
         // engine's own id when it has one, so two databases created in the same
         // instant cannot collide.
@@ -762,11 +778,9 @@ impl Inner {
         }
 
         let _timer = metrics::write_timer();
-        if let Err(e) = self.db.write_opt(batch, &self.write_options()) {
-            self.escalate_if_read_only(&e);
-            return Err(e.into());
-        }
-        Ok(())
+        self.engine_write("a document batch", || {
+            self.db.write_opt(batch, &self.write_options())
+        })
     }
 
     /// Delete every revision of `id` at or before `ts`, across all three
@@ -854,7 +868,9 @@ impl Persistence for RocksDbPersistence {
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
-            inner.db.write_opt(batch, &inner.write_options())?;
+            inner.engine_write("a persistence global", || {
+                inner.db.write_opt(batch, &inner.write_options())
+            })?;
             Ok(())
         })
         .await
@@ -919,7 +935,9 @@ impl Persistence for RocksDbPersistence {
                     }
                     iter.status()?;
                 }
-                inner.db.write_opt(batch, &inner.write_options())?;
+                inner.engine_write("a persistence global", || {
+                    inner.db.write_opt(batch, &inner.write_options())
+                })?;
                 metrics::log_index_entries_deleted(deleted);
                 Ok(deleted)
             },
@@ -954,7 +972,9 @@ impl Persistence for RocksDbPersistence {
                 for (id, ts) in highest_expired {
                     deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
                 }
-                inner.db.write_opt(batch, &inner.write_options())?;
+                inner.engine_write("an index-entry delete", || {
+                    inner.db.write_opt(batch, &inner.write_options())
+                })?;
                 metrics::log_documents_deleted(deleted);
                 Ok(deleted)
             },
@@ -999,7 +1019,9 @@ impl Persistence for RocksDbPersistence {
             for id in ids {
                 deleted += inner.delete_document_revisions(&mut batch, id, Timestamp::MAX)?;
             }
-            inner.db.write_opt(batch, &inner.write_options())?;
+            inner.engine_write("a document delete", || {
+                inner.db.write_opt(batch, &inner.write_options())
+            })?;
             metrics::log_documents_deleted(deleted);
             Ok(deleted)
         })
@@ -1013,17 +1035,6 @@ impl Persistence for RocksDbPersistence {
         // served by scanning a large write buffer.
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_finish_loading", move || -> anyhow::Result<()> {
-            // Deliberately no `write_watch` guard. `flush_cf` uses RocksDB's
-            // default `FlushOptions`, whose `allow_write_stall = false` waits
-            // for L0 to fall below the slowdown trigger — and "a bulk import
-            // leaves everything in L0" is this function's own premise, so the
-            // wait can be long and is healthy. Counting it as an in-flight
-            // write would let a large import trip the stall ceiling and stop a
-            // backend that is doing exactly what it was asked to.
-            //
-            // Nothing is lost: the guard exists so a *stalled acknowledged
-            // write* is visible, and this is neither acknowledged nor a write.
-            //
             // Every family, explicitly. `atomic_flush` does *not* widen a
             // single-family flush: `DBImpl::Flush` passes a one-element
             // candidate list into `SelectColumnFamiliesForAtomicFlush`, so
@@ -1033,7 +1044,8 @@ impl Persistence for RocksDbPersistence {
             // candidate list at all.) This loop is doing the work, not
             // repeating it.
             for name in ALL_COLUMN_FAMILIES {
-                inner.db.flush_cf(&inner.cf(name)?)?;
+                let cf = inner.cf(name)?;
+                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
             }
             Ok(())
         })
@@ -1058,7 +1070,8 @@ impl Persistence for RocksDbPersistence {
             }
             inner.db.flush_wal(true)?;
             for name in ALL_COLUMN_FAMILIES {
-                inner.db.flush_cf(&inner.cf(name)?)?;
+                let cf = inner.cf(name)?;
+                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
             }
             // Let in-flight compactions finish rather than leaving a large L0
             // for the next boot to recover through, but do not wait forever.

@@ -18,12 +18,6 @@ pub fn write_timer() -> Timer<VMHistogram> {
 }
 
 register_convex_histogram!(
-    ROCKSDB_WAL_FLUSH_SECONDS,
-    "Time for one interval-mode WAL flush and fsync",
-    &STATUS_LABEL
-);
-
-register_convex_histogram!(
     ROCKSDB_BACKUP_SECONDS,
     "Time to create one backup generation",
     &STATUS_LABEL
@@ -38,8 +32,6 @@ pub fn log_backup(size_bytes: u64, num_files: u32) {
     log_distribution(&ROCKSDB_BACKUP_BYTES, size_bytes as f64);
     log_distribution(&ROCKSDB_BACKUP_FILES_TOTAL, num_files as f64);
 }
-
-register_convex_counter!(ROCKSDB_BACKUP_FAILURES_TOTAL, "Backup attempts that failed");
 
 register_convex_histogram!(
     ROCKSDB_CONFLICT_CHECK_SECONDS,

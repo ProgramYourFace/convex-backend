@@ -36,6 +36,7 @@ use common::{
         TimestampRange,
     },
     query::Order,
+    shutdown::ShutdownSignal,
     types::{
         IndexId,
         Timestamp,
@@ -61,6 +62,7 @@ use value::{
 use crate::{
     backup,
     keys,
+    keys::CF_GLOBALS,
     options::{
         self,
         DbTuning,
@@ -1181,12 +1183,24 @@ async fn restore_refuses_a_non_empty_target() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A secondary instance has no WAL and no business writing a backup; saying so
-/// beats producing a subtly incomplete one.
+/// A live backup and a stopped-writer backup share one chain.
+///
+/// This is the ordinary operational mix: a CronJob backs up through a secondary
+/// while the backend runs, and an operator occasionally takes one by hand with
+/// the writer stopped. Both must land in the same directory as successive
+/// generations, because the backup directory is claimed by database identity —
+/// and a secondary cannot mint that identity, so it has to already match.
+///
+/// An earlier revision asserted the opposite of this test: that "a secondary
+/// instance has no WAL and no business writing a backup". The premise was
+/// wrong. A secondary tails the primary's WAL, which is exactly what makes a
+/// live backup complete.
 #[tokio::test]
-async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
+async fn live_and_stopped_backups_share_a_chain() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backup");
+
     let primary = RocksDbPersistence::new(&db_path)?;
     primary
         .write(
@@ -1196,11 +1210,19 @@ async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
         )
         .await?;
 
+    // Live, through a secondary, while the primary holds the lock.
     let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
-    let err = secondary
-        .backup(&dir.path().join("backup"), 4)
-        .expect_err("a secondary must refuse");
-    assert!(format!("{err}").contains("secondary"), "{err}");
+    secondary.backup(&backup_dir, 4)?;
+
+    // Stopped, by the writer itself.
+    primary.backup(&backup_dir, 4)?;
+
+    let generations = backup::list(&backup_dir)?;
+    assert_eq!(
+        generations.len(),
+        2,
+        "both backups belong to the same chain, so the directory should hold two generations"
+    );
     Ok(())
 }
 
@@ -1345,7 +1367,7 @@ async fn rehearse_refuses_an_empty_database() -> anyhow::Result<()> {
 
 /// RocksDB defines no behaviour for two backup engines on one directory —
 /// its own header says the result may include trashing the directory — and
-/// `purge_old_backups` runs on every worker tick, so an operator listing
+/// `purge_old_backups` runs on every scheduled backup, so an operator listing
 /// generations while the worker prunes is a real sequence.
 #[tokio::test]
 async fn backup_directory_refuses_concurrent_use() -> anyhow::Result<()> {
@@ -1795,6 +1817,186 @@ async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<
         "a retry after a failed shutdown must not report success: the guard latched before the \
          flush, so this returns Ok having flushed nothing"
     );
+    Ok(())
+}
+
+/// The escalation must fire when the engine stops accepting writes, and must
+/// not fire for writes that merely fail.
+///
+/// This had no coverage at all, and the version it replaced could not have
+/// fired: it gated on `rocksdb.background-errors`, which RocksDB bumps only on
+/// a failed background flush or compaction. On ENOSPC the failing write never
+/// reaches the memtable, so no flush is scheduled and that counter stays zero
+/// while every write fails forever — measured on a full tmpfs at 20 rounds with
+/// no signal raised.
+///
+/// Driven through `Inner::engine_write` with a synthetic failure rather than by
+/// filling a real volume, so it runs anywhere and asserts the policy rather
+/// than the operating system.
+#[tokio::test]
+async fn repeated_engine_write_failures_escalate() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let persistence = RocksDbPersistence::open_with(
+        &dir.path().join("db"),
+        OpenOptions {
+            sync: None,
+            shutdown: Some(ShutdownSignal::new(tx)),
+            ..OpenOptions::default()
+        },
+    )?;
+    let inner = &persistence.inner;
+
+    let fail = || {
+        inner.engine_write("a synthetic failure", || {
+            // A real engine error, produced without needing a full volume:
+            // opening a checkpoint at a path that already exists fails.
+            Err::<(), _>(synthetic_engine_error())
+        })
+    };
+
+    // Below the threshold: a write that fails is not a database that has
+    // stopped accepting writes.
+    for _ in 0..(*options::WRITE_FAILURES_TO_ESCALATE - 1) {
+        assert!(fail().is_err());
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a run of failures below the threshold must not stop the backend"
+    );
+
+    // A success clears the run, so the count is consecutive rather than
+    // cumulative — the distinction that keeps a transient error from ever
+    // accumulating into a shutdown.
+    let globals = inner.cf(CF_GLOBALS)?;
+    inner.engine_write("a real write", || {
+        inner.db.put_cf(&globals, b"escalation-test", b"1")
+    })?;
+    for _ in 0..(*options::WRITE_FAILURES_TO_ESCALATE - 1) {
+        assert!(fail().is_err());
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a success must reset the run, so this second partial run must not escalate either"
+    );
+
+    // And over the threshold, it stops.
+    for _ in 0..*options::WRITE_FAILURES_TO_ESCALATE {
+        assert!(fail().is_err());
+    }
+    let reported = rx
+        .try_recv()
+        .expect("the backend must stop once the engine is refusing writes");
+    assert!(
+        reported.to_string().contains("refusing writes"),
+        "unexpected escalation message: {reported}"
+    );
+    Ok(())
+}
+
+/// A genuine , for tests that need a failing engine write
+/// without a failing device. `rocksdb::Error::new` is private to the binding.
+fn synthetic_engine_error() -> rocksdb::Error {
+    rocksdb::DB::destroy(
+        &rocksdb::Options::default(),
+        "/proc/self/definitely-not-a-database",
+    )
+    .expect_err("destroying a database under /proc must fail")
+}
+
+/// A backup taken while the primary is live must contain every acknowledged
+/// write, including ones the primary has never flushed.
+///
+/// This is the supported way to back up a running deployment, so it is worth
+/// stating what makes it work. RocksDB allows one writer, so a scheduled job
+/// cannot open the data directory read-write while the backend holds it. A
+/// secondary opens without the lock and tails the primary's write-ahead log —
+/// and under `SyncMode::Every` an acknowledged write is in that log before
+/// `write` returns. So the recovery point is the moment of the backup, not the
+/// moment the secondary opened, and not the last flush.
+///
+/// The writes below are deliberately never flushed: they exist only in the
+/// primary's memtable and its WAL when the backup is taken. Restoring through
+/// the real `restore` path — whose `RestoreOptions` differ from a hand-rolled
+/// one — is the point of the test.
+#[tokio::test]
+async fn a_backup_of_a_live_primary_captures_unflushed_writes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let backup_dir = dir.path().join("backups");
+    let primary = RocksDbPersistence::new(&db_path)?;
+
+    let batch = |from: u32, n: u32| -> anyhow::Result<Vec<DocumentLogEntry>> {
+        (from..from + n)
+            .map(|i| {
+                Ok(DocumentLogEntry {
+                    ts: ts(u64::from(i) + 1),
+                    id: doc_id(1, i),
+                    value: Some(document(1, i, "body")?),
+                    prev_ts: None,
+                })
+            })
+            .collect()
+    };
+
+    primary
+        .write(&batch(0, 100)?, &[], ConflictStrategy::Error)
+        .await?;
+
+    // Opened before the rest of the writes, as a long-running sidecar would be.
+    let secondary = RocksDbPersistence::new_secondary(&db_path)?;
+
+    // Acknowledged after the secondary opened, and never flushed.
+    primary
+        .write(&batch(100, 100)?, &[], ConflictStrategy::Error)
+        .await?;
+
+    // The whole operation a CronJob performs.
+    secondary.backup(&backup_dir, 3)?;
+
+    let restored_dir = dir.path().join("restored");
+    backup::restore(&backup_dir, &restored_dir, None)?;
+    let restored = RocksDbPersistence::new(&restored_dir)?;
+    let check = restored.inner.verify_readable()?;
+    assert_eq!(
+        check.documents, 200,
+        "a live backup must include writes the primary acknowledged but never flushed; got {} of \
+         200",
+        check.documents
+    );
+    Ok(())
+}
+
+/// `SyncMode::Never` must still survive a crash of *this* process.
+///
+/// The mode trades away host loss, not process loss: RocksDB still writes
+/// through to the page cache on every write, so only the machine going down
+/// loses data. Nothing tested that, and `new_with_sync_mode` — the only way to
+/// state the mode in code rather than hope an environment variable was set —
+/// had no callers at all.
+#[tokio::test]
+async fn never_sync_survives_a_process_crash() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("db");
+    {
+        let persistence = RocksDbPersistence::new_with_sync_mode(&path, SyncMode::Never)?;
+        persistence
+            .write(
+                &[entry(1, 1, 10, "v1", None)?],
+                &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+                ConflictStrategy::Error,
+            )
+            .await?;
+        // Deliberately no shutdown: dropping the handle is the closest thing to
+        // a teardown that a killed process gets.
+    }
+    let reopened = RocksDbPersistence::new(&path)?;
+    let check = reopened.inner.verify_readable()?;
+    assert_eq!(
+        check.documents, 1,
+        "a write acknowledged under `Never` must survive reopening the database"
+    );
+    assert_eq!(check.index_entries, 1);
     Ok(())
 }
 

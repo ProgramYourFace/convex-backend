@@ -222,9 +222,23 @@ pub static SCAN_PAGE_ROWS: LazyLock<usize> =
 pub static BACKUP_KEEP: LazyLock<usize> =
     LazyLock::new(|| env_config("ROCKSDB_BACKUP_KEEP", 24usize));
 
+/// Consecutive failed engine writes before the process stops itself.
+///
+/// Counted across independent writes and reset by any success, so this is "the
+/// engine got nothing through, this many times running" rather than "one write
+/// was bad". Small, because RocksDB latches read-only rather than recovering:
+/// once it is refusing writes, waiting longer only fails more mutations.
+pub static WRITE_FAILURES_TO_ESCALATE: LazyLock<u32> =
+    LazyLock::new(|| env_config::<u32>("ROCKSDB_WRITE_FAILURES_TO_ESCALATE", 5).max(1));
+
 /// How long `shutdown` waits for background compactions to settle.
-pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64)));
+/// Clamped away from zero deliberately. RocksDB reads a zero timeout on
+/// `WaitForCompactOptions` as "wait as long as there is background work to
+/// finish" — the opposite of what an operator setting it to zero would mean,
+/// and an unbounded wait on the teardown path.
+pub static SHUTDOWN_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config("ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS", 30u64).clamp(1, 300))
+});
 
 fn default_background_jobs() -> i32 {
     std::thread::available_parallelism()

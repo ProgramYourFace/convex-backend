@@ -30,9 +30,12 @@ rocksdb-backup — administer backups of an embedded RocksDB Convex database
 
 Without --id, the newest generation is used.
 
-`backup` is for the database being *stopped* — before an upgrade or a risky
-migration. RocksDB allows one writer, so it fails while the backend is running;
-a running deployment takes its generations from the periodic worker instead.
+`backup` opens the database through a SECONDARY instance, which takes no lock
+and tails the primary's write-ahead log — so it works against a running
+deployment, which is what makes it schedulable. RocksDB allows one writer but
+any number of secondaries. Under the default sync mode an acknowledged write is
+in that log before `write` returns, so the recovery point is the moment of the
+backup rather than the last flush.
 
 `verify` checks that the files are intact. `rehearse` checks the thing you
 actually need to know — that a database restored from them opens and reads —
@@ -71,7 +74,7 @@ fn parse() -> anyhow::Result<Args> {
         dir,
         to: None,
         db: None,
-        keep: 24,
+        keep: *rocksdb_persistence::options::BACKUP_KEEP,
         scratch: None,
         id: None,
     };
@@ -123,28 +126,20 @@ fn run() -> anyhow::Result<()> {
             let db_dir = args
                 .db
                 .ok_or_else(|| anyhow::anyhow!("backup needs --db <db-dir>"))?;
-            // No background work: this is a one-shot tool, and attaching a
-            // periodic worker or a health monitor to it would be surprising.
             anyhow::ensure!(
                 db_dir.join("CURRENT").exists(),
                 "{} is not a RocksDB database. Refusing to create one — a mistyped --db would \
                  otherwise back up an empty database over a real chain.",
                 db_dir.display(),
             );
-            let persistence = rocksdb_persistence::RocksDbPersistence::open_with(
-                &db_dir,
-                rocksdb_persistence::OpenOptions {
-                    ..rocksdb_persistence::OpenOptions::default()
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "could not open {}. RocksDB allows one writer, so this fails while the \
-                     backend is running — stop it first, or let the periodic worker take the \
-                     backup instead.",
-                    db_dir.display(),
-                )
-            })?;
+            // Opened as a *secondary*, always. RocksDB allows one writer, so a
+            // read-write open fails whenever the backend is running — which is
+            // when a scheduled backup runs. A secondary takes no lock, tails
+            // the primary's write-ahead log, and sees every acknowledged write.
+            // It works just as well against a stopped database, so there is one
+            // code path rather than two.
+            let persistence = rocksdb_persistence::RocksDbPersistence::new_secondary(&db_dir)
+                .with_context(|| format!("could not open {} for reading", db_dir.display()))?;
             let info = persistence.backup(&args.dir, args.keep)?;
             println!(
                 "backup {} written: {} files, {} MiB",
