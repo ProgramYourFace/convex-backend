@@ -352,6 +352,24 @@ impl RocksDbPersistence {
         let db = Db::open_cf_descriptors_as_secondary(&shared.db, path, secondary_path, cfs)
             .with_context(|| format!("failed to open RocksDB secondary at {}", path.display()))?;
         db.try_catch_up_with_primary()?;
+        // Said once, here, rather than inferred from a probe's return value.
+        // A secondary cannot write into a directory it does not own, so its
+        // storage check is a read, and how much that read proves depends on
+        // what this platform can do to keep it out of the page cache.
+        match platform::cache_bypass() {
+            platform::CacheBypass::Fadvise => tracing::info!(
+                "rocksdb secondary storage checks will drop the page cache before reading"
+            ),
+            platform::CacheBypass::FNoCache => tracing::warn!(
+                "rocksdb secondary storage checks use F_NOCACHE, which does not evict pages \
+                 already resident: a liveness probe against this reader may be answered from \
+                 memory"
+            ),
+            platform::CacheBypass::None => tracing::warn!(
+                "rocksdb secondary storage checks cannot bypass the page cache on this platform: \
+                 a liveness probe against this reader proves only that the path is openable"
+            ),
+        }
         check_format_version(&db, path, false)?;
         Ok(Self {
             inner: Arc::new(Inner {

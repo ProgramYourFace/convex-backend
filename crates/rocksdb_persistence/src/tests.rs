@@ -2398,9 +2398,11 @@ async fn a_secondary_probes_by_reading_and_a_primary_by_writing() -> anyhow::Res
         .expect("the secondary probes by reading, so it is unaffected");
     std::fs::remove_dir(&occupied)?;
 
-    // And the secondary really does read, rather than returning `Ok(())`:
-    // without this the whole branch could be deleted and this test would still
-    // pass, which is how three probes in a row shipped doing nothing.
+    // And the secondary really does *read*, rather than returning `Ok(())`.
+    // The assertion above already catches the branch being deleted outright —
+    // a secondary on the primary's write path trips over the occupied probe
+    // path — but nothing so far distinguishes "reads CURRENT" from "returns
+    // Ok(())", which is the shape three probes in a row shipped in.
     let current = db_path.join("CURRENT");
     let moved = db_path.join("CURRENT.moved");
     std::fs::rename(&current, &moved)?;
@@ -2414,11 +2416,22 @@ async fn a_secondary_probes_by_reading_and_a_primary_by_writing() -> anyhow::Res
     );
     std::fs::rename(&moved, &current)?;
 
-    // A secondary must never write into the primary's directory.
+    // A secondary must never write into the primary's directory. Comparing the
+    // whole listing, not just the probe's path: the primary removes its own
+    // probe too, so an existence check would pass for a secondary that wrote
+    // and then unlinked.
+    let before: BTreeSet<_> = std::fs::read_dir(&db_path)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
     secondary.check_storage().await?;
-    assert!(
-        !db_path.join("convex-storage-probe").exists(),
-        "the secondary wrote into a directory it does not own",
+    let after: BTreeSet<_> = std::fs::read_dir(&db_path)?
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        before, after,
+        "the secondary touched a directory it does not own",
     );
     Ok(())
 }

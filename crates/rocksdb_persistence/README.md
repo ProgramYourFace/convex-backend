@@ -389,6 +389,27 @@ rest of that WAL and every later one, logging it at INFO. Since
 surviving state is self-consistent and the loss of acknowledged commits is
 undetectable — an unacceptable trade for a store with no replica to refill from.
 
+## Portability
+
+Two things in this crate are not portable Rust, and both live in `platform.rs` so the
+answer is in one place rather than scattered through `unsafe` blocks.
+
+**The backup directory lock is `flock`, so `rocksdb-backup` is unix-only.** On any other
+target every subcommand that opens the backup directory returns "backups need an exclusive
+directory lock, which is only implemented for unix". A no-op lock was the alternative and
+is worse: two concurrent backups would interleave their generations into one chain, which
+is the failure the lock exists to prevent.
+
+**The storage check's cache bypass is per-platform**, and only the *secondary* path
+depends on it — a primary writes and fsyncs, which is portable. Linux, Android, FreeBSD
+and illumos get `POSIX_FADV_DONTNEED`; macOS gets `F_NOCACHE`, which stops the descriptor
+retaining what it reads but does not evict pages already resident, so it is genuinely
+weaker; anything else gets an ordinary cached read. The backend logs which applies when it
+opens a secondary, so this is never something to infer from behaviour.
+
+Deployments are Linux containers. The rest exists so the crate builds on the five targets
+`precompile.yml` releases, since `db_connection` depends on it unconditionally.
+
 ## Threading
 
 RocksDB is synchronous. Every call into it runs on a blocking pool thread, so no

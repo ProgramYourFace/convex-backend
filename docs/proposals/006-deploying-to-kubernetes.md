@@ -145,8 +145,9 @@ flush. Do not expose port 3210 beyond the cluster, and keep `failureThreshold` a
 higher so a transient saturation cannot restart a healthy pod.
 
 **One configuration where this is not a check at all:** a data directory on `tmpfs` —
-`emptyDir: {medium: Memory}`. `fsync` there is a no-op, and `POSIX_FADV_DONTNEED` does not
-evict either, so neither the primary's write nor a secondary's read leaves memory. There
+`emptyDir: {medium: Memory}`. `fsync` there is a no-op, and `POSIX_FADV_DONTNEED` returns
+success while evicting nothing — measured — so neither the primary's write nor a
+secondary's read leaves memory. There
 is also no device to wedge, so nothing is lost; it is worth knowing before reading a green
 probe as evidence about storage.
 
@@ -183,8 +184,9 @@ clock, but it means the server-side timeout cannot be relied on to bound the pro
 what it adds over anything read-based. The in-process escalation covers it too, but it
 only fires once a write is attempted, and on a read-mostly cell the only writes are the
 committer's idle bump, jittered 1–2 h apart. Once a bump does start, the five consecutive
-failures take about a second and a half — it retries in place with a 100 ms backoff — so
-the window is the wait for the next bump, not five of them: **up to two hours** (§2a).
+failures land within about a second and a half — it retries in place on an exponential
+backoff starting at 100 ms — so the window is the wait for the next bump, not five of
+them: **up to two hours** (§2a).
 
 **A read-mostly cell.** On a cell with no user mutations the only persistence write is the
 committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and
@@ -407,8 +409,11 @@ change it when you restore into a new cell.
   does compile. Build the backend before relying on the manifest above.
 - **A secondary's probe is weaker than a primary's.** A read replica cannot write
   into the primary's directory, so its check drops `CURRENT`'s page cache and
-  re-reads it. `POSIX_FADV_DONTNEED` is advisory, and the read cannot detect a
-  read-only remount. Nothing in this tree opens a secondary reader today.
+  re-reads it. How much that proves is per-platform — `POSIX_FADV_DONTNEED` on
+  Linux, the weaker `F_NOCACHE` on macOS, nothing elsewhere — and every
+  mechanism is advisory, so unlike the primary's write it cannot detect a
+  read-only remount. The backend logs which is in effect when it opens a
+  secondary. Nothing in this tree opens one today.
 - **`Persistence::shutdown()` is dead** (§4). Wiring SIGTERM to it would make
   restarts clean and shrink §4's window considerably — but it also changes the
   teardown path, which is where several defects have lived, so it wants its own

@@ -884,13 +884,13 @@ impl PersistenceReader for RocksDbPersistence {
             // answered entirely from memory — the same defect as the two probes
             // this one replaced, for the third time.
             //
-            // So drop the cached page first. `POSIX_FADV_DONTNEED` on a clean
-            // file evicts its pages, and the read that follows has to go to the
-            // device. It is advisory, so this is weaker than the primary's
-            // write — it cannot detect a read-only remount, and a filesystem
-            // that ignores the hint makes it a cache hit again — but it is the
-            // strongest thing available to a process that is not allowed to
-            // write here.
+            // So drop the cached page first — see `crate::platform`, which is
+            // where the per-target answer lives: `POSIX_FADV_DONTNEED` on
+            // Linux and friends, `F_NOCACHE` on Apple, and nothing at all
+            // elsewhere. Whichever applies, this stays weaker than the
+            // primary's write: it cannot detect a read-only remount, and every
+            // mechanism is advisory. `open_secondary` logs which one is in
+            // effect, so a reader is never left inferring it.
             if inner.secondary {
                 let current = inner.path.join("CURRENT");
                 let mut file = std::fs::File::open(&current).with_context(|| {
@@ -900,6 +900,11 @@ impl PersistenceReader for RocksDbPersistence {
                 crate::platform::read_bypassing_cache(&mut file, &mut bytes).with_context(
                     || format!("cannot read the database at {}", inner.path.display()),
                 )?;
+                anyhow::ensure!(
+                    !bytes.is_empty(),
+                    "the database at {} has an empty CURRENT",
+                    inner.path.display(),
+                );
                 return Ok(());
             }
             let probe = inner.path.join(PROBE_FILE);

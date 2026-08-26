@@ -79,17 +79,22 @@ use serde_json::Value as JsonValue;
 
 // We only have a single Sqlite connection which does not allow async calls, so
 // we can't really make queries concurrent.
-/// The file `check_storage` writes and removes, beside the database.
-const PROBE_FILE: &str = "convex-storage-probe";
+/// Prefixes the storage probe's filename, which is otherwise the database's.
+///
+/// Per-database, because two `SqlitePersistence` instances over different
+/// databases in one directory would otherwise share one probe file and unlink
+/// each other's.
+const PROBE_PREFIX: &str = "convex-storage-probe-";
 
 pub struct SqlitePersistence {
     inner: Arc<Mutex<Inner>>,
-    /// Where to write the storage probe, or `None` when there is no file.
+    /// The file the storage probe writes, or `None` when the database has no
+    /// file on disk and there is nothing to check.
     ///
     /// Deliberately outside the mutex: the probe is reachable from an
     /// unauthenticated liveness endpoint and must not contend with the lock
     /// every query and commit takes.
-    probe_directory: Option<PathBuf>,
+    probe_file: Option<PathBuf>,
 }
 
 struct Inner {
@@ -112,30 +117,42 @@ impl SqlitePersistence {
         // probe into a permanent `Ok(())`. `sqlite3_db_filename` returns the
         // resolved absolute path, and an empty string for a database with no
         // file at all.
-        let probe_directory: Option<PathBuf> = connection
+        let probe_file: Option<PathBuf> = connection
             .path()
             .filter(|resolved| !resolved.is_empty())
-            .and_then(|resolved| Path::new(resolved).parent().map(Path::to_path_buf));
+            .map(|resolved| {
+                let path = Path::new(resolved);
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                path.with_file_name(format!("{PROBE_PREFIX}{name}"))
+            });
+        match &probe_file {
+            Some(probe) => tracing::info!("sqlite storage checks will write {}", probe.display()),
+            // `Connection::path` is `None` for a NULL filename *and* for a
+            // non-UTF-8 one, so this is not only the in-memory case. Said out
+            // loud, because the alternative is a liveness check that returns
+            // `Ok(())` for ever with nothing to show why.
+            None => tracing::info!(
+                "sqlite has no file on disk for {path:?}, so storage checks are disabled"
+            ),
+        }
         // Execute create tables unconditionally since they are idempotent.
         connection.execute_batch(DOCUMENTS_INIT)?;
         connection.execute_batch(INDEXES_INIT)?;
         connection.execute_batch(PERSISTENCE_GLOBALS_INIT)?;
         // A probe file only survives if the process died between the fsync and
         // the unlink, so it is always stale.
-        if let Some(directory) = &probe_directory {
-            let probe = directory.join(PROBE_FILE);
-            if let Err(e) = std::fs::remove_file(&probe)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!("could not remove a stale {}: {e}", probe.display());
-            }
+        if let Some(probe) = &probe_file
+            && let Err(e) = std::fs::remove_file(probe)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("could not remove a stale {}: {e}", probe.display());
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 newly_created,
                 connection,
             })),
-            probe_directory,
+            probe_file,
         })
     }
 
@@ -294,7 +311,7 @@ impl Persistence for SqlitePersistence {
     fn reader(&self) -> Arc<dyn PersistenceReader> {
         Arc::new(Self {
             inner: self.inner.clone(),
-            probe_directory: self.probe_directory.clone(),
+            probe_file: self.probe_file.clone(),
         })
     }
 
@@ -668,7 +685,7 @@ impl PersistenceReader for SqlitePersistence {
     async fn check_storage(&self) -> anyhow::Result<()> {
         use std::io::Write as _;
 
-        let Some(directory) = self.probe_directory.clone() else {
+        let Some(probe) = self.probe_file.clone() else {
             return Ok(());
         };
         // On the blocking pool, for the reason the probe exists: it is designed
@@ -679,19 +696,13 @@ impl PersistenceReader for SqlitePersistence {
         // can serve nothing at all, including the failure it is being killed
         // for.
         tokio_spawn_blocking("sqlite_check_storage", move || -> anyhow::Result<()> {
-            let probe = directory.join(PROBE_FILE);
             let written = (|| -> std::io::Result<()> {
                 let mut file = std::fs::File::create(&probe)?;
                 file.write_all(b"convex storage probe\n")?;
                 file.sync_all()
             })();
             let _ = std::fs::remove_file(&probe);
-            written.with_context(|| {
-                format!(
-                    "cannot write beside the database at {}",
-                    directory.display()
-                )
-            })?;
+            written.with_context(|| format!("cannot write {}", probe.display()))?;
             Ok(())
         })
         .await?
@@ -853,30 +864,53 @@ mod tests {
 
     use super::SqlitePersistence;
 
-    /// Resolved by SQLite, not by parsing the spec — including the URI forms a
-    /// hand-rolled parser gets backwards. `%2F` decodes to a separator *after*
-    /// the query is split off, so the database is a directory deeper than it
-    /// looks and a naive probe would report on the wrong filesystem.
+    /// Where the probe writes is resolved by SQLite, not by parsing the spec.
+    ///
+    /// Two URI forms are the reason. `%2F` decodes to a separator *after* the
+    /// query is split off, so the database is a directory deeper than a naive
+    /// split puts it, and the probe would report on the wrong filesystem. And
+    /// a `#` ends the spec, so a `?mode=memory` after one is part of the
+    /// filename — reading it as in-memory turns an unauthenticated liveness
+    /// check into a permanent `Ok(())`.
     #[test]
-    fn probe_directory_is_whatever_sqlite_opened() -> anyhow::Result<()> {
+    fn the_probe_lands_where_sqlite_opened_the_database() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let nested = dir.path().join("data");
         std::fs::create_dir_all(&nested)?;
+        let directory_of = |p: &SqlitePersistence| {
+            p.probe_file
+                .as_ref()
+                .and_then(|f| f.parent().map(std::path::Path::to_path_buf))
+        };
 
         for spec in [
             ":memory:",
+            // A private on-disk temp database: SQLite reports no filename.
+            "",
             "file::memory:",
             "file:x?mode=memory&cache=shared",
         ] {
             let persistence = SqlitePersistence::new(spec)?;
-            assert_eq!(persistence.probe_directory, None, "{spec} names no file");
+            assert_eq!(persistence.probe_file, None, "{spec} names no file");
         }
 
         let plain = nested.join("db.sqlite3");
         let persistence = SqlitePersistence::new(plain.to_str().unwrap())?;
         assert_eq!(
-            persistence.probe_directory.as_deref(),
-            Some(nested.as_path()),
+            directory_of(&persistence).as_deref(),
+            Some(nested.as_path())
+        );
+        // Named after the database, so two of them in one directory do not
+        // unlink each other's probe.
+        assert_eq!(
+            persistence
+                .probe_file
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("{}db.sqlite3", super::PROBE_PREFIX),
         );
 
         // `%2F` is a separator once SQLite decodes it, so this database is in
@@ -885,9 +919,17 @@ mod tests {
         let encoded = format!("file:{}%2Fdata%2Fdb2.sqlite3", dir.path().display());
         let persistence = SqlitePersistence::new(&encoded)?;
         assert_eq!(
-            persistence.probe_directory.as_deref(),
+            directory_of(&persistence).as_deref(),
             Some(nested.as_path()),
             "%2F must resolve as a directory separator",
+        );
+
+        // A `#` ends the spec, so this is an ordinary file, not in-memory.
+        let fragment = format!("file:{}/db3.sqlite3#?mode=memory", nested.display());
+        let persistence = SqlitePersistence::new(&fragment)?;
+        assert!(
+            persistence.probe_file.is_some(),
+            "a `#` fragment does not make a database in-memory",
         );
         Ok(())
     }
@@ -904,10 +946,13 @@ mod tests {
         persistence.check_storage().await?;
 
         // Nothing accumulates.
-        assert!(!dir.path().join(super::PROBE_FILE).exists());
+        assert!(std::fs::read_dir(dir.path())?.flatten().all(|e| !e
+            .file_name()
+            .to_string_lossy()
+            .starts_with(super::PROBE_PREFIX)));
 
         // Occupying the probe's path fails a write and not a read.
-        std::fs::create_dir(dir.path().join(super::PROBE_FILE))?;
+        std::fs::create_dir(persistence.probe_file.clone().unwrap())?;
         assert!(
             persistence.check_storage().await.is_err(),
             "the probe must fail when it cannot create its file",

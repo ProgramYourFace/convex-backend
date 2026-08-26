@@ -50,51 +50,121 @@ pub(crate) fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
     ))
 }
 
-/// Reads `file` in a way that has to reach the storage device, filling `buf`.
+/// What a platform can do to keep a read from being served out of memory.
 ///
-/// The point is defeating the page cache. A liveness probe that reads a file
-/// the process has already touched proves nothing — it is answered from memory
-/// on a volume nothing can reach, which is how three successive versions of
-/// this backend's probe shipped broken.
+/// Named rather than reduced to a bool, because the honest answer differs per
+/// platform and the difference matters: a probe that reports "the device is
+/// alive" when it never left the page cache is precisely the defect four
+/// consecutive review rounds found in this backend.
+// Exactly one variant is constructible per target, so the other two are always
+// dead on any given build. Allowed rather than silenced per-variant, because
+// the point of the enum is that all three exist somewhere.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheBypass {
+    /// `posix_fadvise(POSIX_FADV_DONTNEED)`. Evicts clean, unmapped pages, so
+    /// the read that follows has to fault them back from the device. Advisory:
+    /// a filesystem may accept the call and do nothing — tmpfs does, measurably
+    /// — so this is the strongest available, not a guarantee.
+    Fadvise,
+    /// `F_NOCACHE`. Stops the descriptor caching *future* I/O; it does not
+    /// evict pages already resident, so a small file the process has recently
+    /// read can still be served from the unified buffer cache. Weaker than
+    /// [`Self::Fadvise`], and weaker than its name suggests.
+    FNoCache,
+    /// Nothing. The read is an ordinary cached read and proves only that the
+    /// path is still openable.
+    None,
+}
+
+/// What this build will do. A constant, so it can be reported once at open
+/// rather than guessed at from a probe's return value.
+pub(crate) const fn cache_bypass() -> CacheBypass {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos"
+    ))]
+    {
+        CacheBypass::Fadvise
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        CacheBypass::FNoCache
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_vendor = "apple"
+    )))]
+    {
+        CacheBypass::None
+    }
+}
+
+/// Reads `file`, doing whatever this platform offers to keep the read from
+/// being answered out of the page cache.
 ///
-/// Returns whether the cache was actually bypassed, because on some platforms
-/// it cannot be and the caller should not claim otherwise.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<bool> {
+/// The point is defeating that cache. A liveness probe that reads a file the
+/// process has already touched proves nothing — it is answered from memory on a
+/// volume nothing can reach, which is how three successive versions of this
+/// backend's probe shipped broken.
+///
+/// It returns no claim about whether that succeeded, deliberately. None of the
+/// mechanisms below can report it: `posix_fadvise` returns 0 for "advice
+/// accepted", not "pages evicted", and `fcntl` reports only that the flag was
+/// set. [`cache_bypass`] says what was attempted; nothing here can say what the
+/// kernel did with it.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "illumos"
+))]
+pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     // `len = 0` means "to the end of the file". Only clean, unmapped pages are
-    // dropped, which is exactly what a file nobody is writing consists of.
+    // dropped, which is exactly what a file nobody is writing consists of. The
+    // fd stays open across this: the page cache is per-inode, so evicting and
+    // then reading through the same handle is enough — measured.
+    //
     // Safe: `fd` is owned by `file` and outlives the call.
-    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     file.read_to_end(buf)?;
-    // `posix_fadvise` returns the error number directly rather than setting
-    // errno, and it is advisory: a filesystem that ignores it leaves the read a
-    // cache hit. tmpfs is the case that matters — it has no backing device, so
-    // there is nothing to detect there anyway.
-    Ok(rc == 0)
+    Ok(())
 }
 
-/// macOS has no `posix_fadvise`. `F_NOCACHE` is the equivalent, and it is a
-/// property of the *descriptor* rather than of the file, so the read has to
-/// happen through this handle.
+/// macOS has no `posix_fadvise`. `F_NOCACHE` is the nearest thing, and it is a
+/// property of the *descriptor*, so the read has to happen through this handle.
+///
+/// It is genuinely weaker: it stops the descriptor *retaining* what it reads,
+/// but does not invalidate pages already in the unified buffer cache, and a
+/// small unaligned read takes XNU's copy path rather than its direct one. For a
+/// 16-byte file the process opened a moment ago, that may well still be a
+/// memory hit. See [`CacheBypass::FNoCache`]; macOS is a developer platform for
+/// this backend, not a deployment one.
 #[cfg(target_vendor = "apple")]
-pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<bool> {
+pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     // Safe: `fd` is owned by `file` and outlives the call.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
     file.read_to_end(buf)?;
-    Ok(rc != -1)
+    Ok(())
 }
 
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_os = "freebsd",
+    target_os = "illumos",
     target_vendor = "apple"
 )))]
-pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<bool> {
+pub(crate) fn read_bypassing_cache(file: &mut File, buf: &mut Vec<u8>) -> io::Result<()> {
     file.read_to_end(buf)?;
-    Ok(false)
+    Ok(())
 }
