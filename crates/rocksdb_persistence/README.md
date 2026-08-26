@@ -257,6 +257,73 @@ timeout layer, and answers `200 OK` in about a millisecond on a wedged volume.
 
 ## Backups
 
+`rocksdb-backup` is a standalone binary with `backup`, `list`, `verify`, `rehearse` and
+`restore`. `backup` and `restore` open the database **read-write**, so the backend must be
+stopped; `list`, `verify` and `rehearse` only read the backup directory and run against a
+live deployment.
+
+### Backing up a running deployment
+
+Snapshot the volume. Under the default `SyncMode::Every` an acknowledged write is in the
+write-ahead log before `write` returns, so a crash-consistent snapshot recovers exactly as
+an unclean restart does — which this crate tests directly, with a child process calling
+`_exit(0)` and no destructors at all.
+
+**`rocksdb-backup` cannot substitute for that, and a read-only instance is not a
+workaround.** `BackupEngine` copies a file list it has asked the database to hold still,
+and holding it still is `DisableFileDeletions`, which a secondary answers with
+`NotSupported` — RocksDB's comment: *"the secondary instance does not own the database
+files."* The copy then runs unpinned, with the SST list from the secondary's last catch-up
+and the WAL list from a live scan of the primary's directory. A revision of this crate
+allowed it: one flush inside that window produced a generation that was created `Ok`,
+passed `verify`, and restored 10 of 210 acknowledged documents. It is now a hard refusal
+with a test pinning it.
+
+Generations are incremental — unchanged SST files are shared, so the *n*th backup writes
+only what changed since *n-1* — and memtables are flushed first, so a backup never depends
+on replaying a WAL. With `atomic_flush` on, that flush is a consistent cut across every
+column family, so a backup can never hold an index entry whose document it missed.
+
+## Health and failure escalation
+
+RocksDB latches read-only on a background error — a full disk, an SST checksum failure —
+and stays that way. Every subsequent write fails, the process keeps serving, and nothing
+crashes. A Postgres deployment gets a pod that dies and a database another node can take
+over; an embedded one would fail every mutation indefinitely until somebody looked.
+
+So a write that fails checks whether the engine has latched, and if it has, raises the
+backend's `ShutdownSignal` — the same one the relational backends raise on lease loss.
+That is the whole of it: no monitor thread, no polling, no timers.
+
+The check runs only after a write has already failed, which matters twice.
+`property_int_value` takes the engine's mutex, so polling it per write would tax every
+commit for a condition that is almost never true. And it asks a question that is true
+*now* — this write just failed and the engine reports itself in error — rather than
+reading `rocksdb.background-errors` as a level. That counter is cumulative and never
+cleared, while RocksDB auto-resumes retryable errors by default
+(`max_bgerror_resume_count` is `INT_MAX`), so a single transient EIO that the engine
+recovered from on its own leaves it permanently non-zero. An earlier revision polled it on
+a timer and would have killed a healthy backend for exactly that.
+
+### What is deliberately not detected here
+
+A **stalled** write. On a full volume or a hung mount RocksDB does not fail a write, it
+blocks — indefinitely — so no error surfaces and the check above never runs. Detecting
+that from inside the stuck process was attempted and abandoned: every signal RocksDB
+offers (`num-running-flushes`, `num-running-compactions`, `is-write-stopped`,
+`actual-delayed-write-rate`, `current-super-version-number`) is updated by the machinery
+that has stopped, so each one latches in exactly the failure being detected. Five
+successive attempts each broke in a new way.
+
+Liveness is the cluster's job. A wedged volume parks the blocking pool the HTTP paths use,
+so requests hang and time out — configure a liveness probe against an endpoint that
+performs a storage round-trip, and the kubelet restarts the pod, which is the recovery
+action an in-process escalation was reaching for anyway. Note that `/version` is **not**
+such an endpoint: it is a pure async closure returning a cached string, outside the
+timeout layer, and answers `200 OK` in about a millisecond on a wedged volume.
+
+## Backups
+
 Backups are a scheduled job, not a thread inside the backend — the same shape as
 `pg_basebackup` against Postgres. `rocksdb-backup` is a standalone binary with `backup`,
 `list`, `verify`, `rehearse` and `restore` subcommands; run it from a CronJob against the

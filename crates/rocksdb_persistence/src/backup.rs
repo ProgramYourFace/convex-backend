@@ -253,11 +253,33 @@ fn restore_into(dir: &Path, db_dir: &Path, backup_id: Option<u32>) -> anyhow::Re
         // refuse on the retry, wedging the operator at the worst moment.
         // Clearing it is safe: it was empty before this call, so nothing here
         // predates the attempt.
-        if let Err(e) = std::fs::remove_dir_all(db_dir) {
-            tracing::warn!(
-                "could not clear {} after a failed restore: {e}. Remove it before retrying.",
+        //
+        // Contents, not the directory itself. A restore target is often a mount
+        // point or a PVC subdirectory whose ownership, mode and labels the
+        // operator set up; removing and recreating it discards all of that, and
+        // on a mount root it fails outright.
+        match std::fs::read_dir(db_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let removed = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    if let Err(e) = removed {
+                        tracing::warn!(
+                            "could not clear {} after a failed restore: {e}. Remove it before \
+                             retrying.",
+                            path.display(),
+                        );
+                    }
+                }
+            },
+            Err(e) => tracing::warn!(
+                "could not read {} after a failed restore: {e}. Clear it before retrying.",
                 db_dir.display(),
-            );
+            ),
         }
     }
     result
@@ -350,26 +372,36 @@ impl RocksDbPersistence {
 }
 
 fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<BackupInfo> {
-    // A secondary is not just allowed here, it is the supported way to back up
-    // a *running* deployment. RocksDB permits one writer, so a second process
-    // cannot open the data directory read-write while the backend holds it —
-    // which is every moment that matters. A secondary opens without taking the
-    // lock, tails the primary's write-ahead log, and `BackupEngine` accepts its
-    // handle. Measured: a primary acknowledged 100 documents after the
-    // secondary opened, never flushed them, and all 100 came back through a
-    // restore.
+    // A secondary cannot take a backup, and the reason is structural rather
+    // than a policy this crate chose.
     //
-    // That works because of the durability mode, not by luck. Under
-    // `SyncMode::Every` an acknowledged write is in the WAL before `write`
-    // returns, and the WAL is what the secondary reads and the backup copies.
-    if inner.secondary {
-        // Without this the backup is as stale as the moment the secondary was
-        // opened, which for a long-lived process is arbitrarily far behind.
-        inner
-            .db
-            .try_catch_up_with_primary()
-            .context("failed to catch the secondary up with the primary before backing up")?;
-    }
+    // `BackupEngine` works by asking the database for a consistent file list
+    // and holding it still while it copies. Holding it still is
+    // `DisableFileDeletions`, and `DBImplSecondary` returns `NotSupported` for
+    // it — RocksDB's own comment says why: "the secondary instance does not own
+    // the database files. It simply opens the files of the primary instance."
+    // `GetLiveFilesStorageInfo` tolerates that failure, so the copy proceeds
+    // *unpinned*: the SST list comes from the secondary's view as of its last
+    // catch-up, while the WAL list comes from a live scan of the primary's
+    // directory. Two different instants, nothing holding them together.
+    //
+    // A revision of this crate allowed it, to back up a running deployment.
+    // Measured: with one flush landing in the window between catch-up and the
+    // file listing, a generation was created `Ok`, passed `verify_backup`, and
+    // restored 10 of 210 acknowledged documents. It also failed outright with
+    // ENOENT in 15 of 15 runs against an ordinary concurrent writer, because
+    // the primary compacted away a file that had already been listed.
+    //
+    // A backup that reports success, verifies clean, and is missing most of the
+    // database is the worst failure this subsystem can have, so this is a hard
+    // refusal rather than a warning. Backing up a *running* deployment is a
+    // volume snapshot's job — see the README.
+    anyhow::ensure!(
+        !inner.secondary,
+        "a read-only instance cannot take a consistent backup: RocksDB will not pin the primary's \
+         files for it, so the result can silently omit data. Take this backup with the writer \
+         stopped, or snapshot the volume instead."
+    );
     let timer = metrics::backup_timer();
     // Ownership first, before a read-write engine is opened: opening one can
     // run RocksDB's own garbage collection over a directory that turns out to
@@ -382,16 +414,7 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
     drop(_claim_lock);
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
-    // Flushing is a primary's privilege, and only a primary has a memtable of
-    // its own to flush. A secondary holds no unflushed writes: everything it
-    // knows came from the primary's files and WAL, which the backup copies
-    // either way.
-    let created = if inner.secondary {
-        engine.create_new_backup(&inner.db)
-    } else {
-        engine.create_new_backup_flush(&inner.db, true)
-    };
-    if let Err(e) = created {
+    if let Err(e) = engine.create_new_backup_flush(&inner.db, true) {
         timer.finish_developer_error();
         return Err(anyhow::Error::from(e).context("failed to create a backup"));
     }

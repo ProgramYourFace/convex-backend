@@ -244,8 +244,6 @@ impl RocksDbPersistence {
         Self::open(path, true, opts)
     }
 
-    /// Whether an interval WAL flusher is running.
-
     /// Open a read-only view of a database another process has open for
     /// writing.
     ///
@@ -466,6 +464,11 @@ impl Inner {
     /// any path, and cannot be tripped by one bad write: the counter resets on
     /// every success, so reaching the threshold means this many *in a row* got
     /// nothing through.
+    ///
+    /// Batch writes only. A `flush_cf` failure is not evidence that the engine
+    /// is refusing writes — `ShutdownInProgress` returns one on a database that
+    /// is demonstrably still accepting them, and counting those escalated a
+    /// healthy backend in review.
     fn engine_write<T>(
         &self,
         what: &str,
@@ -482,7 +485,7 @@ impl Inner {
                     .consecutive_write_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                if failures >= *options::WRITE_FAILURES_TO_ESCALATE
+                if failures == *options::WRITE_FAILURES_TO_ESCALATE
                     && let Some(shutdown) = &self.shutdown
                 {
                     shutdown.signal(anyhow::anyhow!(
@@ -922,7 +925,7 @@ impl Persistence for RocksDbPersistence {
                     }
                     iter.status()?;
                 }
-                inner.engine_write("a persistence global", || {
+                inner.engine_write("an index-entry delete", || {
                     inner.db.write_opt(batch, &inner.write_options())
                 })?;
                 metrics::log_index_entries_deleted(deleted);
@@ -959,7 +962,7 @@ impl Persistence for RocksDbPersistence {
                 for (id, ts) in highest_expired {
                     deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
                 }
-                inner.engine_write("an index-entry delete", || {
+                inner.engine_write("a document delete", || {
                     inner.db.write_opt(batch, &inner.write_options())
                 })?;
                 metrics::log_documents_deleted(deleted);
@@ -1006,7 +1009,7 @@ impl Persistence for RocksDbPersistence {
             for id in ids {
                 deleted += inner.delete_document_revisions(&mut batch, id, Timestamp::MAX)?;
             }
-            inner.engine_write("a document delete", || {
+            inner.engine_write("a tablet delete", || {
                 inner.db.write_opt(batch, &inner.write_options())
             })?;
             metrics::log_documents_deleted(deleted);
@@ -1032,7 +1035,7 @@ impl Persistence for RocksDbPersistence {
             // repeating it.
             for name in ALL_COLUMN_FAMILIES {
                 let cf = inner.cf(name)?;
-                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
+                inner.db.flush_cf(&cf)?;
             }
             Ok(())
         })
@@ -1058,7 +1061,7 @@ impl Persistence for RocksDbPersistence {
             inner.db.flush_wal(true)?;
             for name in ALL_COLUMN_FAMILIES {
                 let cf = inner.cf(name)?;
-                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
+                inner.db.flush_cf(&cf)?;
             }
             // Let in-flight compactions finish rather than leaving a large L0
             // for the next boot to recover through, but do not wait forever.

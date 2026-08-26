@@ -100,7 +100,7 @@ Convex file is touched.
 
 **A. `RocksDbPersistence::backup(&self, dir: &Path, keep: usize)`.** Opens a
 `BackupEngine` against `dir`, calls `create_new_backup_flush(&self.inner.db, true)`, then
-`purge_old_backups(keep)`. It needs the live database handle, so it lives on the
+`purge_old_backups(keep)`. It needs the live database handle, held read-write, so it lives on the
 persistence object rather than in a standalone tool. A secondary instance refuses.
 
 **B. A background worker** that calls it on an interval, with these knobs:
@@ -139,10 +139,25 @@ mistake of writing into a live database.
 **D. The rehearsal, which §7 called the highest-value gap.** `rocksdb-backup rehearse`
 restores a generation into a scratch directory, opens it, and iterates every column
 family touching values as well as keys — so a blob-stored document body is a read that
-actually happens rather than one a key-only scan would skip. `verify` checksums files;
+actually happens rather than one a key-only scan would skip. `verify` checks that every file is present and the expected size — **not** checksums;
 this proves a database restored from them opens and can be read.
 
 ---
+
+### E. Backing up a running deployment
+
+Snapshot the volume. Under the default `SyncMode::Every` every acknowledged write
+is in the write-ahead log before `write` returns, so a crash-consistent snapshot
+recovers exactly as an unclean restart does — which this crate tests directly,
+with a child process calling `_exit(0)` and no destructors.
+
+`rocksdb-backup backup` cannot do this. It needs the database read-write, and a
+read-only instance is not a workaround: RocksDB will not hold a file list still
+for one (`DBImplSecondary::DisableFileDeletions` returns `NotSupported`, because
+"the secondary instance does not own the database files"). A revision of this
+crate allowed it anyway; a single flush landing in the window produced a
+generation that was created `Ok`, passed `verify_backup`, and restored 10 of 210
+acknowledged documents. The guard is now a hard refusal with a test pinning it.
 
 ## 4. Restore runbook
 
@@ -151,7 +166,7 @@ holds the volume:
 
 1. **Stop the writer.** `kubectl scale statefulset/<cell> --replicas=0`. Wait for the pod
    to terminate — the RocksDB directory lock is released only when the process exits, and
-   `terminationGracePeriodSeconds: 60` gives the backend time to `shutdown` cleanly.
+   `terminationGracePeriodSeconds: 60` is generous, but note that nothing in the tree calls `Persistence::shutdown()` today, so every stop is an unclean one and recovery replays the write-ahead log.
 2. **Confirm what you are restoring.** Run the restore subcommand's listing (from
    `get_backup_info`) against the backup directory and pick an id. Backup ids are
    always-increasing, so "latest" is well-defined; a corrupted-data incident is the case

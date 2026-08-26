@@ -1,18 +1,24 @@
-//! Backup administration for the embedded RocksDB backend.
+//! Operator tooling for RocksDB backups: take one, list them, check one, and
+//! restore.
 //!
-//! A separate binary rather than a subcommand on the backend, for one
-//! structural reason: restoring rewrites a database directory, and RocksDB
-//! holds that directory's lock for as long as a database is open. A restore
-//! therefore cannot run inside the process it is restoring for. Shipping it as
-//! its own binary makes it usable as an init container or a one-shot `Job`,
-//! which is where a restore actually happens.
+//! # When each command needs the backend stopped
 //!
-//! ```text
-//! rocksdb-backup list    <backup-dir>
-//! rocksdb-backup verify  <backup-dir> [--id N]
-//! rocksdb-backup rehearse <backup-dir> --scratch <dir> [--id N]
-//! rocksdb-backup restore <backup-dir> --to <db-dir> [--id N]
-//! ```
+//! `backup` and `restore` open the database read-write, so the backend must be
+//! stopped. RocksDB allows one writer, and that is not a lock this tool can
+//! work around: a read-only instance cannot make RocksDB hold a file list
+//! still, so a backup taken from one can silently omit data. See
+//! `backup::backup_inner`.
+//!
+//! `list`, `verify` and `rehearse` only read the backup directory, so they run
+//! against a live deployment.
+//!
+//! # Backing up a running deployment
+//!
+//! Snapshot the volume. Under the default `SyncMode::Every` every acknowledged
+//! write is in the write-ahead log before `write` returns, so a
+//! crash-consistent snapshot recovers exactly as an unclean restart does —
+//! which this crate tests. That is the live-backup story; this tool is for
+//! maintenance windows and for everything on the restore side.
 
 use std::path::PathBuf;
 

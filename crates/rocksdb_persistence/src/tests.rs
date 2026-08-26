@@ -1193,37 +1193,6 @@ async fn restore_refuses_a_non_empty_target() -> anyhow::Result<()> {
 /// An earlier revision asserted the opposite of this test: that "a secondary
 /// instance has no WAL and no business writing a backup". The premise was
 /// wrong. A secondary tails the primary's WAL, which is exactly what makes a
-/// live backup complete.
-#[tokio::test]
-async fn live_and_stopped_backups_share_a_chain() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("db");
-    let backup_dir = dir.path().join("backup");
-
-    let primary = RocksDbPersistence::new(&db_path)?;
-    primary
-        .write(
-            &[entry(1, 1, 10, "v1", None)?],
-            &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
-            ConflictStrategy::Error,
-        )
-        .await?;
-
-    // Live, through a secondary, while the primary holds the lock.
-    let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
-    secondary.backup(&backup_dir, 4)?;
-
-    // Stopped, by the writer itself.
-    primary.backup(&backup_dir, 4)?;
-
-    let generations = backup::list(&backup_dir)?;
-    assert_eq!(
-        generations.len(),
-        2,
-        "both backups belong to the same chain, so the directory should hold two generations"
-    );
-    Ok(())
-}
 
 /// Document retention deletes rows while exports and index backfills are
 /// scanning. A page cursor that seeks-and-steps skips the row *after* a deleted
@@ -1892,7 +1861,7 @@ async fn repeated_engine_write_failures_escalate() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A genuine , for tests that need a failing engine write
+/// A genuine `rocksdb::Error`, for tests that need a failing engine write
 /// without a failing device. `rocksdb::Error::new` is private to the binding.
 fn synthetic_engine_error() -> rocksdb::Error {
     rocksdb::DB::destroy(
@@ -1916,54 +1885,6 @@ fn synthetic_engine_error() -> rocksdb::Error {
 /// The writes below are deliberately never flushed: they exist only in the
 /// primary's memtable and its WAL when the backup is taken. Restoring through
 /// the real `restore` path — whose `RestoreOptions` differ from a hand-rolled
-/// one — is the point of the test.
-#[tokio::test]
-async fn a_backup_of_a_live_primary_captures_unflushed_writes() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("db");
-    let backup_dir = dir.path().join("backups");
-    let primary = RocksDbPersistence::new(&db_path)?;
-
-    let batch = |from: u32, n: u32| -> anyhow::Result<Vec<DocumentLogEntry>> {
-        (from..from + n)
-            .map(|i| {
-                Ok(DocumentLogEntry {
-                    ts: ts(u64::from(i) + 1),
-                    id: doc_id(1, i),
-                    value: Some(document(1, i, "body")?),
-                    prev_ts: None,
-                })
-            })
-            .collect()
-    };
-
-    primary
-        .write(&batch(0, 100)?, &[], ConflictStrategy::Error)
-        .await?;
-
-    // Opened before the rest of the writes, as a long-running sidecar would be.
-    let secondary = RocksDbPersistence::new_secondary(&db_path)?;
-
-    // Acknowledged after the secondary opened, and never flushed.
-    primary
-        .write(&batch(100, 100)?, &[], ConflictStrategy::Error)
-        .await?;
-
-    // The whole operation a CronJob performs.
-    secondary.backup(&backup_dir, 3)?;
-
-    let restored_dir = dir.path().join("restored");
-    backup::restore(&backup_dir, &restored_dir, None)?;
-    let restored = RocksDbPersistence::new(&restored_dir)?;
-    let check = restored.inner.verify_readable()?;
-    assert_eq!(
-        check.documents, 200,
-        "a live backup must include writes the primary acknowledged but never flushed; got {} of \
-         200",
-        check.documents
-    );
-    Ok(())
-}
 
 /// `SyncMode::Never` must still survive a crash of *this* process.
 ///
@@ -1995,5 +1916,52 @@ async fn never_sync_survives_a_process_crash() -> anyhow::Result<()> {
         "a write acknowledged under `Never` must survive reopening the database"
     );
     assert_eq!(check.index_entries, 1);
+    Ok(())
+}
+
+/// A read-only instance must refuse to take a backup.
+///
+/// This looks like a limitation worth removing, and a revision of this crate
+/// did remove it, to back up a running deployment. It is not a limitation, it
+/// is a correctness boundary.
+///
+/// `BackupEngine` copies a file list it has asked the database to hold still.
+/// Holding it still is `DisableFileDeletions`, which `DBImplSecondary` answers
+/// with `NotSupported` — RocksDB's own comment: "the secondary instance does
+/// not own the database files. It simply opens the files of the primary
+/// instance." `GetLiveFilesStorageInfo` tolerates that failure, so the copy
+/// runs unpinned: the SST list is the secondary's view as of its last
+/// catch-up, the WAL list is a live scan of the primary's directory, and
+/// nothing keeps the two consistent.
+///
+/// Measured on the version that allowed it: one flush landing in the window
+/// produced a generation that was created `Ok`, passed `verify_backup`, and
+/// restored 10 of 210 acknowledged documents. Against an ordinary concurrent
+/// writer it also failed outright with ENOENT in 15 of 15 runs.
+///
+/// So the refusal is the feature. Back up with the writer stopped, or snapshot
+/// the volume — under `SyncMode::Every` a crash-consistent snapshot is
+/// recoverable, because every acknowledged write is already in the WAL.
+#[tokio::test]
+async fn a_read_only_instance_refuses_to_back_up() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("db");
+    let primary = RocksDbPersistence::new(&db_path)?;
+    primary
+        .write(
+            &[entry(1, 1, 10, "v1", None)?],
+            &[index_entry(1, b"k", 10, Some(doc_id(1, 1)))],
+            ConflictStrategy::Error,
+        )
+        .await?;
+
+    let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
+    let err = secondary
+        .backup(&dir.path().join("backup"), 4)
+        .expect_err("a read-only instance must refuse to back up");
+    assert!(
+        format!("{err}").contains("cannot take a consistent backup"),
+        "the error must say why, so nobody removes the guard again: {err}"
+    );
     Ok(())
 }
