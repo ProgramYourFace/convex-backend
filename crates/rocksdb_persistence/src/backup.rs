@@ -81,17 +81,14 @@ impl DirLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        // flock is advisory and released by the kernel when the fd closes, so
-        // a crashed holder does not strand the directory the way a lock file
-        // whose presence is the lock would.
-        let rc = unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        };
+        // Advisory, and released by the kernel when the fd closes, so a crashed
+        // holder does not strand the directory the way a lock file whose
+        // presence is the lock would. See `crate::platform` for why this is not
+        // written inline.
+        let acquired = crate::platform::try_lock_exclusive(&file)
+            .with_context(|| format!("failed to lock {}", path.display()))?;
         anyhow::ensure!(
-            rc == 0,
+            acquired,
             "another process is using the backup directory {}. Backups, restores and listings \
              must not overlap: RocksDB does not define what concurrent backup engines do to a \
              directory, up to and including destroying it.",

@@ -26,7 +26,6 @@ use std::{
         BTreeSet,
     },
     io::Write as _,
-    os::unix::io::AsRawFd as _,
     sync::Arc,
 };
 
@@ -859,9 +858,9 @@ impl PersistenceReader for RocksDbPersistence {
     /// - It blocks on a hung mount of any kind, which is the failure with no
     ///   other detector.
     /// - It fails with `EROFS` on a volume remounted read-only, which nothing
-    ///   else here catches: reads still succeed, and the write escalation needs
-    ///   five *attempted* writes, which a read-mostly cell does not produce for
-    ///   up to two hours.
+    ///   else here catches: reads still succeed, and the write escalation only
+    ///   fires once a write is *attempted*, which on a read-mostly cell means
+    ///   waiting up to two hours for the committer's next idle timestamp bump.
     /// - It takes no RocksDB lock. `flush_wal(true)` would: it holds
     ///   `log_write_mutex_` and waits on `log_sync_cv_`, which the commit path
     ///   waits on too, and RocksDB's own comment there notes that parallel
@@ -894,18 +893,13 @@ impl PersistenceReader for RocksDbPersistence {
             // write here.
             if inner.secondary {
                 let current = inner.path.join("CURRENT");
-                let file = std::fs::File::open(&current).with_context(|| {
+                let mut file = std::fs::File::open(&current).with_context(|| {
                     format!("cannot open the database at {}", inner.path.display())
                 })?;
-                // Safe: `fd` is owned by `file` and outlives the call, and
-                // `posix_fadvise` only ever advises.
-                unsafe {
-                    libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-                }
-                drop(file);
-                std::fs::read(&current).with_context(|| {
-                    format!("cannot read the database at {}", inner.path.display())
-                })?;
+                let mut bytes = Vec::new();
+                crate::platform::read_bypassing_cache(&mut file, &mut bytes).with_context(
+                    || format!("cannot read the database at {}", inner.path.display()),
+                )?;
                 return Ok(());
             }
             let probe = inner.path.join(PROBE_FILE);

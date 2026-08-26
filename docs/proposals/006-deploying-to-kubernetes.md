@@ -110,9 +110,9 @@ primary it never does.
 So `PersistenceReader::check_storage` **writes**. On RocksDB it creates one small file in
 the data directory, fsyncs it, and removes it, on the blocking pool. That blocks on a hung
 mount of any kind, and it fails with `EROFS` on a volume remounted read-only — which
-nothing else here catches, since reads keep succeeding and the write escalation needs five
-*consecutive failed* writes — 5 to 10 hours on a read-mostly cell, where the only writes
-are the committer's idle bump. It deliberately takes no RocksDB lock: `flush_wal(true)` would hold
+nothing else here catches, since reads keep succeeding and the escalation only fires once
+a write is *attempted* — up to two hours on a read-mostly cell, where the only writes are
+the committer's idle bump. It deliberately takes no RocksDB lock: `flush_wal(true)` would hold
 `log_write_mutex_` and wait on the condition variable the commit path waits on, and this
 endpoint is unauthenticated, so it must not be able to put load on commits.
 
@@ -145,7 +145,8 @@ flush. Do not expose port 3210 beyond the cluster, and keep `failureThreshold` a
 higher so a transient saturation cannot restart a healthy pod.
 
 **One configuration where this is not a check at all:** a data directory on `tmpfs` —
-`emptyDir: {medium: Memory}`. `fsync` there is a no-op, so the probe proves nothing. There
+`emptyDir: {medium: Memory}`. `fsync` there is a no-op, and `POSIX_FADV_DONTNEED` does not
+evict either, so neither the primary's write nor a secondary's read leaves memory. There
 is also no device to wedge, so nothing is lost; it is worth knowing before reading a green
 probe as evidence about storage.
 
@@ -180,8 +181,10 @@ clock, but it means the server-side timeout cannot be relied on to bound the pro
 
 **A volume that has gone read-only** *is* caught, because the probe is a write — this is
 what it adds over anything read-based. The in-process escalation covers it too, but it
-needs five *consecutive failed* writes, and on a read-mostly cell the only writes are the
-committer's idle bump at 1–2 h apart: 5 to 10 hours (§2a).
+only fires once a write is attempted, and on a read-mostly cell the only writes are the
+committer's idle bump, jittered 1–2 h apart. Once a bump does start, the five consecutive
+failures take about a second and a half — it retries in place with a 100 ms backoff — so
+the window is the wait for the next bump, not five of them: **up to two hours** (§2a).
 
 **A read-mostly cell.** On a cell with no user mutations the only persistence write is the
 committer's idle `MaxRepeatableTimestamp` bump, whose interval is jittered between 1× and

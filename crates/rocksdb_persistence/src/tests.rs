@@ -2305,6 +2305,7 @@ async fn check_storage_actually_writes() -> anyhow::Result<()> {
 /// A read-only volume is the case the probe adds over anything read-based:
 /// reads keep succeeding, and the write escalation needs five *attempted*
 /// writes, which a read-mostly cell will not produce for up to two hours.
+#[cfg(unix)]
 #[tokio::test]
 async fn check_storage_fails_on_a_read_only_directory() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2385,7 +2386,8 @@ async fn a_secondary_probes_by_reading_and_a_primary_by_writing() -> anyhow::Res
 
     // Occupying the probe's path is what the primary's write trips over. The
     // secondary never writes, so it is unaffected — which is the asymmetry.
-    std::fs::create_dir(db_path.join("convex-storage-probe"))?;
+    let occupied = db_path.join("convex-storage-probe");
+    std::fs::create_dir(&occupied)?;
     assert!(
         primary.check_storage().await.is_err(),
         "the primary probes by writing, so it must fail here",
@@ -2394,5 +2396,29 @@ async fn a_secondary_probes_by_reading_and_a_primary_by_writing() -> anyhow::Res
         .check_storage()
         .await
         .expect("the secondary probes by reading, so it is unaffected");
+    std::fs::remove_dir(&occupied)?;
+
+    // And the secondary really does read, rather than returning `Ok(())`:
+    // without this the whole branch could be deleted and this test would still
+    // pass, which is how three probes in a row shipped doing nothing.
+    let current = db_path.join("CURRENT");
+    let moved = db_path.join("CURRENT.moved");
+    std::fs::rename(&current, &moved)?;
+    let err = secondary
+        .check_storage()
+        .await
+        .expect_err("the secondary's probe must fail when CURRENT is unreadable");
+    assert!(
+        format!("{err:#}").contains("cannot open"),
+        "the failure must name what it could not do: {err:#}"
+    );
+    std::fs::rename(&moved, &current)?;
+
+    // A secondary must never write into the primary's directory.
+    secondary.check_storage().await?;
+    assert!(
+        !db_path.join("convex-storage-probe").exists(),
+        "the secondary wrote into a directory it does not own",
+    );
     Ok(())
 }

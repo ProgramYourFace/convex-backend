@@ -113,6 +113,7 @@ pub mod keys;
 mod memory;
 mod metrics;
 pub mod options;
+mod platform;
 mod reader;
 
 #[cfg(test)]
@@ -453,7 +454,15 @@ impl RocksDbPersistence {
         // the unlink, so it is always stale. Left alone it is an unexplained
         // file in the operator's data directory that `is_rocksdb_artifact`
         // deliberately refuses to recognise.
-        let _ = std::fs::remove_file(path.join(reader::PROBE_FILE));
+        let probe = path.join(reader::PROBE_FILE);
+        if let Err(e) = std::fs::remove_file(&probe)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            // Not fatal — the database is fine — but silence here leaves the
+            // restore precondition refusing this directory later with a message
+            // that does not mention the file it is refusing over.
+            tracing::warn!("could not remove a stale {}: {e}", probe.display());
+        }
 
         // Minted here, by the writer, rather than lazily on the first backup.
         // A secondary cannot mint it, because a secondary cannot write, and a

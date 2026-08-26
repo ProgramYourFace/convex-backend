@@ -183,8 +183,9 @@ read by nothing; an operator alerting on those two metrics gets "no data", which
 fires. There is no twenty-minute ceiling.
 
 It also concluded that "no HTTP probe can detect a wedge today". That is no longer true:
-`/health/storage` writes and fsyncs a small file on the blocking pool — a read of any kind
-is answered from cache — and is the recommended `livenessProbe`. See [006](./006-deploying-to-kubernetes.md) §2 for the probe
+`/health/storage` writes and fsyncs a small file on the blocking pool — a read of a file
+the process has already touched is answered from cache, and proves nothing — and is the
+recommended `livenessProbe`. See [006](./006-deploying-to-kubernetes.md) §2 for the probe
 and §2a for what the in-process escalation still covers.
 
 ## 5. Disk
