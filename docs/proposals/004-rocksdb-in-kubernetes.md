@@ -13,8 +13,8 @@ PVCs.
 ## 0. Summary
 
 The switch is smaller operationally than it looks, because the reference topology already
-satisfies the one invariant an embedded engine imposes. But it is **not** free, and two
-items below are correctness issues rather than tuning:
+satisfies the one invariant an embedded engine imposes. But it is **not** free, and three
+items below need action rather than tuning:
 
 | | Item | Kind | Status |
 |---|---|---|---|
@@ -22,6 +22,7 @@ items below are correctness issues rather than tuning:
 | §2 | The relay checkpoint stops sharing a durability domain with Convex | **correctness** | rule below; keep `ROCKSDB_SYNC_WRITES=true` |
 | §3 | Memory is one budget, and RocksDB reads no cgroup limit | **bug** | fixed: the cache is derived from the container limit |
 | §4 | Crash recovery stops being unbounded | win | no action |
+| §4b | No Postgres lease, so liveness has to come from the cluster | **manifest change** | add a `livenessProbe`; the in-process detector was removed |
 | §5 | Disk: ~2.9× less, and one fewer PVC | win | resize |
 | §6 | No backup or point-in-time restore | **gap** | backup/restore/rehearsal implemented per [005](./005-backup-and-restore.md); no PITR, and none possible at this layer |
 | §7 | No in-place migration from Postgres | gap | export/import, or new cells only |
@@ -164,6 +165,56 @@ kill" state to be in.
 The 20-minute probe window can come down substantially once the cell's data is no longer
 in Postgres. Keep it generous — the sidecar still recovers its own small database — but
 the death spiral it was defending against is gone.
+
+---
+
+## 4b. Liveness becomes the cluster's job, not the process's
+
+Postgres gives the cell a failure model for free: a wedged node loses its lease, the pod
+dies, and another takes over. An embedded engine has no lease, so the backend originally
+carried an in-process detector that watched for a write stalled past a timeout and raised
+the same `ShutdownSignal` the relational backends raise on lease loss.
+
+That detector was removed, after four consecutive review rounds each found it wrong in a
+new way — and each defect was introduced by the previous round's fix. The reason is
+structural rather than four coding mistakes: every signal available from inside is
+updated by the machinery that has stopped, so each one latches in exactly the failure
+being detected. `num-running-flushes` and `num-running-compactions` are incremented
+before a job runs and decremented after its last fsync returns, so a job blocked on a
+hung device pins them above zero forever. `is-write-stopped` and
+`actual-delayed-write-rate` are released only from `InstallSuperVersion`, which a wedged
+volume never reaches. `current-super-version-number` advances on completion, which
+freezes on a hang — and also freezes during one long L0→L1 compaction with writes
+stopped. Measured on a healthy, continuously busy database, the engine reports a
+background job open in under 10% of samples, so no instantaneous reading of these
+properties separates working from wedged.
+
+A process cannot reliably diagnose its own liveness. An external observer with a timeout
+can, and the cluster already is one. So the cell needs a **liveness** probe, not just the
+readiness probe it carries today:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /version, port: 3210 }
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 8          # ~2 min before the kubelet restarts the pod
+```
+
+This is the one manifest addition the swap requires beyond §5's volume and §3's memory
+split. It replaces a lease the cell no longer has, and the kubelet restarting the pod is
+the same recovery action the deleted escalation was reaching for.
+
+Pair it with an alert on `rocksdb_oldest_write_seconds`, which the backend publishes on
+every health poll whether or not anything is wrong. Sustained above the write timeout
+means writers are parked. `rocksdb_write_stopped` sits beside it as the engine's own
+report of deliberate throttling, which is what distinguishes an ingest burst being
+backpressured from a volume that has stopped responding — the two look identical in the
+write age alone.
+
+Note the interaction with §4's startup probe: a `livenessProbe` runs concurrently with a
+`startupProbe` only after the latter succeeds, so the generous recovery window is not
+shortened by adding this. Keep them separate.
 
 ---
 
@@ -344,4 +395,5 @@ streaming export, and the search and vector indexes are untouched. `CONVEX_CLOUD
 `INSTANCE_NAME`, `INSTANCE_SECRET`, the readiness probe on `/version`, the ingress, the
 relay's `CELL_SITE_URL` and `CONVEX_URL` and every application-level knob in the manifest
 carry over unchanged. The change is `POSTGRES_URL` becoming `--db rocksdb <path>`, plus
-the resource and volume consequences above.
+the resource and volume consequences above and the liveness probe in §4b — which is an
+addition rather than a change, and the only one the loss of the Postgres lease forces.
