@@ -582,7 +582,9 @@ impl Inner {
         // database has never been opened read-write by this build.
         anyhow::ensure!(
             !self.secondary,
-            "this database has no backup identity yet, and a read-only instance cannot mint one.              Start the backend against it once, or take the backup with the writer stopped."
+            "this database has no backup identity yet, and a read-only instance cannot mint one. \
+             Start the backend against it once — it mints the identity at open — or take this \
+             backup with the writer stopped."
         );
         // First call on this database: mint one and keep it. Derived from the
         // engine's own id when it has one, so two databases created in the same
