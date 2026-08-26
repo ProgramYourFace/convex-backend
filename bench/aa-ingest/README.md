@@ -91,11 +91,10 @@ devices and that asking it for a neighbour's device id returns null.
 on `ConvexHttpService`, mounted ahead of the resolving middleware so a readiness
 probe passes before any instance exists, and it answers 200 for any `Host`.
 
-### Measured, one process, identical load per tenant
+### After a light ingest, sequential
 
-`EVENTS=400 DEVICES=16 LANES=2`, so the working set is small and the block cache
-is nowhere near its cap. Ingest held ~1900–2000 events/s per tenant at
-`EVENTS=1500 DEVICES=48`.
+Sequential runs at `EVENTS=400 DEVICES=16 LANES=2` — the tenants have written
+and then gone quiet, so this is hosting cost plus a resident working set.
 
 | tenants | RSS | threads | fds |
 |---|---|---|---|
@@ -103,16 +102,92 @@ is nowhere near its cap. Ingest held ~1900–2000 events/s per tenant at
 | 4 | 221 MiB | 58 | 55 |
 | 8 | 351 MiB | 79 | 99 |
 
-**~100 MiB fixed plus ~31 MiB per tenant, and ~11 fds per tenant.** The
-per-tenant term is the `Application` and its workers — committer, subscriptions,
-retention, index-cache handle — not the block cache: a cache per open would add
-its whole share again for every tenant (a quarter of the container limit each),
-and RSS would be measured in GiB by tenant three. That it is not is the
-process-wide `SHARED_MEMORY` singleton doing its job, observed rather than
-argued.
+~100 MiB fixed plus **~31 MiB per tenant**. Compare the three conditions, which
+differ by an order of magnitude and are all real:
 
-Two caveats before this becomes a capacity model: the working set here is small
-enough that the shared cache never approaches its cap, so this measures
-per-instance fixed cost and not steady-state under load; and descriptors grow
-linearly, which is why `MULTITENANT_MAX_INSTANCES` divides that budget rather
-than trusting the default.
+| condition | per tenant |
+|---|---|
+| idle, never written (`thread-census.sh`) | ~1.4 MiB |
+| quiet after a light ingest (above) | ~31 MiB |
+| all tenants writing at once (`CONCURRENT=1`) | ~70 MiB |
+
+The spread is the working set — memtables, in-flight batches and cached blocks
+that exist only around a write. Size a cell against the busy number.
+
+None of the three is the block cache: a cache per open would add a quarter of
+the container limit again for every tenant, and RSS would be in GiB by tenant
+three. That it is not is the process-wide `SHARED_MEMORY` singleton doing its
+job, observed rather than argued.
+
+### Concurrent: every tenant busy at once
+
+`CONCURRENT=1` drives all tenants simultaneously instead of one after another.
+Sequential runs say nothing about contention, and contention is the question a
+cell has to answer.
+
+```
+CONCURRENT=1 TENANTS=8 EVENTS=3000 DEVICES=64 LANES=4 ./multitenant-run.sh
+```
+
+4 cores, 3,000 events per tenant:
+
+| tenants | cell ev/s | per tenant | p50 | p99 | peak RSS | bytes/event |
+|---|---|---|---|---|---|---|
+| 1 | 1,531 | 1,531 | 138 ms | 248 ms | 161 MiB | 811 |
+| 2 | 1,934 | 967 | 255 ms | 368 ms | 270 MiB | 807 |
+| 4 | 1,920 | 480 | 498 ms | 953 ms | 407 MiB | 808 |
+| 8 | 2,104 | 263 | 919 ms | 1,274 ms | 657 MiB | 810 |
+
+Three results, and they point in different directions.
+
+**The cell saturates at ~1,900–2,100 ev/s and stays there.** Eight times the
+tenants buys 1.37x the total work; each tenant's share falls as 1/N. That is a
+CPU ceiling — four cores, one shared isolate pool — not a storage one. Adding
+tenants divides a cell's throughput rather than multiplying it.
+
+**Commit latency grows ~1.9x per doubling** (138 → 255 → 498 → 919 ms). This is
+NOT committer contention: each instance has its own committer and its own OCC
+domain. It is queuing for the shared pool that feeds them.
+
+**Bytes per event never moves** — 807 to 811 across the whole range, half a
+percent. Each store is an independent LSM tree with no shared pages, no shared
+free-space map and no shared vacuum queue, so nothing amplifies across tenants.
+A cell's disk is the sum of its tenants and nothing else.
+
+Both compute numbers are worst-case: all tenants at full tilt simultaneously.
+A real cell's tenants are mostly idle, which is the premise of packing them.
+
+## Hosting cost — `thread-census.sh`
+
+What N idle instances cost before any request arrives.
+
+```
+./thread-census.sh 300
+```
+
+| tenants | threads | RSS | fds | run states |
+|---|---|---|---|---|
+| 1 | 23 | 77 MiB | 22 | 19 S + 4 V8 |
+| 8 | 51 | 93 MiB | 99 | 47 S + 4 |
+| 24 | 85 | 114 MiB | 275 | 81 S + 4 |
+| 64 | 174 | 176 MiB | 715 | 170 S + 4 |
+| **300** | **655** | **505 MiB** | **3,342** | **651 S + 4** |
+
+Steady from 8 upward: **~2.0 threads, ~1.4 MiB, ~11 fds per tenant.**
+
+**No thread is per-tenant.** The census at N=1 is entirely process-wide
+machinery — 6 tokio workers, 6 bounded-pool, 4 V8, 4 RocksDB compaction, plus
+singletons — and every one of those pools lives in `SharedResources`, cloned
+into each instance. Per-instance work is a tokio *task*. The ~2/tenant growth
+is bounded pools filling lazily toward their caps, not a thread per tenant, and
+at 300 tenants 651 of 655 threads are asleep. Parked threads cost a stack and a
+scheduler entry; they are not contention.
+
+**What binds at that scale is the memtable floor, not threads.** The per-family
+target is `WRITE_BUFFER_BYTES / (max_instances x 5)` clamped to 4–64 MiB, and
+the derived block cache clamps at 4 GiB regardless of host memory — so at 300
+instances the floor demands 300 x 5 x 4 MiB = 6 GiB against a 1 GiB budget,
+5.9x oversubscribed, and the write-buffer manager force-flushes continuously.
+Setting `ROCKSDB_BLOCK_CACHE_BYTES` explicitly bypasses the derive clamp; 24 GiB
+brings 300 instances to exactly 1.00x. That number is arithmetic from the clamp
+constants — no run here has pushed the cache to its cap.

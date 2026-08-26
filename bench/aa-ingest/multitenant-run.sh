@@ -108,6 +108,18 @@ say "up, version $(curl -s "http://127.0.0.1:$PORT/version")"
 # resolving middleware precisely so a readiness probe passes before any instance
 # exists. It answers 200 for any Host, by design. /instance_name extracts
 # MtState, so it is resolved per request and is what the routing rules govern.
+# The listeners bind BEFORE any instance exists — that is deliberate, so a
+# readiness probe on /version passes while the roster is still converging. It
+# also means a hosted instance is not routable the instant /version answers, so
+# wait for admission rather than racing it.
+say "waiting for the roster to converge"
+for _ in $(seq 1 120); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${NAMES[-1]}.$GROUP.api.$BASE" \
+      "http://127.0.0.1:$PORT/instance_name")" = "200" ] && break
+  kill -0 $PID 2>/dev/null || { tail -30 "$WORK/backend.log"; fail "backend exited while admitting"; }
+  sleep 1
+done
+
 say "checking the router fails closed"
 probe() { curl -s -o /dev/null -w '%{http_code}' "$@" "http://127.0.0.1:$PORT/instance_name"; }
 UNKNOWN=$(probe -H "Host: nosuch.$GROUP.api.$BASE")
@@ -137,6 +149,7 @@ for n in "${NAMES[@]}"; do
   ( cd "$HERE" && CONVEX_URL="$URL" npx convex deploy --admin-key "$KEY" --url "$URL" -y ) \
     > "$WORK/deploy-$n.log" 2>&1 || { tail -25 "$WORK/deploy-$n.log"; fail "[$n] deploy failed"; }
 
+  if [ "${CONCURRENT:-0}" = "1" ]; then continue; fi
   say "[$n] ingesting $EVENTS location events over $DEVICES devices"
   ( cd "$HERE" && CONVEX_URL="$URL" CONVEX_ADMIN_KEY="$KEY" \
       EVENTS=$EVENTS BATCH=$BATCH LANES=$LANES DEVICES=$DEVICES \
@@ -144,6 +157,58 @@ for n in "${NAMES[@]}"; do
       node drive.mjs ) 2>&1 | sed "s/^/    [$n] /" \
     || fail "[$n] ingest failed"
 done
+
+# --- CONCURRENT mode: every tenant ingests at once ---------------------------
+# Sequential ingest says nothing about contention. This is the mode that
+# answers "how does a cell behave when all its tenants are busy": the shared
+# isolate pool, the shared block cache and the shared compaction threads are
+# the contended resources, and each instance's committer is its own.
+if [ "${CONCURRENT:-0}" = "1" ]; then
+  say "ingesting on ALL $TENANTS tenants concurrently ($EVENTS events each)"
+  DRIVERS=()
+  START=$(date +%s.%N)
+  for n in "${NAMES[@]}"; do
+    URL="http://$n.$GROUP.api.$BASE:$PORT"
+    ( cd "$HERE" && CONVEX_URL="$URL" CONVEX_ADMIN_KEY="${KEYS[$n]}" \
+        EVENTS=$EVENTS BATCH=$BATCH LANES=$LANES DEVICES=$DEVICES \
+        DEVICE_PREFIX="$n-dev-" MERGE_PERCENT=30 READS=200 \
+        node drive.mjs > "$WORK/drive-$n.json" 2>"$WORK/drive-$n.err" ) &
+    DRIVERS+=($!)
+  done
+  # Sample peak RSS of the BACKEND while the drivers run. Tracks explicit pids:
+  # `jobs -r` is unreliable in a non-interactive shell and spun forever here.
+  PEAK=0
+  while :; do
+    LIVE=0
+    for d in "${DRIVERS[@]}"; do kill -0 "$d" 2>/dev/null && LIVE=1 && break; done
+    [ "$LIVE" = "0" ] && break
+    R=$(ps -o rss= -p $PID 2>/dev/null | tr -d ' ')
+    [ -n "$R" ] && [ "$R" -gt "$PEAK" ] && PEAK=$R
+    sleep 0.5
+  done
+  for d in "${DRIVERS[@]}"; do wait "$d" || fail "a concurrent driver failed"; done
+  END=$(date +%s.%N)
+  WALL=$(echo "$END - $START" | bc)
+  for n in "${NAMES[@]}"; do
+    [ -s "$WORK/drive-$n.json" ] || { cat "$WORK/drive-$n.err"; fail "[$n] concurrent ingest produced nothing"; }
+    echo "    [$n] $(cat "$WORK/drive-$n.json")"
+  done
+  python3 - "$WORK" "$TENANTS" "$EVENTS" "$WALL" "$PEAK" <<'PYEOF'
+import json, sys, glob, os
+work, tenants, events, wall, peak = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
+rows = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(work, "drive-*.json")))]
+per = [r["eventsPerSecond"] for r in rows]
+p50 = [r["p50Ms"] for r in rows]
+p99 = [r["p99Ms"] for r in rows]
+applied = sum(r["applied"] for r in rows)
+print(f"    AGGREGATE  tenants={tenants}  applied={applied}  wall={wall:.2f}s"
+      f"  cell={applied/wall:.0f} ev/s"
+      f"  per-tenant={sum(per)/len(per):.0f} ev/s (min {min(per):.0f}, max {max(per):.0f})")
+print(f"    COMMITTER  p50 avg={sum(p50)/len(p50):.1f}ms (max {max(p50):.1f})"
+      f"  p99 avg={sum(p99)/len(p99):.1f}ms (max {max(p99):.1f})")
+print(f"    PEAK RSS   {peak/1024:.0f} MiB")
+PYEOF
+fi
 
 # --- what each tenant can see ----------------------------------------------
 say "asking each tenant what it holds"
@@ -189,7 +254,8 @@ say "on-disk layout"
 for n in "${NAMES[@]}"; do
   D="$WORK/data/instances/$n"
   [ -d "$D/db" ] || { echo "    [$n] MISSING $D/db"; FAILED=1; }
-  echo "    [$n] $(du -sh "$D/db" 2>/dev/null | cut -f1) db, $(ls "$D/db" | wc -l) files"
+  KB=$(du -sk "$D/db" 2>/dev/null | cut -f1)
+  echo "    [$n] ${KB} KiB db, $(ls "$D/db" | wc -l) files, $(echo "scale=1; $KB*1024/$EVENTS" | bc) bytes/event"
 done
 
 # --- one process, one block cache ------------------------------------------
