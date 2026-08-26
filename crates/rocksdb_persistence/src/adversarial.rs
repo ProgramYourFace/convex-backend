@@ -1495,10 +1495,15 @@ async fn engine_backpressure_predicate_is_true_under_ordinary_load() -> anyhow::
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.await??;
 
+    assert!(
+        masked * 2 < samples,
+        "a background job was open in {masked}/{samples} samples; if the engine really did report \
+         a job open most of the time it is busy, the classifier this measurement was taken to \
+         discredit would have been defensible"
+    );
     println!(
         "a background job was open in {masked}/{samples} samples ({:.1}%) on a healthy, busy \
-         database — every one of those is a sample where keying off job presence alone would have \
-         masked a stalled write",
+         database",
         100.0 * f64::from(masked) / f64::from(samples),
     );
     Ok(())

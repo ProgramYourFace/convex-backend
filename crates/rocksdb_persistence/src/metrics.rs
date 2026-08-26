@@ -98,19 +98,6 @@ pub fn log_background_errors(count: u64) {
     log_gauge(&ROCKSDB_BACKGROUND_ERRORS_TOTAL, count as f64);
 }
 
-register_convex_gauge!(
-    ROCKSDB_WRITE_STOPPED_TOTAL,
-    "Whether RocksDB is deliberately stalling writers as backpressure"
-);
-/// Tells a deliberate stall apart from a hang — the difference between an
-/// ingest burst and a volume that has stopped accepting writes.
-pub fn log_write_stopped(stopped: bool) {
-    log_gauge(
-        &ROCKSDB_WRITE_STOPPED_TOTAL,
-        if stopped { 1.0 } else { 0.0 },
-    );
-}
-
 register_convex_histogram!(
     ROCKSDB_CONFLICT_CHECK_SECONDS,
     "Time spent enforcing ConflictStrategy::Error before a write"

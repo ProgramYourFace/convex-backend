@@ -63,6 +63,11 @@ const FLUSH_FAILURE_INTERVALS: u32 = 10;
 /// quiet — no successes, no failures — is treated as dead.
 const FLUSH_SILENCE_MULTIPLIER: u32 = 6;
 
+/// Multiples of the configured interval below which the silence ceiling may
+/// never fall, whatever it is set to. A healthy flusher is silent for about one
+/// interval between ticks by construction.
+const FLUSH_SILENCE_INTERVAL_FLOOR: u32 = 3;
+
 pub(crate) struct HealthMonitor {
     stop: Arc<Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -170,33 +175,44 @@ fn check(
     // volume or a hung mount RocksDB stalls the writer indefinitely rather than
     // returning an error, so no counter moves and each stalled write parks a
     // blocking-pool thread. The oldest in-flight write is the signal that does
-    // move, and it is published here as a level for something outside the
-    // process to act on.
+    // move.
     //
-    // Deliberately *not* escalated here. Four review rounds each found that
-    // deciding "stalled or merely slow" from inside the stuck process was
-    // wrong in a new way, because every signal available to it — the write
-    // controller's stop and delay tokens, `num-running-flushes`,
-    // `num-running-compactions`, the superversion number — is updated by the
-    // same machinery that has stopped, and so latches in exactly the failure
-    // being detected. A process cannot reliably diagnose its own liveness.
+    // Measured and escalated FIRST, before any RocksDB call below, for two
+    // reasons. `DBImpl::GetIntProperty` takes the engine's `mutex_`, so if a
+    // wedged engine ever holds that across its hung I/O, the poll would park
+    // before publishing and the one gauge an operator is told to alert on would
+    // freeze at its last value instead of climbing. And this is the escalation
+    // that has to survive a wedge, so it must not sit behind a call into the
+    // thing that is wedged.
+    let oldest = inner.write_watch.oldest_in_flight();
+    metrics::log_oldest_write(oldest.map_or(0.0, |d| d.as_secs_f64()));
+
+    // Four review rounds each found a *new* defect in trying to classify this
+    // stall as deliberate backpressure or a hang, because every RocksDB signal
+    // that could tell them apart — the write controller's stop and delay
+    // tokens, `num-running-flushes`, `num-running-compactions`, the
+    // superversion number — is updated by the machinery that has stopped, and
+    // so latches in exactly the failure being detected. That classification is
+    // gone, and with it the attempt to escalate quickly.
     //
-    // An external observer with a timeout can, and every deployment already has
-    // one: a liveness probe restarts the pod, which is the recovery action this
-    // escalation was reaching for anyway. `crates/rocksdb_persistence/README.md`
-    // gives the probe configuration. What stays here are the two conditions
-    // that are unambiguous from inside — a latched background error, and a
-    // write-ahead log that has measurably stopped being flushed — neither of
-    // which requires guessing at intent.
-    metrics::log_oldest_write(
-        inner
-            .write_watch
-            .oldest_in_flight()
-            .map_or(0.0, |d| d.as_secs_f64()),
-    );
-    // The engine's own report that it is holding writers back, published
-    // alongside so a dashboard can tell deliberate backpressure from a stall.
-    metrics::log_write_stopped(engine_reports_throttling(inner));
+    // What remains is duration alone, at a ceiling generous enough that no
+    // legitimate backpressure reaches it. This predicate reads no engine
+    // property: the clock is `WriteGuard`'s, taken and dropped by this crate,
+    // which RocksDB never touches and therefore cannot latch. Deliberate
+    // throttling drains long before the ceiling; a hung volume does not, and
+    // running on past it is worse than restarting, because every writer is
+    // parked and the deployment's recovery cannot begin while the process still
+    // answers probes.
+    if let Some(waiting) = oldest
+        && waiting > *options::WRITE_STALL_CEILING
+    {
+        shutdown.signal(anyhow::anyhow!(
+            "a RocksDB write has been in flight for {waiting:?}, past the stall ceiling. The \
+             engine blocks rather than failing when it cannot make progress — a full volume or a \
+             hung mount looks exactly like this — so stopping beats parking every writer forever"
+        ));
+        return;
+    }
 
     // Published on every poll, failing or not. A series that only appears once
     // the process is already being shut down is not something an alert can
@@ -243,10 +259,20 @@ fn check(
         // an ordinary fsync tail into a kill, the ceiling keeps a long one from
         // granting an hour of silence in a mode that advertises at most one
         // interval of loss.
+        // Bounded at both ends, and the upper bound is itself floored by the
+        // interval it bounds. A healthy flusher waits the whole interval before
+        // each tick, so `since_last_success` necessarily climbs to about one
+        // interval every cycle — a ceiling below that would read the healthy
+        // steady state as a dead flusher and restart the pod onto the same
+        // configuration, forever.
         let silence_deadline = budget
             .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
             .max(*options::MIN_FLUSH_SILENCE)
-            .min((*options::MAX_FLUSH_SILENCE).max(*options::MIN_FLUSH_SILENCE));
+            .min(
+                (*options::MAX_FLUSH_SILENCE)
+                    .max(*options::MIN_FLUSH_SILENCE)
+                    .max(interval.saturating_mul(FLUSH_SILENCE_INTERVAL_FLOOR)),
+            );
         let stopped = since > silence_deadline;
         if failing || stopped {
             shutdown.signal(anyhow::anyhow!(
@@ -289,47 +315,9 @@ fn check(
 /// so asking any of them returns a permanent zero. Verified against a full
 /// filesystem: the five read `0` while `default` read `3`.
 ///
-/// `property_int_value` — no `_cf` — is the default family, so it is the only
-/// call here that can ever be non-zero.
-/// Whether the engine is deliberately holding writers back rather than hung.
-///
-/// `rocksdb.is-write-stopped` is `write_controller().IsStopped()`, and it does
-/// not cover the stall this crate explicitly enables: the write buffer manager
-/// is built with `allow_stall`, and `DBImpl::WriteBufferManagerStallWrites`
-/// parks writers through `WriteThread::BeginWriteStall` without ever touching
-/// the write controller. So the DB-wide memory stall — the first case the
-/// escalation is meant to exclude — reads as zero there.
-///
-/// Running flushes and compactions are the missing signal — but only while they
-/// are *finishing*. `num-running-*` reports that a job is **open**, which on a
-/// wedged volume is permanently true: `BackgroundCallCompaction` increments the
-/// counter before the job runs and decrements it only once its last file write
-/// and fsync return, so a compaction blocked on a hung device pins the counter
-/// above zero forever. Presence alone would therefore classify an indefinite
-/// I/O hang as deliberate throttling and disable the escalation in exactly the
-/// failure mode it exists for.
-///
-/// `rocksdb.current-super-version-number` advances when a flush or compaction
-/// *completes* and installs a new superversion, so it separates "working
-/// through a backlog" from "stuck holding a job open". A memory stall keeps
-/// flushes completing and so keeps reading as backpressure, which is the case
-/// this predicate was widened for in the first place.
-fn property(inner: &Inner, name: &str) -> u64 {
-    inner
-        .db
-        .property_int_value(name)
-        .ok()
-        .flatten()
-        .unwrap_or(0)
-}
-
-/// The engine's own report that it is holding writers back, with no judgement
-/// about whether that state is draining. Published as a gauge; see `check`.
-fn engine_reports_throttling(inner: &Inner) -> bool {
-    property(inner, "rocksdb.is-write-stopped") > 0
-        || property(inner, "rocksdb.actual-delayed-write-rate") > 0
-}
-
+/// So this must keep using `property_int_value` — no `_cf`. "Correcting" it to
+/// ask the app families would silently zero it, and it is one of only two
+/// escalations left in this module.
 fn background_errors(inner: &Inner) -> Option<u64> {
     match inner
         .db
@@ -432,5 +420,68 @@ impl Drop for WriteGuard<'_> {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod escalation_tests {
+    use std::time::Duration;
+
+    use super::{
+        FLUSH_FAILURE_INTERVALS,
+        FLUSH_SILENCE_INTERVAL_FLOOR,
+        FLUSH_SILENCE_MULTIPLIER,
+    };
+    use crate::options;
+
+    /// The silence deadline as `check` computes it, so the test exercises the
+    /// arithmetic rather than a copy of it.
+    fn silence_deadline(interval: Duration) -> Duration {
+        interval
+            .saturating_mul(FLUSH_FAILURE_INTERVALS)
+            .saturating_mul(FLUSH_SILENCE_MULTIPLIER)
+            .max(*options::MIN_FLUSH_SILENCE)
+            .min(
+                (*options::MAX_FLUSH_SILENCE)
+                    .max(*options::MIN_FLUSH_SILENCE)
+                    .max(interval.saturating_mul(FLUSH_SILENCE_INTERVAL_FLOOR)),
+            )
+    }
+
+    /// A healthy flusher waits the whole interval before each tick, so the time
+    /// since its last success climbs to about one interval every cycle. A
+    /// silence ceiling below that reads the healthy steady state as a dead
+    /// flusher — and since escalation restarts the pod onto the same
+    /// configuration, that is a crash loop rather than a one-off.
+    ///
+    /// The ceiling is operator-configurable and the README invites tightening
+    /// it, so this has to hold for intervals well past any default.
+    #[test]
+    fn the_silence_deadline_always_outlasts_a_healthy_flushers_own_interval() {
+        for seconds in [1u64, 5, 30, 60, 120, 600, 1800, 3600] {
+            let interval = Duration::from_secs(seconds);
+            let deadline = silence_deadline(interval);
+            assert!(
+                deadline > interval,
+                "a {interval:?} interval got a {deadline:?} silence deadline, which a healthy \
+                 flusher would trip on its own cadence"
+            );
+        }
+    }
+
+    /// And the ceiling still binds where it was introduced to: a long interval
+    /// must not buy an hour of silence in a mode that promises at most one
+    /// interval of loss.
+    #[test]
+    fn the_silence_deadline_is_still_bounded_above() {
+        let interval = Duration::from_secs(60);
+        let deadline = silence_deadline(interval);
+        let unbounded = interval
+            .saturating_mul(FLUSH_FAILURE_INTERVALS)
+            .saturating_mul(FLUSH_SILENCE_MULTIPLIER);
+        assert!(
+            deadline < unbounded,
+            "the ceiling must still cut the multiplied budget down"
+        );
     }
 }

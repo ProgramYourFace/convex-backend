@@ -252,6 +252,17 @@ pub static MIN_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_MIN_FLUSH_SILENCE_SECONDS", 120).max(10))
 });
 
+/// How long one write may be in flight before the process stops itself.
+///
+/// Deliberately generous. This is a backstop for the case nothing else can see
+/// — a volume that has stopped responding without returning an error — not a
+/// latency guard, and the cost of firing it early is an outage.
+/// `finish_loading` holds a write guard across a bulk import's flush, so the
+/// ceiling has to outlast that too.
+pub static WRITE_STALL_CEILING: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_WRITE_STALL_CEILING_SECONDS", 1200).max(60))
+});
+
 /// Ceiling on the same deadline, independent of the configured interval.
 ///
 /// The multiplied budget scales with the interval and overtakes the floor once

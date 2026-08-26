@@ -93,8 +93,9 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
 | `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a failing WAL flush |
+| `ROCKSDB_WRITE_STALL_CEILING_SECONDS` | 1200 | how long one write may be in flight before the process stops itself |
 | `ROCKSDB_MIN_FLUSH_SILENCE_SECONDS` | 120 | floor on how long the WAL may go unflushed before the flusher is presumed dead |
-| `ROCKSDB_MAX_FLUSH_SILENCE_SECONDS` | 600 | ceiling on the same, so a long interval cannot grant an hour of silence |
+| `ROCKSDB_MAX_FLUSH_SILENCE_SECONDS` | 600 | ceiling on the same, itself floored at 3× the interval so a healthy flusher never trips it |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -271,7 +272,10 @@ changes.
 
 A health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
-on either of the two conditions that are unambiguous from inside the process:
+on any of:
+
+- **a write in flight past `ROCKSDB_WRITE_STALL_CEILING_SECONDS`**, on duration alone —
+  see below for why nothing finer-grained survived review;
 
 - **a latched background error**, read from the `default` column family. That detail
   matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
@@ -289,50 +293,76 @@ on either of the two conditions that are unambiguous from inside the process:
   stops a 60 s interval from granting an hour of silence in a mode that promises at most
   one interval of loss.
 
-### Why a stalled write is not escalated from inside
+### Why a stalled write is escalated only on duration
 
-It was, and it was wrong four times. Deciding "wedged or merely slow" from inside the
-stuck process means reading signals that are all updated by the machinery that has
-stopped, so each one latches in exactly the failure being detected:
+RocksDB blocks writers for two very different reasons, and telling them apart from inside
+the process turned out to be unfixable. Deliberate backpressure — the write buffer
+manager's `allow_stall`, the L0 slowdown and stop triggers — drains as compaction catches
+up, and stopping for it turns an ingest burst into an outage. A hung volume never drains.
+Four review rounds each produced a new defect trying to classify one as the other, because
+every RocksDB signal that could distinguish them is updated by the machinery that has
+stopped, and so latches in exactly the failure being detected:
 
-- `rocksdb.num-running-flushes` / `num-running-compactions` are incremented before a job
-  runs and decremented after its last fsync returns, so a job blocked on a hung device
-  pins them above zero forever.
-- `rocksdb.is-write-stopped` and `actual-delayed-write-rate` are released only by
-  `RecalculateWriteStallConditions`, which runs from `InstallSuperVersion` — that is,
-  when a flush or compaction *completes*. Nothing completes on a wedged volume, so a
-  token taken while compaction was merely falling behind is never released. Since a disk
-  usually degrades before it wedges, the engine is likely to be holding one at the moment
-  it stops responding.
-- `rocksdb.current-super-version-number` advances on completion, which correctly freezes
-  on a hang — but also freezes during a single long L0→L1 compaction with writes stopped,
-  because no new memtables are filling. It cannot separate the two either.
+- `num-running-flushes` / `num-running-compactions` are incremented before a job runs and
+  decremented after its last fsync returns, so a job blocked on a hung device pins them
+  above zero forever.
+- `is-write-stopped` and `actual-delayed-write-rate` are released only by
+  `RecalculateWriteStallConditions`, which runs from `InstallSuperVersion` — that is, when
+  a flush or compaction *completes*. Nothing completes on a wedged volume. And since a
+  disk usually degrades before it wedges, the engine is likely to be holding one of these
+  tokens at the moment it stops responding.
+- `current-super-version-number` advances on completion, which correctly freezes on a
+  hang — but also freezes during a single long L0→L1 compaction with writes stopped,
+  because no new memtables are filling.
 
 Measured on a healthy, continuously busy database, the engine reports a background job
-open in **under 10% of samples** (`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`),
-so no instantaneous reading of these properties distinguishes working from wedged.
+open in **under half** of samples
+(`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`), so an
+instantaneous reading of these properties carries very little information about whether
+the engine is working.
 
-An external observer with a timeout does not have this problem, and every deployment
-already has one. Configure a liveness probe; the kubelet restarting the pod is the same
-recovery action the escalation was reaching for.
+So the classification is gone, and with it any attempt to escalate quickly. What remains
+is **duration alone**, at `ROCKSDB_WRITE_STALL_CEILING_SECONDS` (default 1200 — twenty
+minutes). That predicate reads no engine property: the clock belongs to a guard this crate
+takes and drops around each write, which RocksDB never touches and therefore cannot latch.
+Real backpressure drains long before twenty minutes; a hung mount does not. It is measured
+and escalated before any other work in the poll, so a health thread that later blocks
+inside `DBImpl::GetIntProperty` — which takes the engine's mutex — cannot stop the
+escalation or freeze the gauge below.
 
-```yaml
-livenessProbe:
-  httpGet: { path: /version, port: 3210 }
-  periodSeconds: 15
-  timeoutSeconds: 10
-  failureThreshold: 8          # ~2 min, matching the old ROCKSDB_WRITE_STALL_TIMEOUT
+The cost of that generosity is honest: **a wedged volume is unavailable for up to twenty
+minutes before the process stops itself.** Tighten `ROCKSDB_WRITE_STALL_CEILING_SECONDS`
+if your workload has a known write-latency bound, but keep it clear of `finish_loading`,
+which holds a write guard across a bulk import's flush.
+
+### Liveness probes
+
+A liveness probe is still worth configuring, but **not on `/version`**. That route is a
+pure async closure returning a cached string:
+
+```rust
+.route("/version", get(move || async move { version }))
 ```
 
-A wedged volume parks every blocking-pool thread, which is the pool the HTTP paths use,
-so the probe times out on its own without needing to interpret any engine counter.
+It touches no persistence, runs on a tokio async worker rather than the blocking pool, and
+is merged into the router *after* the timeout and concurrency-limit layers are applied, so
+it sits outside both. On a wedged volume it answers `200 OK` in about a millisecond,
+indefinitely — measured. It is a fine readiness signal for "the process is up and routing";
+it says nothing about whether storage works.
+
+Nothing else currently exposed performs a storage round-trip on the blocking pool, so
+there is no HTTP endpoint that a probe can use to detect a wedge today. Until one exists,
+**the in-process ceiling above is the backstop**, and the probe is not a substitute for
+it.
 
 For alerting rather than restarting, watch **`rocksdb_oldest_write_seconds`** — the age of
-the oldest in-flight write, published on every poll whether or not anything is wrong.
-Sustained above your write timeout means writers are parked. `rocksdb_write_stopped` is
-published beside it as the engine's own report of deliberate throttling, which
-distinguishes an ingest burst being backpressured from a volume that has stopped
-responding — the two look identical in `rocksdb_oldest_write_seconds` alone.
+the oldest in-flight write, published on every poll before any call into RocksDB, whether
+or not anything is wrong. Sustained growth means writers are parked. Note that it cannot
+tell you *why*: a backpressured ingest burst and a dead volume look identical in it, and
+an earlier revision of this file claimed `rocksdb_write_stopped` could separate them. That
+gauge has been removed rather than corrected, because it reads zero during the
+write-buffer-manager stall this configuration actually produces and one during a genuine
+wedge — wrong in both directions.
 
 It also publishes `rocksdb_wal_flush_age_seconds` and `rocksdb_backup_age_seconds`.
 
