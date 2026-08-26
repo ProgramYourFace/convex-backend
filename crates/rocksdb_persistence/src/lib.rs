@@ -229,6 +229,12 @@ pub(crate) struct Inner {
     /// Latched by the first `shutdown()`, so a second is a no-op rather than an
     /// error. See the note there.
     shutdown_done: std::sync::atomic::AtomicBool,
+    /// A secondary's scratch directory, owned here so it is removed when the
+    /// reader using it goes away. Held rather than leaked: the caller cannot
+    /// drop it earlier without pulling the ground out from under an open
+    /// engine, and leaking it accumulates a directory per reader in TMPDIR
+    /// across restarts.
+    _secondary_scratch: Option<tempfile::TempDir>,
 }
 
 impl RocksDbPersistence {
@@ -280,9 +286,34 @@ impl RocksDbPersistence {
     /// the write lock, and catches up to the primary's log on demand — which
     /// [`Inner::refresh`] does before every read.
     ///
-    /// `secondary_path` needs its own writable directory for the instance's
-    /// own bookkeeping; it holds no user data.
-    pub fn new_secondary(path: &Path, secondary_path: &Path) -> anyhow::Result<Self> {
+    /// The instance needs its own writable directory for its bookkeeping; it
+    /// holds no user data, and is created here so its lifetime can be tied to
+    /// the reader that uses it rather than leaked by the caller.
+    ///
+    /// Per *reader*, not per process: two readers in one process sharing a
+    /// directory would corrupt each other's catch-up state, and in a container
+    /// the backend is usually PID 1, so a pid-derived path would also be
+    /// identical across restarts and silently reuse a dead process's state.
+    pub fn new_secondary(path: &Path) -> anyhow::Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("convex-rocksdb-secondary-")
+            .tempdir()?;
+        let secondary_path = scratch.path().to_path_buf();
+        Self::open_secondary(path, &secondary_path, Some(scratch))
+    }
+
+    /// As [`Self::new_secondary`], but into a caller-provided directory whose
+    /// lifetime the caller manages. Used by tests, which want a path they can
+    /// inspect.
+    pub fn new_secondary_in(path: &Path, secondary_path: &Path) -> anyhow::Result<Self> {
+        Self::open_secondary(path, secondary_path, None)
+    }
+
+    fn open_secondary(
+        path: &Path,
+        secondary_path: &Path,
+        scratch: Option<tempfile::TempDir>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             path.join("CURRENT").exists(),
             "no RocksDB database at {}",
@@ -313,6 +344,7 @@ impl RocksDbPersistence {
                 health: std::sync::OnceLock::new(),
                 write_watch: health::WriteWatch::default(),
                 shutdown_done: std::sync::atomic::AtomicBool::new(false),
+                _secondary_scratch: scratch,
             }),
         })
     }
@@ -381,6 +413,7 @@ impl RocksDbPersistence {
             health: std::sync::OnceLock::new(),
             write_watch: health::WriteWatch::default(),
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
+            _secondary_scratch: None,
         });
 
         if opts.background
@@ -1017,7 +1050,7 @@ impl Persistence for RocksDbPersistence {
             // flag, after which every `flush_cf` returns `ShutdownInProgress`.
             if inner
                 .shutdown_done
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                .load(std::sync::atomic::Ordering::SeqCst)
             {
                 return Ok(());
             }
@@ -1048,6 +1081,13 @@ impl Persistence for RocksDbPersistence {
                 tracing::warn!("rocksdb compactions still running at shutdown: {e}");
             }
             inner.db.cancel_all_background_work(true);
+            // Latched only now: the guard exists so a *completed* shutdown can
+            // be repeated, not so a failed one can be papered over. Setting it
+            // before the flush made every retry of a shutdown that died at
+            // ENOSPC return Ok having written nothing.
+            inner
+                .shutdown_done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
         .await

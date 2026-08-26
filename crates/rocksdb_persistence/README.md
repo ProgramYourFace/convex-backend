@@ -92,9 +92,9 @@ Ordinary environment variables, read through `cmd_util::env::env_config`.
 | `ROCKSDB_BLOB_THRESHOLD_BYTES` | 4096 | document size above which bodies move to blob files; `0` disables |
 | `ROCKSDB_SCAN_PAGE_ROWS` | 1024 | rows per page in the streaming read paths |
 | `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` | 30 | how long `shutdown` waits for compactions |
-| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a stalled write |
-| `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS` | 120 | how long one write may be in flight, with no stall reported, before the process is stopped |
+| `ROCKSDB_HEALTH_POLL_SECONDS` | 15 | how often to check for a latched background error and a failing WAL flush |
 | `ROCKSDB_MIN_FLUSH_SILENCE_SECONDS` | 120 | floor on how long the WAL may go unflushed before the flusher is presumed dead |
+| `ROCKSDB_MAX_FLUSH_SILENCE_SECONDS` | 600 | ceiling on the same, so a long interval cannot grant an hour of silence |
 | `ROCKSDB_BACKUP_DIR` | *unset* | where periodic backups go; unset disables them |
 | `ROCKSDB_BACKUP_INTERVAL_SECONDS` | 3600 | how often the worker takes a generation (minimum 60) |
 | `ROCKSDB_BACKUP_KEEP` | 24 | generations retained; `0` never prunes |
@@ -264,21 +264,15 @@ stays that way. Every subsequent write fails, the process keeps serving, and not
 crashes. A Postgres deployment gets a pod that dies and a database another node can take
 over; an embedded one would fail every mutation indefinitely with no signal.
 
-**And the real symptom is a stall, not an error.** Measured against a full volume: writes
-stop returning entirely rather than failing, each one parking a blocking-pool thread, so
-nothing errors, nothing crashes, and no error counter moves. Only duration changes.
+**And the real symptom is often a stall, not an error.** Measured against a full volume:
+writes stop returning entirely rather than failing, each one parking a blocking-pool
+thread, so nothing errors, nothing crashes, and no error counter moves. Only duration
+changes.
 
-So a health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
+A health thread polls every `ROCKSDB_HEALTH_POLL_SECONDS` (default 15) and raises the
 backend's `ShutdownSignal` — the same one the relational backends raise on lease loss —
-on any of:
+on either of the two conditions that are unambiguous from inside the process:
 
-- **a write in flight longer than `ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS`** *and* no write
-  stall reported by the engine. RocksDB also blocks writers deliberately, as
-  backpressure — `allow_stall` on the write buffer manager, the L0 slowdown triggers —
-  and that drains as compaction catches up. Separating the two takes more than
-  `rocksdb.is-write-stopped`, which is the *write controller* and does not cover the
-  write-buffer-manager stall this backend enables — running flushes and compactions are
-  the signal that the engine is working through a backlog rather than stuck;
 - **a latched background error**, read from the `default` column family. That detail
   matters: `rocksdb.background-errors` is served per column family but RocksDB only ever
   increments it on `default`, so polling the five families this backend defines returns a
@@ -288,12 +282,59 @@ on any of:
   In that mode a write is acknowledged before it reaches the kernel, so persistent flush
   failure is acknowledged data accumulating unwritten — unbounded, not "one interval".
   Escalation needs consecutive *failures*, not just elapsed time, so one slow fsync on a
-  contended volume cannot take the process down. A separate, much longer deadline —
-  `max(interval × 60, ROCKSDB_MIN_FLUSH_SILENCE_SECONDS)` — catches a flusher that died
-  without ever returning an error. The floor matters: without it, a 100 ms interval would
-  make that deadline six seconds.
+  contended volume cannot take the process down. A separate deadline —
+  `clamp(interval × 60, ROCKSDB_MIN_FLUSH_SILENCE_SECONDS, ROCKSDB_MAX_FLUSH_SILENCE_SECONDS)`
+  — catches a flusher that died without ever returning an error. Both bounds matter: the
+  floor stops a 100 ms interval from making that deadline six seconds, and the ceiling
+  stops a 60 s interval from granting an hour of silence in a mode that promises at most
+  one interval of loss.
 
-It also publishes `rocksdb_oldest_write_seconds` and `rocksdb_wal_flush_age_seconds`.
+### Why a stalled write is not escalated from inside
+
+It was, and it was wrong four times. Deciding "wedged or merely slow" from inside the
+stuck process means reading signals that are all updated by the machinery that has
+stopped, so each one latches in exactly the failure being detected:
+
+- `rocksdb.num-running-flushes` / `num-running-compactions` are incremented before a job
+  runs and decremented after its last fsync returns, so a job blocked on a hung device
+  pins them above zero forever.
+- `rocksdb.is-write-stopped` and `actual-delayed-write-rate` are released only by
+  `RecalculateWriteStallConditions`, which runs from `InstallSuperVersion` — that is,
+  when a flush or compaction *completes*. Nothing completes on a wedged volume, so a
+  token taken while compaction was merely falling behind is never released. Since a disk
+  usually degrades before it wedges, the engine is likely to be holding one at the moment
+  it stops responding.
+- `rocksdb.current-super-version-number` advances on completion, which correctly freezes
+  on a hang — but also freezes during a single long L0→L1 compaction with writes stopped,
+  because no new memtables are filling. It cannot separate the two either.
+
+Measured on a healthy, continuously busy database, the engine reports a background job
+open in **under 10% of samples** (`adversarial.rs::engine_backpressure_predicate_is_true_under_ordinary_load`),
+so no instantaneous reading of these properties distinguishes working from wedged.
+
+An external observer with a timeout does not have this problem, and every deployment
+already has one. Configure a liveness probe; the kubelet restarting the pod is the same
+recovery action the escalation was reaching for.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /version, port: 3210 }
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 8          # ~2 min, matching the old ROCKSDB_WRITE_STALL_TIMEOUT
+```
+
+A wedged volume parks every blocking-pool thread, which is the pool the HTTP paths use,
+so the probe times out on its own without needing to interpret any engine counter.
+
+For alerting rather than restarting, watch **`rocksdb_oldest_write_seconds`** — the age of
+the oldest in-flight write, published on every poll whether or not anything is wrong.
+Sustained above your write timeout means writers are parked. `rocksdb_write_stopped` is
+published beside it as the engine's own report of deliberate throttling, which
+distinguishes an ingest burst being backpressured from a volume that has stopped
+responding — the two look identical in `rocksdb_oldest_write_seconds` alone.
+
+It also publishes `rocksdb_wal_flush_age_seconds` and `rocksdb_backup_age_seconds`.
 
 ## Semantics that differ from the relational backends
 

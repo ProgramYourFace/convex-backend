@@ -234,20 +234,10 @@ pub async fn connect_persistence_reader<RT: Runtime>(
             // A RocksDB directory has one writer, so a standalone reader opens
             // a secondary instance beside it rather than the primary itself.
             //
-            // Each secondary needs a directory of its own for its bookkeeping.
-            // Per *reader*, not per process: two readers in one process sharing
-            // a directory would corrupt each other's catch-up state, and in a
-            // container the backend is usually PID 1, so a pid-derived path is
-            // also identical across restarts and would silently reuse a dead
-            // process's bookkeeping. A fresh temporary directory avoids both,
-            // and holds nothing that should outlive the reader.
-            let secondary = tempfile::Builder::new()
-                .prefix("convex-rocksdb-secondary-")
-                .tempdir()?;
-            let reader = RocksDbPersistence::new_secondary(&path, secondary.path())?.reader();
-            // The directory has to outlive the reader still using it.
-            std::mem::forget(secondary);
-            Ok(reader)
+            // The secondary's scratch directory is created and owned inside
+            // the backend, so it is removed when the reader using it is
+            // dropped rather than accumulating one per reader in TMPDIR.
+            Ok(RocksDbPersistence::new_secondary(&path)?.reader())
         },
         PersistenceSeed::Postgres { config, options } => {
             let options = PostgresReaderOptions {

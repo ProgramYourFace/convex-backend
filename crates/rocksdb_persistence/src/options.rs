@@ -242,16 +242,6 @@ pub static HEALTH_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_HEALTH_POLL_SECONDS", 15).max(1))
 });
 
-/// How long a single write may be in flight before the process is stopped.
-///
-/// This is a stall detector, not a latency budget: RocksDB blocks a writer it
-/// cannot make progress for rather than failing it, so a write past this point
-/// is not slow, it is stuck. Generous enough that a long compaction-induced
-/// backpressure pause does not trip it.
-pub static WRITE_STALL_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_secs(env_config::<u64>("ROCKSDB_WRITE_STALL_TIMEOUT_SECONDS", 120).max(5))
-});
-
 /// Floor on how long a write-ahead log may go unflushed before the flusher is
 /// presumed dead, independent of the configured interval.
 ///
@@ -260,6 +250,16 @@ pub static WRITE_STALL_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
 /// kill.
 pub static MIN_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config::<u64>("ROCKSDB_MIN_FLUSH_SILENCE_SECONDS", 120).max(10))
+});
+
+/// Ceiling on the same deadline, independent of the configured interval.
+///
+/// The multiplied budget scales with the interval and overtakes the floor once
+/// the interval passes ~20 s: at 60 s it reaches an hour, which is an hour of
+/// acknowledged-but-unwritten writes in a mode whose contract is "up to one
+/// interval". The grace a large interval earns is bounded here.
+pub static MAX_FLUSH_SILENCE: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config::<u64>("ROCKSDB_MAX_FLUSH_SILENCE_SECONDS", 600).max(30))
 });
 
 /// How long `shutdown` waits for background compactions to settle.

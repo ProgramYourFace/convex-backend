@@ -995,7 +995,7 @@ async fn interval_sync_makes_writes_durable_without_a_clean_shutdown() -> anyhow
         // mode, so the end state is identical either way. A secondary instance
         // can: it reads the primary's files but neither its memtables nor its
         // WAL buffer, so it sees the write only once a flush has moved it.
-        let observer = RocksDbPersistence::new_secondary(&path, &dir.path().join("observer"))?;
+        let observer = RocksDbPersistence::new_secondary_in(&path, &dir.path().join("observer"))?;
         let seen: Vec<_> = observer
             .reader()
             .load_documents(TimestampRange::all(), Order::Asc, 8, validator())
@@ -1286,7 +1286,7 @@ async fn secondary_instances_refuse_to_back_up() -> anyhow::Result<()> {
         )
         .await?;
 
-    let secondary = RocksDbPersistence::new_secondary(&db_path, &dir.path().join("secondary"))?;
+    let secondary = RocksDbPersistence::new_secondary_in(&db_path, &dir.path().join("secondary"))?;
     let err = secondary
         .backup(&dir.path().join("backup"), 4)
         .expect_err("a secondary must refuse");
@@ -1806,7 +1806,7 @@ async fn a_secondary_instance_can_actually_read() -> anyhow::Result<()> {
         )
         .await?;
 
-    let secondary = RocksDbPersistence::new_secondary(&path, &dir.path().join("secondary"))?;
+    let secondary = RocksDbPersistence::new_secondary_in(&path, &dir.path().join("secondary"))?;
     let reader = secondary.reader();
 
     let documents: Vec<_> = reader
@@ -1925,5 +1925,35 @@ async fn shutdown_is_idempotent() -> anyhow::Result<()> {
         .shutdown()
         .await
         .expect("and a third, for good measure");
+    Ok(())
+}
+
+/// The idempotence guard latches *before* the work it guards, so a shutdown
+/// that fails part-way is reported as a success by every later call — while
+/// nothing was ever flushed. A caller that retries a failed shutdown (the only
+/// sensible response) is told the log is on disk when it is not.
+#[tokio::test]
+async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let persistence = RocksDbPersistence::new(&dir.path().join("db"))?;
+
+    // Put the engine in the state the commit message describes: once
+    // `shutting_down_` is set, every `flush_cf` returns ShutdownInProgress.
+    // Standing in for any mid-shutdown failure — ENOSPC on the WAL fsync is
+    // the one that matters in production.
+    persistence.inner.db.cancel_all_background_work(true);
+
+    let first = persistence.shutdown().await;
+    assert!(
+        first.is_err(),
+        "precondition: this shutdown must fail part-way"
+    );
+
+    let second = persistence.shutdown().await;
+    assert!(
+        second.is_err(),
+        "a retry after a failed shutdown must not report success: the guard latched before the \
+         flush, so this returns Ok having flushed nothing"
+    );
     Ok(())
 }
