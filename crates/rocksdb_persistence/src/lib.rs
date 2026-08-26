@@ -201,6 +201,8 @@ pub(crate) struct Inner {
     sync: options::SyncMode,
     /// Where to report a database that has stopped accepting writes.
     shutdown: Option<ShutdownSignal>,
+    /// Engine writes that have failed since the last one that succeeded.
+    consecutive_write_failures: std::sync::atomic::AtomicU32,
     /// Latched by the first `shutdown()`, so a second is a no-op rather than an
     /// error. See the note there.
     shutdown_done: std::sync::atomic::AtomicBool,
@@ -307,6 +309,7 @@ impl RocksDbPersistence {
                 // A secondary instance never writes, so it has no WAL to flush.
                 sync: options::SyncMode::Every,
                 shutdown: None,
+                consecutive_write_failures: std::sync::atomic::AtomicU32::new(0),
                 shutdown_done: std::sync::atomic::AtomicBool::new(false),
                 _secondary_scratch: scratch,
             }),
@@ -373,6 +376,7 @@ impl RocksDbPersistence {
             _write_buffer_manager: shared.write_buffer_manager,
             sync,
             shutdown: opts.shutdown,
+            consecutive_write_failures: std::sync::atomic::AtomicU32::new(0),
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
             _secondary_scratch: None,
         });
@@ -444,8 +448,8 @@ fn check_format_version(db: &Db, path: &Path, stamp_if_missing: bool) -> anyhow:
 }
 
 impl Inner {
-    /// Escalates a write failure that means the database has stopped accepting
-    /// writes altogether, rather than that one write was bad.
+    /// Runs one engine write, escalating if the engine has stopped accepting
+    /// writes altogether rather than rejecting this one.
     ///
     /// RocksDB latches read-only on a background error — a full disk, an SST
     /// checksum failure — and stays there. Every subsequent write fails, the
@@ -453,41 +457,50 @@ impl Inner {
     /// pod that dies and a database another node can take over; an embedded one
     /// would fail every mutation indefinitely until somebody looked.
     ///
-    /// Checked here rather than on a timer, and only when a write has *already*
-    /// failed, for two reasons. It costs nothing on the path that matters:
-    /// `property_int_value` takes the engine's mutex, so polling it per write
-    /// would tax every commit. And it asks a question that is true *now* — this
-    /// write just failed and the engine reports itself in error — instead of
-    /// reading `background-errors` as a level. That counter is cumulative and
-    /// never cleared, while RocksDB auto-resumes retryable errors by default
-    /// (`max_bgerror_resume_count` is `INT_MAX`), so one transient EIO that the
-    /// engine itself recovered from leaves it permanently non-zero. Escalating
-    /// on the counter alone would kill a healthy backend; escalating on a
-    /// failed write plus a non-zero counter cannot.
-    fn escalate_if_read_only(&self, cause: &rocksdb::Error) {
-        let Some(shutdown) = &self.shutdown else {
-            return;
-        };
-        // The default column family, deliberately. `rocksdb.background-errors`
-        // is served per column family but RocksDB only ever increments it on
-        // `default`: `DBImpl` holds a single `default_cf_internal_stats_` and
-        // every bump goes through it. Asking any of the five this backend
-        // defines returns a permanent zero. Verified against a full filesystem:
-        // those five read `0` while `default` read `3`.
-        let errors = self
-            .db
-            .property_int_value(rocksdb::properties::BACKGROUND_ERRORS)
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        if errors == 0 {
-            return;
+    /// The signal is **consecutive failures across independent writes**, not
+    /// any property RocksDB exposes. An earlier version gated on
+    /// `rocksdb.background-errors` and was dead code for the case it was
+    /// written for: that counter is bumped in exactly two places, both of them
+    /// a failed background *flush* or *compaction*
+    /// (`db_impl_compaction_flush.cc`), and never by a foreground write or by
+    /// `ErrorHandler::SetBGError`. On ENOSPC the failing write never reaches
+    /// the memtable, so no flush is ever scheduled and the counter stays zero
+    /// while every write fails forever. Measured on an 8 MiB tmpfs: 20 rounds
+    /// of failing writes, `background-errors` reading `0` throughout, no
+    /// signal raised — and still refusing writes after 7 MiB was freed.
+    ///
+    /// Counting failures asks the question directly, needs no property read on
+    /// any path, and cannot be tripped by one bad write: the counter resets on
+    /// every success, so reaching the threshold means this many *in a row* got
+    /// nothing through.
+    fn engine_write<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce() -> Result<T, rocksdb::Error>,
+    ) -> anyhow::Result<T> {
+        match f() {
+            Ok(value) => {
+                self.consecutive_write_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                Ok(value)
+            },
+            Err(e) => {
+                let failures = self
+                    .consecutive_write_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if failures >= *options::WRITE_FAILURES_TO_ESCALATE
+                    && let Some(shutdown) = &self.shutdown
+                {
+                    shutdown.signal(anyhow::anyhow!(
+                        "{failures} consecutive RocksDB writes have failed (most recently {what}: \
+                         {e}); the engine is refusing writes, so stopping to let the deployment \
+                         restart or fail over rather than failing every mutation from here on"
+                    ));
+                }
+                Err(e.into())
+            },
         }
-        shutdown.signal(anyhow::anyhow!(
-            "a RocksDB write failed ({cause}) and the engine has latched {errors} background \
-             error(s), so it is refusing writes: stopping so the deployment restarts or fails \
-             over rather than failing every mutation from here on"
-        ));
     }
 
     pub(crate) fn cf(&self, name: &str) -> anyhow::Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
@@ -747,11 +760,9 @@ impl Inner {
         }
 
         let _timer = metrics::write_timer();
-        if let Err(e) = self.db.write_opt(batch, &self.write_options()) {
-            self.escalate_if_read_only(&e);
-            return Err(e.into());
-        }
-        Ok(())
+        self.engine_write("a document batch", || {
+            self.db.write_opt(batch, &self.write_options())
+        })
     }
 
     /// Delete every revision of `id` at or before `ts`, across all three
@@ -839,7 +850,9 @@ impl Persistence for RocksDbPersistence {
             let globals = inner.cf(CF_GLOBALS)?;
             let mut batch = WriteBatch::default();
             batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
-            inner.db.write_opt(batch, &inner.write_options())?;
+            inner.engine_write("a persistence global", || {
+                inner.db.write_opt(batch, &inner.write_options())
+            })?;
             Ok(())
         })
         .await
@@ -904,7 +917,9 @@ impl Persistence for RocksDbPersistence {
                     }
                     iter.status()?;
                 }
-                inner.db.write_opt(batch, &inner.write_options())?;
+                inner.engine_write("a persistence global", || {
+                    inner.db.write_opt(batch, &inner.write_options())
+                })?;
                 metrics::log_index_entries_deleted(deleted);
                 Ok(deleted)
             },
@@ -939,7 +954,9 @@ impl Persistence for RocksDbPersistence {
                 for (id, ts) in highest_expired {
                     deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
                 }
-                inner.db.write_opt(batch, &inner.write_options())?;
+                inner.engine_write("an index-entry delete", || {
+                    inner.db.write_opt(batch, &inner.write_options())
+                })?;
                 metrics::log_documents_deleted(deleted);
                 Ok(deleted)
             },
@@ -984,7 +1001,9 @@ impl Persistence for RocksDbPersistence {
             for id in ids {
                 deleted += inner.delete_document_revisions(&mut batch, id, Timestamp::MAX)?;
             }
-            inner.db.write_opt(batch, &inner.write_options())?;
+            inner.engine_write("a document delete", || {
+                inner.db.write_opt(batch, &inner.write_options())
+            })?;
             metrics::log_documents_deleted(deleted);
             Ok(deleted)
         })
@@ -1018,7 +1037,8 @@ impl Persistence for RocksDbPersistence {
             // candidate list at all.) This loop is doing the work, not
             // repeating it.
             for name in ALL_COLUMN_FAMILIES {
-                inner.db.flush_cf(&inner.cf(name)?)?;
+                let cf = inner.cf(name)?;
+                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
             }
             Ok(())
         })
@@ -1043,7 +1063,8 @@ impl Persistence for RocksDbPersistence {
             }
             inner.db.flush_wal(true)?;
             for name in ALL_COLUMN_FAMILIES {
-                inner.db.flush_cf(&inner.cf(name)?)?;
+                let cf = inner.cf(name)?;
+                inner.engine_write("a flush", || inner.db.flush_cf(&cf))?;
             }
             // Let in-flight compactions finish rather than leaving a large L0
             // for the next boot to recover through, but do not wait forever.

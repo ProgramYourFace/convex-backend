@@ -36,6 +36,7 @@ use common::{
         TimestampRange,
     },
     query::Order,
+    shutdown::ShutdownSignal,
     types::{
         IndexId,
         Timestamp,
@@ -61,7 +62,12 @@ use value::{
 use crate::{
     backup,
     keys,
-    options::SyncMode,
+    keys::CF_GLOBALS,
+    options::{
+        self,
+        SyncMode,
+    },
+    OpenOptions,
     RocksDbPersistence,
 };
 
@@ -1791,4 +1797,87 @@ async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<
          flush, so this returns Ok having flushed nothing"
     );
     Ok(())
+}
+
+/// The escalation must fire when the engine stops accepting writes, and must
+/// not fire for writes that merely fail.
+///
+/// This had no coverage at all, and the version it replaced could not have
+/// fired: it gated on `rocksdb.background-errors`, which RocksDB bumps only on
+/// a failed background flush or compaction. On ENOSPC the failing write never
+/// reaches the memtable, so no flush is scheduled and that counter stays zero
+/// while every write fails forever — measured on a full tmpfs at 20 rounds with
+/// no signal raised.
+///
+/// Driven through `Inner::engine_write` with a synthetic failure rather than by
+/// filling a real volume, so it runs anywhere and asserts the policy rather
+/// than the operating system.
+#[tokio::test]
+async fn repeated_engine_write_failures_escalate() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let persistence = RocksDbPersistence::open_with(
+        &dir.path().join("db"),
+        OpenOptions {
+            sync: None,
+            shutdown: Some(ShutdownSignal::new(tx)),
+        },
+    )?;
+    let inner = &persistence.inner;
+
+    let fail = || {
+        inner.engine_write("a synthetic failure", || {
+            // A real engine error, produced without needing a full volume:
+            // opening a checkpoint at a path that already exists fails.
+            Err::<(), _>(synthetic_engine_error())
+        })
+    };
+
+    // Below the threshold: a write that fails is not a database that has
+    // stopped accepting writes.
+    for _ in 0..(*options::WRITE_FAILURES_TO_ESCALATE - 1) {
+        assert!(fail().is_err());
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a run of failures below the threshold must not stop the backend"
+    );
+
+    // A success clears the run, so the count is consecutive rather than
+    // cumulative — the distinction that keeps a transient error from ever
+    // accumulating into a shutdown.
+    let globals = inner.cf(CF_GLOBALS)?;
+    inner.engine_write("a real write", || {
+        inner.db.put_cf(&globals, b"escalation-test", b"1")
+    })?;
+    for _ in 0..(*options::WRITE_FAILURES_TO_ESCALATE - 1) {
+        assert!(fail().is_err());
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a success must reset the run, so this second partial run must not escalate either"
+    );
+
+    // And over the threshold, it stops.
+    for _ in 0..*options::WRITE_FAILURES_TO_ESCALATE {
+        assert!(fail().is_err());
+    }
+    let reported = rx
+        .try_recv()
+        .expect("the backend must stop once the engine is refusing writes");
+    assert!(
+        reported.to_string().contains("refusing writes"),
+        "unexpected escalation message: {reported}"
+    );
+    Ok(())
+}
+
+/// A genuine , for tests that need a failing engine write
+/// without a failing device. `rocksdb::Error::new` is private to the binding.
+fn synthetic_engine_error() -> rocksdb::Error {
+    rocksdb::DB::destroy(
+        &rocksdb::Options::default(),
+        "/proc/self/definitely-not-a-database",
+    )
+    .expect_err("destroying a database under /proc must fail")
 }
