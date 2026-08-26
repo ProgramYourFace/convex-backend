@@ -116,6 +116,7 @@ mod metrics;
 pub mod options;
 mod reader;
 mod wal_flush;
+mod worker;
 
 #[cfg(test)]
 mod adversarial;
@@ -187,6 +188,15 @@ pub struct OpenOptions {
     /// to a scratch database and write generations of it into the production
     /// chain.
     pub background: bool,
+    /// Backup schedule, overriding `ROCKSDB_BACKUP_DIR` and friends.
+    ///
+    /// `None` reads the environment, which is what a deployment does. An
+    /// explicit value exists so a test can attach a real backup worker without
+    /// setting process-wide environment variables that every other test in the
+    /// binary would see — and the backup worker is one of the three threads
+    /// teardown has to stop, so leaving it untestable left two thirds of that
+    /// path uncovered.
+    pub backup: Option<backup::BackupConfig>,
 }
 
 impl Default for OpenOptions {
@@ -195,6 +205,7 @@ impl Default for OpenOptions {
             sync: None,
             shutdown: None,
             background: true,
+            backup: None,
         }
     }
 }
@@ -232,22 +243,54 @@ impl Drop for RocksDbPersistence {
         // Measured at a 200µs flush interval: 17 of 400 open/write/drop/reopen
         // cycles failed with `LOCK: No locks available`, and the suite
         // intermittently aborted with `pthread lock: Invalid argument` — glibc
-        // reporting a lock taken on an already-destroyed mutex. In
-        // `SyncMode::Interval` an orderly exit could also finish before that
-        // deferred `flush_wal`, losing exactly the acknowledged writes
-        // `Inner::drop` exists to protect.
-        //
-        // Joining from here makes that unreachable rather than unlikely: once
-        // these return, no worker holds a reference, so the `Arc<Inner>`
-        // released below can only reach zero on this thread.
+        // reporting a lock taken on an already-destroyed mutex.
+        let mut all_stopped = true;
         if let Some(monitor) = self.inner.health.get() {
-            monitor.stop();
+            all_stopped &= monitor.stop();
         }
         if let Some(worker) = self.inner.backup_worker.get() {
-            worker.stop();
+            all_stopped &= worker.stop();
         }
         if let Some(flusher) = self.inner.wal_flusher.get() {
-            flusher.stop();
+            all_stopped &= flusher.stop();
+        }
+
+        if !all_stopped {
+            // A worker is still inside a call that has not returned. Waiting
+            // for it is what the deadline exists to avoid, but the database
+            // must not be closed while it is in use, so the engine is leaked
+            // deliberately: the strong count is raised so `Inner::drop` can
+            // never run.
+            //
+            // This is the right trade in the only situation that reaches it. A
+            // thread that has not come back from RocksDB in
+            // `ROCKSDB_SHUTDOWN_TIMEOUT_SECONDS` is one whose volume has
+            // stopped answering, and the process is on its way out — leaking an
+            // engine in a process that is exiting costs nothing, while closing
+            // one underneath a live thread is a use-after-free.
+            tracing::error!(
+                "leaking the RocksDB engine: a background worker did not stop in time, and \
+                 closing the database underneath it would be worse than leaving it open in a \
+                 process that is already shutting down"
+            );
+            std::mem::forget(self.inner.clone());
+            return;
+        }
+
+        // The closing WAL flush belongs here, not only in `Inner::drop`.
+        //
+        // `Inner::drop` does not run while any other `Arc<Inner>` is alive — a
+        // reader, or an in-flight blocking task — so deferring the flush to it
+        // left a window in `SyncMode::Interval` where the flusher had been
+        // stopped and nothing had yet moved the buffer. Measured at 503ms and
+        // climbing with one other reference held, against 14ms while the
+        // flusher was still ticking. A kill in that window loses acknowledged
+        // writes, which is precisely what this flush exists to prevent.
+        if matches!(self.inner.sync, options::SyncMode::Interval(_))
+            && !self.inner.secondary
+            && let Err(e) = self.inner.db.flush_wal(true)
+        {
+            tracing::error!("failed to flush the RocksDB WAL while closing: {e}");
         }
     }
 }
@@ -482,7 +525,7 @@ impl RocksDbPersistence {
         // a scratch database into the production backup chain.
         let backup_config = opts
             .background
-            .then(backup::BackupConfig::from_env)
+            .then(|| opts.backup.clone().or_else(backup::BackupConfig::from_env))
             .flatten();
         if let Some(config) = backup_config.clone() {
             let worker = backup::BackupWorker::spawn(Arc::downgrade(&inner), config)?;
@@ -927,8 +970,9 @@ impl Persistence for RocksDbPersistence {
             // writer it cannot make progress for instead of failing it, and a
             // parked writer holds this thread until the volume recovers or the
             // process is stopped.
-            let _guard = inner.write_watch.begin();
-            inner.apply_write(write, conflict_strategy)
+            inner
+                .write_watch
+                .observe(|| inner.apply_write(write, conflict_strategy))
         })
         .await
         .context("rocksdb write task panicked")?
@@ -942,12 +986,13 @@ impl Persistence for RocksDbPersistence {
         let encoded = serde_json::to_vec(&value)?;
         let inner = self.inner.clone();
         tokio_spawn_blocking("rocksdb_write_global", move || -> anyhow::Result<()> {
-            let _guard = inner.write_watch.begin();
-            let globals = inner.cf(CF_GLOBALS)?;
-            let mut batch = WriteBatch::default();
-            batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
-            inner.db.write_opt(batch, &inner.write_options())?;
-            Ok(())
+            inner.write_watch.observe(|| {
+                let globals = inner.cf(CF_GLOBALS)?;
+                let mut batch = WriteBatch::default();
+                batch.put_cf(&globals, String::from(key).as_bytes(), &encoded);
+                inner.db.write_opt(batch, &inner.write_options())?;
+                Ok(())
+            })
         })
         .await
         .context("rocksdb global write task panicked")?
@@ -971,50 +1016,52 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_index_entries",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
-                let idx = inner.cf(CF_IDX)?;
+                inner.write_watch.observe(|| {
+                    let idx = inner.cf(CF_IDX)?;
 
-                // Retention deletes every version of a key at or before a
-                // timestamp, and can name several expired versions of the same
-                // key in one call. Collapsing to the highest timestamp per key
-                // first keeps the returned count equal to the number of rows
-                // actually removed, which is what the relational backends
-                // report: their `DELETE ... WHERE a OR b` counts a row once
-                // however many clauses match it.
-                let mut highest_expired: BTreeMap<(IndexId, Vec<u8>), Timestamp> = BTreeMap::new();
-                for entry in entries {
-                    let mut full_key = entry.key_prefix;
-                    if let Some(suffix) = entry.key_suffix {
-                        full_key.extend_from_slice(&suffix);
-                    }
-                    highest_expired
-                        .entry((entry.index_id, full_key))
-                        .and_modify(|ts| *ts = (*ts).max(entry.ts))
-                        .or_insert(entry.ts);
-                }
-
-                let mut batch = WriteBatch::default();
-                let mut deleted = 0;
-                for ((index_id, full_key), ts) in highest_expired {
-                    // Versions sort newest-first, so the expired ones are a
-                    // contiguous suffix of the key's run.
-                    let prefix = keys::idx_key_prefix(index_id, &full_key);
-                    let mut iter = inner.db.raw_iterator_cf(&idx);
-                    iter.seek(keys::idx_key(index_id, &full_key, ts));
-                    while iter.valid() {
-                        let Some(key) = iter.key() else { break };
-                        if !key.starts_with(&prefix) {
-                            break;
+                    // Retention deletes every version of a key at or before a
+                    // timestamp, and can name several expired versions of the same
+                    // key in one call. Collapsing to the highest timestamp per key
+                    // first keeps the returned count equal to the number of rows
+                    // actually removed, which is what the relational backends
+                    // report: their `DELETE ... WHERE a OR b` counts a row once
+                    // however many clauses match it.
+                    let mut highest_expired: BTreeMap<(IndexId, Vec<u8>), Timestamp> =
+                        BTreeMap::new();
+                    for entry in entries {
+                        let mut full_key = entry.key_prefix;
+                        if let Some(suffix) = entry.key_suffix {
+                            full_key.extend_from_slice(&suffix);
                         }
-                        batch.delete_cf(&idx, key);
-                        deleted += 1;
-                        iter.next();
+                        highest_expired
+                            .entry((entry.index_id, full_key))
+                            .and_modify(|ts| *ts = (*ts).max(entry.ts))
+                            .or_insert(entry.ts);
                     }
-                    iter.status()?;
-                }
-                inner.db.write_opt(batch, &inner.write_options())?;
-                metrics::log_index_entries_deleted(deleted);
-                Ok(deleted)
+
+                    let mut batch = WriteBatch::default();
+                    let mut deleted = 0;
+                    for ((index_id, full_key), ts) in highest_expired {
+                        // Versions sort newest-first, so the expired ones are a
+                        // contiguous suffix of the key's run.
+                        let prefix = keys::idx_key_prefix(index_id, &full_key);
+                        let mut iter = inner.db.raw_iterator_cf(&idx);
+                        iter.seek(keys::idx_key(index_id, &full_key, ts));
+                        while iter.valid() {
+                            let Some(key) = iter.key() else { break };
+                            if !key.starts_with(&prefix) {
+                                break;
+                            }
+                            batch.delete_cf(&idx, key);
+                            deleted += 1;
+                            iter.next();
+                        }
+                        iter.status()?;
+                    }
+                    inner.db.write_opt(batch, &inner.write_options())?;
+                    metrics::log_index_entries_deleted(deleted);
+                    Ok(deleted)
+                })
             },
         )
         .await
@@ -1029,28 +1076,30 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking(
             "rocksdb_delete_documents",
             move || -> anyhow::Result<usize> {
-                let _guard = inner.write_watch.begin();
-                // Collapse to the highest expired timestamp per document: one
-                // id can be named more than once across the input, and each
-                // revision must count once — which is what Postgres's
-                // `DELETE ... WHERE (a) OR (b)` does, since a row matched by
-                // two clauses is still one deleted row.
-                let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> = BTreeMap::new();
-                for (ts, id) in documents {
-                    highest_expired
-                        .entry(id)
-                        .and_modify(|existing| *existing = (*existing).max(ts))
-                        .or_insert(ts);
-                }
+                inner.write_watch.observe(|| {
+                    // Collapse to the highest expired timestamp per document: one
+                    // id can be named more than once across the input, and each
+                    // revision must count once — which is what Postgres's
+                    // `DELETE ... WHERE (a) OR (b)` does, since a row matched by
+                    // two clauses is still one deleted row.
+                    let mut highest_expired: BTreeMap<InternalDocumentId, Timestamp> =
+                        BTreeMap::new();
+                    for (ts, id) in documents {
+                        highest_expired
+                            .entry(id)
+                            .and_modify(|existing| *existing = (*existing).max(ts))
+                            .or_insert(ts);
+                    }
 
-                let mut batch = WriteBatch::default();
-                let mut deleted = 0;
-                for (id, ts) in highest_expired {
-                    deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
-                }
-                inner.db.write_opt(batch, &inner.write_options())?;
-                metrics::log_documents_deleted(deleted);
-                Ok(deleted)
+                    let mut batch = WriteBatch::default();
+                    let mut deleted = 0;
+                    for (id, ts) in highest_expired {
+                        deleted += inner.delete_document_revisions(&mut batch, id, ts)?;
+                    }
+                    inner.db.write_opt(batch, &inner.write_options())?;
+                    metrics::log_documents_deleted(deleted);
+                    Ok(deleted)
+                })
             },
         )
         .await
@@ -1066,37 +1115,38 @@ impl Persistence for RocksDbPersistence {
         tokio_spawn_blocking("rocksdb_delete_tablet", move || -> anyhow::Result<usize> {
             // Same collapse as `delete_index_entries`: one document can be
             // named more than once, and each revision must count once.
-            let _guard = inner.write_watch.begin();
-            let docs = inner.cf(CF_DOCS)?;
-            let (lower, upper) = keys::tablet_bounds(tablet_id);
+            inner.write_watch.observe(|| {
+                let docs = inner.cf(CF_DOCS)?;
+                let (lower, upper) = keys::tablet_bounds(tablet_id);
 
-            // Matches the relational backends: take up to `chunk_size` rows,
-            // then remove every revision of the documents they belong to, so a
-            // document is never left half-deleted across chunks.
-            let mut ids = BTreeSet::new();
-            let mut iter = inner.db.raw_iterator_cf(&docs);
-            iter.seek(&lower);
-            let mut scanned = 0;
-            while iter.valid() && scanned < chunk_size {
-                let Some(key) = iter.key() else { break };
-                if !upper.is_empty() && key >= &upper[..] {
-                    break;
+                // Matches the relational backends: take up to `chunk_size` rows,
+                // then remove every revision of the documents they belong to, so a
+                // document is never left half-deleted across chunks.
+                let mut ids = BTreeSet::new();
+                let mut iter = inner.db.raw_iterator_cf(&docs);
+                iter.seek(&lower);
+                let mut scanned = 0;
+                while iter.valid() && scanned < chunk_size {
+                    let Some(key) = iter.key() else { break };
+                    if !upper.is_empty() && key >= &upper[..] {
+                        break;
+                    }
+                    let (_, id) = keys::parse_docs_key(key)?;
+                    ids.insert(id);
+                    scanned += 1;
+                    iter.next();
                 }
-                let (_, id) = keys::parse_docs_key(key)?;
-                ids.insert(id);
-                scanned += 1;
-                iter.next();
-            }
-            iter.status()?;
+                iter.status()?;
 
-            let mut batch = WriteBatch::default();
-            let mut deleted = 0;
-            for id in ids {
-                deleted += inner.delete_document_revisions(&mut batch, id, Timestamp::MAX)?;
-            }
-            inner.db.write_opt(batch, &inner.write_options())?;
-            metrics::log_documents_deleted(deleted);
-            Ok(deleted)
+                let mut batch = WriteBatch::default();
+                let mut deleted = 0;
+                for id in ids {
+                    deleted += inner.delete_document_revisions(&mut batch, id, Timestamp::MAX)?;
+                }
+                inner.db.write_opt(batch, &inner.write_options())?;
+                metrics::log_documents_deleted(deleted);
+                Ok(deleted)
+            })
         })
         .await
         .context("rocksdb tablet delete task panicked")?
@@ -1233,11 +1283,6 @@ impl RocksDbPersistence {
     }
 }
 
-/// Reconstruct documents for a set of `(ts, id)` pairs with one batched lookup.
-///
-/// `index_scan` and the `previous_revisions` family all resolve a list of
-/// document coordinates into bodies; batching turns what would be one point get
-/// per row into a single `multi_get`.
 /// Resolves document bodies for coordinates an index or table scan produced.
 ///
 /// `read_opts` must carry the *same* snapshot the scan's iterator used.

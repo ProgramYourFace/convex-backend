@@ -22,12 +22,10 @@
 use std::{
     sync::{
         atomic::{
-            AtomicBool,
             AtomicU32,
             Ordering,
         },
         Arc,
-        Condvar,
         Mutex,
         Weak,
     },
@@ -38,13 +36,15 @@ use std::{
 use crate::{
     health::FlushClock,
     metrics,
+    options,
+    worker,
     Inner,
 };
 
 pub(crate) struct WalFlusher {
     /// Set to stop the thread. Paired with `wake` so a stop does not have to
     /// wait out the remaining interval.
-    stop: Arc<Signal>,
+    stop: Arc<worker::Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
     /// When the log was last written through to disk. A failing flush leaves
     /// acknowledged writes in RocksDB's buffer, so this — not the presence of
@@ -56,19 +56,9 @@ pub(crate) struct WalFlusher {
     failures: Arc<AtomicU32>,
 }
 
-struct Signal {
-    stopped: AtomicBool,
-    lock: Mutex<()>,
-    wake: Condvar,
-}
-
 impl WalFlusher {
     pub(crate) fn spawn(db: Weak<Inner>, interval: Duration) -> anyhow::Result<Self> {
-        let stop = Arc::new(Signal {
-            stopped: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        });
+        let stop = Arc::new(worker::Signal::new());
         let signal = stop.clone();
         let clock = Arc::new(FlushClock::new());
         let thread_clock = clock.clone();
@@ -78,29 +68,7 @@ impl WalFlusher {
             .name("rocksdb-wal-flusher".to_string())
             .spawn(move || {
                 loop {
-                    {
-                        let guard = match signal.lock.lock() {
-                            Ok(guard) => guard,
-                            // A poisoned lock means a previous holder panicked
-                            // while holding nothing but a unit value. There is
-                            // no state to be inconsistent, so carry on.
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        // The flag is re-checked *under* the mutex. Waiting
-                        // without a predicate leaves a window where `stop()`
-                        // sets it and notifies before this thread parks, the
-                        // notification lands on nobody, and the thread sleeps
-                        // out the whole interval — up to an hour for the backup
-                        // worker — with `stop()` blocked in `join` behind it.
-                        let (guard, _) = signal
-                            .wake
-                            .wait_timeout_while(guard, interval, |_| {
-                                !signal.stopped.load(Ordering::Relaxed)
-                            })
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        drop(guard);
-                    }
-                    if signal.stopped.load(Ordering::Relaxed) {
+                    if signal.park(interval) {
                         break;
                     }
                     // If the database is gone there is nothing left to flush,
@@ -130,6 +98,7 @@ impl WalFlusher {
                         },
                     }
                 }
+                signal.mark_exited();
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB WAL flusher: {e}"))?;
         Ok(Self {
@@ -150,51 +119,39 @@ impl WalFlusher {
         self.clock.since_last_success()
     }
 
-    /// Stop the thread and wait for it. Idempotent — `shutdown` calls it so a
-    /// flush cannot race the close, and `Drop` calls it again for the paths
-    /// that never reach `shutdown`.
-    pub(crate) fn stop(&self) {
-        {
-            // Set under the same mutex the waiter re-checks the flag beneath,
-            // so the notification cannot be issued into the gap before it
-            // parks.
-            let guard = match self.stop.lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.stop.stopped.store(true, Ordering::Relaxed);
-            drop(guard);
-        }
-        self.stop.wake.notify_all();
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+    /// Stops the thread and waits for it, bounded. Idempotent — `shutdown`
+    /// calls it so a flush cannot race the close, and `Drop` calls it again for
+    /// the paths that never reach `shutdown`.
+    ///
+    /// Returns whether the thread actually left. `false` means it is still
+    /// inside `flush_wal` against a volume that has not answered, and the
+    /// caller must not close the database underneath it.
+    /// Whether every thread in this group has left its loop.
+    ///
+    /// Exposed so a test can assert the teardown contract — that dropping the
+    /// owning handle stops the workers — without scanning process-wide thread
+    /// names, which sees the other tests in the same binary and flakes.
+    #[cfg(test)]
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.stop.has_exited(1)
+    }
+
+    pub(crate) fn stop(&self) -> bool {
+        let handles = match self.handle.lock() {
+            Ok(mut guard) => guard.take().into_iter().collect(),
+            Err(poisoned) => poisoned.into_inner().take().into_iter().collect(),
         };
-        if let Some(handle) = handle {
-            // The worker holds a strong `Arc<Inner>` for the duration of a
-            // tick. If the owner released the last other reference in that
-            // window, `Inner` is dropped *on this thread*, which reaches here —
-            // and joining yourself deadlocks (the platform returns EDEADLK and
-            // `join` panics). Signalling is enough in that case: the loop is
-            // already unwinding.
-            if handle.thread().id() == std::thread::current().id() {
-                // Joining this thread from this thread would deadlock, so the
-                // handle is detached instead. That is a last resort, not a
-                // design: it leaves work running past the caller's return, and
-                // when `Inner::drop` used to reach here it left the engine
-                // closing on a detached thread after `drop` had returned. The
-                // owning handle now stops the workers before any of that is
-                // reachable — see `RocksDbPersistence::drop`.
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
+        worker::stop_and_wait(
+            &self.stop,
+            handles,
+            *options::SHUTDOWN_TIMEOUT,
+            "write-ahead log flusher",
+        )
     }
 }
 
 impl Drop for WalFlusher {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }

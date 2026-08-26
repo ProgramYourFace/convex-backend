@@ -32,12 +32,10 @@ use std::{
     },
     sync::{
         atomic::{
-            AtomicBool,
             AtomicI64,
             Ordering,
         },
         Arc,
-        Condvar,
         Mutex,
         Weak,
     },
@@ -59,6 +57,7 @@ use rocksdb::backup::{
 use crate::{
     metrics,
     options,
+    worker,
     Inner,
     OpenOptions,
     RocksDbPersistence,
@@ -373,11 +372,29 @@ impl RocksDbPersistence {
     /// sets — that flush is a consistent cut across every column family, so a
     /// backup can never hold an index entry whose document it missed.
     pub fn backup(&self, dir: &Path, keep: usize) -> anyhow::Result<BackupInfo> {
-        backup_inner(&self.inner, dir, keep)
+        backup_inner(&self.inner, dir, keep, None)
     }
 }
 
-fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<BackupInfo> {
+fn backup_inner(
+    inner: &Inner,
+    dir: &Path,
+    keep: usize,
+    stop: Option<&worker::Signal>,
+) -> anyhow::Result<BackupInfo> {
+    // Checked between phases, not inside them. A generation cannot be torn in
+    // half safely, but the gaps between claiming the directory, writing,
+    // verifying and pruning are all safe points — and teardown waits out
+    // whatever phase is running, so a worker that ignored the stop flag made
+    // shutdown as slow as a whole backup. Measured at ~200ms per 60 MiB on
+    // local disk, which the module's own docs describe as minutes in
+    // production; a `terminationGracePeriodSeconds` shorter than that turns an
+    // orderly exit into a SIGKILL, losing the acknowledged writes the closing
+    // WAL flush exists to protect.
+    let interrupted = || {
+        stop.is_some_and(|signal| signal.is_stopped())
+            .then(|| anyhow::anyhow!("backup abandoned: the worker was asked to stop"))
+    };
     anyhow::ensure!(!inner.secondary, "a secondary instance cannot take backups");
     let timer = metrics::backup_timer();
     // Ownership first, before a read-write engine is opened: opening one can
@@ -389,6 +406,9 @@ fn backup_inner(inner: &Inner, dir: &Path, keep: usize) -> anyhow::Result<Backup
     let _claim_lock = DirLock::acquire(dir)?;
     claim_directory(dir, &identity)?;
     drop(_claim_lock);
+    if let Some(e) = interrupted() {
+        return Err(e);
+    }
     let mut locked = open_locked_engine(dir)?;
     let engine = &mut locked.engine;
     if let Err(e) = engine.create_new_backup_flush(&inner.db, true) {
@@ -468,7 +488,7 @@ impl BackupConfig {
 }
 
 pub(crate) struct BackupWorker {
-    stop: Arc<Signal>,
+    stop: Arc<worker::Signal>,
     handle: Mutex<Option<JoinHandle<()>>>,
     /// Unix seconds of the newest generation, or 0 if none is known yet.
     ///
@@ -478,12 +498,6 @@ pub(crate) struct BackupWorker {
     /// backup it collided with, and would stop publishing the backup-age gauge
     /// for exactly as long as a backup was running.
     newest: Arc<AtomicI64>,
-}
-
-struct Signal {
-    stopped: AtomicBool,
-    lock: Mutex<()>,
-    wake: Condvar,
 }
 
 impl BackupWorker {
@@ -502,11 +516,7 @@ impl BackupWorker {
                 .unwrap_or(0),
         ));
         let thread_newest = newest.clone();
-        let stop = Arc::new(Signal {
-            stopped: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        });
+        let stop = Arc::new(worker::Signal::new());
         let signal = stop.clone();
         tracing::info!(
             "rocksdb backups: every {}s into {}, keeping {}",
@@ -518,31 +528,13 @@ impl BackupWorker {
             .name("rocksdb-backup".to_string())
             .spawn(move || {
                 loop {
-                    {
-                        let guard = match signal.lock.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        // Re-checked under the mutex: waiting without a
-                        // predicate lets a `stop()` that lands before this
-                        // thread parks be missed entirely, and the thread then
-                        // sleeps out a full backup interval — an hour by
-                        // default — with `stop()` blocked in `join`.
-                        let (guard, _) = signal
-                            .wake
-                            .wait_timeout_while(guard, config.interval, |_| {
-                                !signal.stopped.load(Ordering::Relaxed)
-                            })
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        drop(guard);
-                    }
-                    if signal.stopped.load(Ordering::Relaxed) {
+                    if signal.park(config.interval) {
                         break;
                     }
                     let Some(inner) = db.upgrade() else {
                         break;
                     };
-                    match backup_inner(&inner, &config.dir, config.keep) {
+                    match backup_inner(&inner, &config.dir, config.keep, Some(&signal)) {
                         Ok(info) => {
                             thread_newest.store(info.timestamp, Ordering::Relaxed);
                             tracing::info!(
@@ -563,6 +555,7 @@ impl BackupWorker {
                         },
                     }
                 }
+                signal.mark_exited();
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB backup worker: {e}"))?;
         Ok(Self {
@@ -581,50 +574,39 @@ impl BackupWorker {
         }
     }
 
-    /// Stop the thread and wait for it. Idempotent.
-    pub(crate) fn stop(&self) {
-        {
-            // Set under the same mutex the waiter re-checks the flag beneath,
-            // so the notification cannot be issued into the gap before it
-            // parks.
-            let guard = match self.stop.lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.stop.stopped.store(true, Ordering::Relaxed);
-            drop(guard);
-        }
-        self.stop.wake.notify_all();
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
+    /// Stops the thread and waits for it, bounded. Idempotent.
+    ///
+    /// Returns whether the thread actually left. `false` means it is still
+    /// inside a backup — an uninterruptible `open(2)` against a hung backup
+    /// mount is the case that motivated the deadline — and the caller must not
+    /// close the database underneath it.
+    /// Whether every thread in this group has left its loop.
+    ///
+    /// Exposed so a test can assert the teardown contract — that dropping the
+    /// owning handle stops the workers — without scanning process-wide thread
+    /// names, which sees the other tests in the same binary and flakes.
+    #[cfg(test)]
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.stop.has_exited(1)
+    }
+
+    pub(crate) fn stop(&self) -> bool {
+        let handles = match self.handle.lock() {
+            Ok(mut guard) => guard.take().into_iter().collect(),
+            Err(poisoned) => poisoned.into_inner().take().into_iter().collect(),
         };
-        if let Some(handle) = handle {
-            // The worker holds a strong `Arc<Inner>` for the duration of a
-            // tick. If the owner released the last other reference in that
-            // window, `Inner` is dropped *on this thread*, which reaches here —
-            // and joining yourself deadlocks (the platform returns EDEADLK and
-            // `join` panics). Signalling is enough in that case: the loop is
-            // already unwinding.
-            if handle.thread().id() == std::thread::current().id() {
-                // Joining this thread from this thread would deadlock, so the
-                // handle is detached instead. That is a last resort, not a
-                // design: it leaves work running past the caller's return, and
-                // when `Inner::drop` used to reach here it left the engine
-                // closing on a detached thread after `drop` had returned. The
-                // owning handle now stops the workers before any of that is
-                // reachable — see `RocksDbPersistence::drop`.
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
+        worker::stop_and_wait(
+            &self.stop,
+            handles,
+            *options::SHUTDOWN_TIMEOUT,
+            "backup worker",
+        )
     }
 }
 
 impl Drop for BackupWorker {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 

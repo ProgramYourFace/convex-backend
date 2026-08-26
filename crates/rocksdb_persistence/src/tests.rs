@@ -37,6 +37,7 @@ use common::{
         TimestampRange,
     },
     query::Order,
+    shutdown::ShutdownSignal,
     types::{
         IndexId,
         Timestamp,
@@ -1962,59 +1963,143 @@ async fn a_failed_shutdown_must_not_report_success_on_retry() -> anyhow::Result<
     Ok(())
 }
 
-/// Dropping the persistence must close the database before `drop` returns, so
-/// the very next open of the same path succeeds.
+/// Dropping the persistence must stop every background worker and close the
+/// database before `drop` returns, so the very next open of the same path
+/// succeeds.
 ///
-/// This is the shape of a real teardown-and-reopen — a restore, a restart into
-/// the same volume, a test harness — and it used to be a race. Each worker
-/// upgrades its `Weak<Inner>` to a strong `Arc` for the duration of a tick, so
-/// when the owner released the last other reference inside that window,
-/// `Inner::drop` ran on the worker's own thread, `stop()` detached rather than
-/// joined itself, and the owner's `drop` returned with the engine still open on
-/// a thread nobody held a handle to. Measured at 17 failures in 400 cycles
-/// before the fix, with `LOCK: No locks available`, and an intermittent
-/// `pthread lock: Invalid argument` abort from locking a destroyed mutex.
+/// Run in three configurations, because there are three workers and an earlier
+/// version of this test exercised exactly one of them. It opened with
+/// `shutdown: None` and no backup directory, so neither the health monitor nor
+/// the backup worker was ever spawned — deleting both of their stops from
+/// `RocksDbPersistence::drop` left the suite green.
 ///
-/// The interval is deliberately tiny so the flusher is almost always mid-tick,
-/// which is what makes the race reachable at all: at a long interval the
-/// flusher is parked in `park()` holding nothing, and the bug never appears.
+/// The failure this guards was real: each worker upgrades its `Weak<Inner>` to
+/// a strong `Arc` for the duration of a tick, so when the owner released the
+/// last other reference inside that window, `Inner::drop` ran on the worker's
+/// own thread, `stop()` detached rather than joined itself, and `drop` returned
+/// with the engine still open on a thread nobody held a handle to. Measured at
+/// 17 failures in 400 cycles, plus an intermittent `pthread lock: Invalid
+/// argument` abort from locking a destroyed mutex.
+///
+/// The flush interval is deliberately tiny so the flusher is almost always
+/// mid-tick, which is what makes the race reachable: at a long interval it is
+/// parked in `park()` holding nothing, and the bug never appears.
 #[tokio::test]
 async fn dropping_the_persistence_closes_the_database_before_it_returns() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("db");
+    #[derive(Clone, Copy)]
+    enum Workers {
+        FlusherOnly,
+        WithHealthMonitor,
+        WithBackupWorker,
+    }
 
-    for round in 0..120 {
-        let persistence = RocksDbPersistence::open_with(
-            &path,
-            OpenOptions {
-                sync: Some(options::SyncMode::Interval(Duration::from_micros(200))),
-                shutdown: None,
-                background: true,
-            },
-        )?;
-        // Enough work that a flush tick lands inside the window.
-        let documents: Vec<_> = (0..64u32)
-            .map(|n| {
-                Ok(DocumentLogEntry {
-                    ts: ts(round + 1),
-                    id: doc_id(1, n),
-                    value: Some(document(1, n, "body")?),
-                    prev_ts: None,
+    for workers in [
+        Workers::FlusherOnly,
+        Workers::WithHealthMonitor,
+        Workers::WithBackupWorker,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("db");
+        let backup_dir = dir.path().join("backups");
+
+        for round in 0..40u64 {
+            let (shutdown, backup) = match workers {
+                Workers::FlusherOnly => (None, None),
+                Workers::WithHealthMonitor => {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    (Some(ShutdownSignal::new(tx)), None)
+                },
+                Workers::WithBackupWorker => (
+                    None,
+                    Some(backup::BackupConfig {
+                        dir: backup_dir.clone(),
+                        // Short enough that a generation is usually in flight
+                        // when the drop lands, which is the case that used to
+                        // make teardown wait out a whole backup.
+                        interval: Duration::from_millis(5),
+                        keep: 2,
+                    }),
+                ),
+            };
+
+            let persistence = RocksDbPersistence::open_with(
+                &path,
+                OpenOptions {
+                    sync: Some(options::SyncMode::Interval(Duration::from_micros(200))),
+                    shutdown,
+                    background: true,
+                    backup,
+                },
+            )?;
+            let documents: Vec<_> = (0..64u32)
+                .map(|n| {
+                    Ok(DocumentLogEntry {
+                        ts: ts(round + 1),
+                        id: doc_id(1, n),
+                        value: Some(document(1, n, "body")?),
+                        prev_ts: None,
+                    })
                 })
-            })
-            .collect::<anyhow::Result<_>>()?;
-        persistence
-            .write(&documents, &[], ConflictStrategy::Overwrite)
-            .await?;
-        drop(persistence);
+                .collect::<anyhow::Result<_>>()?;
+            persistence
+                .write(&documents, &[], ConflictStrategy::Overwrite)
+                .await?;
 
-        // No sleep, no retry: `drop` returning is the contract under test.
-        RocksDbPersistence::open_with(&path, OpenOptions::default()).map_err(|e| {
-            anyhow::anyhow!(
-                "round {round}: reopening immediately after drop failed, so drop returned before \
-                 the engine was closed: {e}"
-            )
-        })?;
+            // Hold a reader across the drop, which is what a real deployment
+            // looks like: `local_backend` keeps readers alive for the life of
+            // the process. It also removes the crutch that made an earlier
+            // version of this test unable to catch two of the three stops —
+            // with no other `Arc<Inner>` alive, `Inner::drop` runs on the
+            // owner's thread and its backstop stops the workers, so deleting
+            // them from `RocksDbPersistence::drop` changed nothing. With a
+            // reader held, that backstop cannot run, and the owning handle is
+            // the only thing that stops anything.
+            let reader = persistence.reader();
+            // Kept so the workers can be interrogated after the owning handle
+            // is gone.
+            let inner = persistence.inner.clone();
+            drop(persistence);
+
+            // No sleep, no polling: what `drop` guarantees is that the workers
+            // are gone when it returns, and a live thread is directly visible.
+            //
+            // Asserting only that the reopen succeeds is much weaker than it
+            // looks. A worker that is *parked* holds no `Arc<Inner>`, so
+            // dropping the owner without stopping it still closes the database
+            // on the owner's thread and the reopen passes — which is why an
+            // earlier version of this test could not catch the health monitor's
+            // or the backup worker's stop being deleted, only the flusher's.
+            // The race needs a worker mid-tick, and a test cannot reliably
+            // arrange that. Thread liveness has no such gap.
+            if let Some(flusher) = inner.wal_flusher.get() {
+                anyhow::ensure!(
+                    flusher.has_stopped(),
+                    "round {round}: the WAL flusher was still running after drop returned"
+                );
+            }
+            if let Some(worker) = inner.backup_worker.get() {
+                anyhow::ensure!(
+                    worker.has_stopped(),
+                    "round {round}: the backup worker was still running after drop returned"
+                );
+            }
+            if let Some(monitor) = inner.health.get() {
+                anyhow::ensure!(
+                    monitor.has_stopped(),
+                    "round {round}: a health thread was still running after drop returned"
+                );
+            }
+
+            // Released only now, so the engine closes and the path is free.
+            drop(inner);
+            drop(reader);
+
+            RocksDbPersistence::open_with(&path, OpenOptions::default()).map_err(|e| {
+                anyhow::anyhow!(
+                    "round {round}: reopening after drop failed, so the engine was not closed: {e}"
+                )
+            })?;
+        }
     }
     Ok(())
 }

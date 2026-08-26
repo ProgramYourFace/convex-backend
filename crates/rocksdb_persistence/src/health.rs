@@ -26,12 +26,10 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{
-            AtomicBool,
             AtomicU64,
             Ordering,
         },
         Arc,
-        Condvar,
         Mutex,
         Weak,
     },
@@ -51,6 +49,7 @@ use crate::{
         self,
         SyncMode,
     },
+    worker,
     Inner,
 };
 
@@ -69,15 +68,9 @@ const FLUSH_SILENCE_MULTIPLIER: u32 = 6;
 const FLUSH_SILENCE_INTERVAL_FLOOR: u32 = 3;
 
 pub(crate) struct HealthMonitor {
-    stop: Arc<Signal>,
+    stop: Arc<worker::Signal>,
     /// Two threads, and the split is the point. See [`HealthMonitor::spawn`].
     handles: Mutex<Vec<JoinHandle<()>>>,
-}
-
-struct Signal {
-    stopped: AtomicBool,
-    lock: Mutex<()>,
-    wake: Condvar,
 }
 
 /// Records when the polling thread last completed a pass, so that a thread
@@ -117,11 +110,7 @@ impl HealthMonitor {
         shutdown: ShutdownSignal,
         backup_dir: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
-        let stop = Arc::new(Signal {
-            stopped: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        });
+        let stop = Arc::new(worker::Signal::new());
         let interval = *options::HEALTH_POLL_INTERVAL;
         let started = Instant::now();
         let poll_clock = Arc::new(PollClock::new());
@@ -165,17 +154,20 @@ impl HealthMonitor {
             let backup_dir = backup_dir.clone();
             std::thread::Builder::new()
                 .name("rocksdb-watchdog".to_string())
-                .spawn(move || loop {
-                    if park(&signal, interval) {
-                        break;
+                .spawn(move || {
+                    loop {
+                        if signal.park(interval) {
+                            break;
+                        }
+                        let Some(inner) = db.upgrade() else {
+                            break;
+                        };
+                        metrics::log_health_poll_age(poll_clock.since_last().as_secs_f64());
+                        if watchdog_pass(&inner, &shutdown, backup_dir.as_deref(), started) {
+                            break;
+                        }
                     }
-                    let Some(inner) = db.upgrade() else {
-                        break;
-                    };
-                    metrics::log_health_poll_age(poll_clock.since_last().as_secs_f64());
-                    if watchdog_pass(&inner, &shutdown, backup_dir.as_deref(), started) {
-                        break;
-                    }
+                    signal.mark_exited();
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB watchdog: {e}"))?
         };
@@ -184,15 +176,21 @@ impl HealthMonitor {
             let signal = stop.clone();
             std::thread::Builder::new()
                 .name("rocksdb-health".to_string())
-                .spawn(move || loop {
-                    if park(&signal, interval) {
-                        break;
+                .spawn(move || {
+                    loop {
+                        if signal.park(interval) {
+                            break;
+                        }
+                        let Some(inner) = db.upgrade() else {
+                            break;
+                        };
+                        let escalated = check(&inner, &shutdown);
+                        poll_clock.completed();
+                        if escalated {
+                            break;
+                        }
                     }
-                    let Some(inner) = db.upgrade() else {
-                        break;
-                    };
-                    check(&inner, &shutdown);
-                    poll_clock.completed();
+                    signal.mark_exited();
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn the RocksDB health monitor: {e}"))?
         };
@@ -203,37 +201,33 @@ impl HealthMonitor {
         })
     }
 
-    pub(crate) fn stop(&self) {
-        {
-            // Set under the same mutex the waiter re-checks the flag beneath,
-            // so the notification cannot be issued into the gap before it
-            // parks.
-            let guard = match self.stop.lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.stop.stopped.store(true, Ordering::Relaxed);
-            drop(guard);
-        }
-        self.stop.wake.notify_all();
+    /// Stops both threads, bounded. Returns whether they actually left.
+    ///
+    /// `false` means one is still inside a call that has not returned — the
+    /// poller inside `DBImpl::GetIntProperty` on a wedged volume is the case
+    /// this module's own design predicts — and the caller must not close the
+    /// database underneath it.
+    /// Whether every thread in this group has left its loop.
+    ///
+    /// Exposed so a test can assert the teardown contract — that dropping the
+    /// owning handle stops the workers — without scanning process-wide thread
+    /// names, which sees the other tests in the same binary and flakes.
+    #[cfg(test)]
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.stop.has_exited(2)
+    }
+
+    pub(crate) fn stop(&self) -> bool {
         let handles = match self.handles.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
-        for handle in handles {
-            if handle.thread().id() == std::thread::current().id() {
-                // Joining this thread from this thread would deadlock, so the
-                // handle is detached instead. That is a last resort, not a
-                // design: it leaves work running past the caller's return, and
-                // when `Inner::drop` used to reach here it left the engine
-                // closing on a detached thread after `drop` had returned. The
-                // owning handle now stops the workers before any of that is
-                // reachable — see `RocksDbPersistence::drop`.
-                drop(handle);
-            } else {
-                let _ = handle.join();
-            }
-        }
+        worker::stop_and_wait(
+            &self.stop,
+            handles,
+            *options::SHUTDOWN_TIMEOUT,
+            "health monitor",
+        )
     }
 }
 
@@ -241,26 +235,6 @@ impl Drop for HealthMonitor {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Waits one interval, or until stopped. Returns whether the caller should
-/// exit.
-fn park(signal: &Signal, interval: Duration) -> bool {
-    {
-        let guard = match signal.lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Re-checked under the mutex; see the same pattern in `wal_flush`.
-        // Without it a `stop()` racing the park is lost and the caller blocks
-        // for a full poll interval.
-        let (guard, _) = signal
-            .wake
-            .wait_timeout_while(guard, interval, |_| !signal.stopped.load(Ordering::Relaxed))
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drop(guard);
-    }
-    signal.stopped.load(Ordering::Relaxed)
 }
 
 /// The one check that has to survive a wedged engine, so it asks the engine
@@ -413,7 +387,7 @@ fn silence_deadline(interval: Duration) -> Duration {
 /// `DBImpl::GetIntProperty` takes the engine's mutex, and a thread that blocks
 /// there stops polling permanently rather than skipping a pass. Nothing whose
 /// escalation must survive a wedged engine may sit behind this call.
-fn check(inner: &Inner, shutdown: &ShutdownSignal) {
+fn check(inner: &Inner, shutdown: &ShutdownSignal) -> bool {
     // Published on every poll, failing or not. A series that only appears once
     // the process is already being shut down is not something an alert can
     // watch — the same argument `log_backup_age` makes, applied here.
@@ -427,7 +401,13 @@ fn check(inner: &Inner, shutdown: &ShutdownSignal) {
             "RocksDB has latched {errors} background error(s) and is refusing writes; stopping so \
              the deployment restarts or fails over rather than failing every mutation"
         ));
+        // Stop polling, as the watchdog does after escalating. `signal` takes
+        // the one-shot sender only once, but it runs `report_error_sync` before
+        // that check, so a loop that kept going would report the same fatal
+        // error to the error sink every poll interval forever.
+        return true;
     }
+    false
 }
 
 /// Reads the latched background error count.
@@ -500,6 +480,20 @@ pub(crate) struct WriteWatch {
 }
 
 impl WriteWatch {
+    /// Runs `f` with this write marked as in flight.
+    ///
+    /// A closure rather than a returned guard, because the guard form has one
+    /// binding that silently disables it — `let _ = watch.begin()` drops it
+    /// immediately, leaving the write unwatched while `begin` still ran — and
+    /// this is the signal the entire stall escalation is built on. It has been
+    /// broken once already, by an edit that deleted the guard from every write
+    /// path; a form with nothing to bind cannot be broken that way, and no test
+    /// has to defend against it.
+    pub(crate) fn observe<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.begin();
+        f()
+    }
+
     /// Marks a write as started. The returned guard clears it on drop, so a
     /// write that panics or is cancelled does not leave a phantom stall.
     pub(crate) fn begin(&self) -> WriteGuard<'_> {
