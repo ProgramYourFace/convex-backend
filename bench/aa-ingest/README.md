@@ -68,3 +68,51 @@ Postgres's 44 over n=10), so Postgres remains the more predictable engine.
 Reads are a wash across all three (881-1034/s) — they are served from Convex's
 index cache, so storage barely participates. The case for this work rests on
 the write path.
+
+## Multi-tenant run
+
+`multitenant-run.sh` boots `convex-multitenant-backend` with N tenant systems in
+ONE process, each on its own RocksDB store, deploys these same functions to
+every instance separately, and drives a disjoint device space into each. It is
+the end-to-end counterpart to the crate's unit tests: routing goes through the
+real host resolver by `Host` header, because `convex deploy` cannot send a
+custom one — which makes the CLI an honest test of the path a browser takes.
+
+```
+TENANTS=3 EVENTS=1500 DEVICES=48 ./multitenant-run.sh
+```
+
+It asserts, in order: an unknown instance is 404, an unresolvable `Host` is 404
+(never a default tenant), a `Host`/header conflict is 400, a hosted instance is
+200 and resolves to its own name; then per tenant, that it holds only its own
+devices and that asking it for a neighbour's device id returns null.
+
+`/version` is deliberately NOT used for the routing checks — it is a meta route
+on `ConvexHttpService`, mounted ahead of the resolving middleware so a readiness
+probe passes before any instance exists, and it answers 200 for any `Host`.
+
+### Measured, one process, identical load per tenant
+
+`EVENTS=400 DEVICES=16 LANES=2`, so the working set is small and the block cache
+is nowhere near its cap. Ingest held ~1900–2000 events/s per tenant at
+`EVENTS=1500 DEVICES=48`.
+
+| tenants | RSS | threads | fds |
+|---|---|---|---|
+| 1 | 131 MiB | 37 | 22 |
+| 4 | 221 MiB | 58 | 55 |
+| 8 | 351 MiB | 79 | 99 |
+
+**~100 MiB fixed plus ~31 MiB per tenant, and ~11 fds per tenant.** The
+per-tenant term is the `Application` and its workers — committer, subscriptions,
+retention, index-cache handle — not the block cache: a cache per open would add
+its whole share again for every tenant (a quarter of the container limit each),
+and RSS would be measured in GiB by tenant three. That it is not is the
+process-wide `SHARED_MEMORY` singleton doing its job, observed rather than
+argued.
+
+Two caveats before this becomes a capacity model: the working set here is small
+enough that the shared cache never approaches its cap, so this measures
+per-instance fixed cost and not steady-state under load; and descriptors grow
+linearly, which is why `MULTITENANT_MAX_INSTANCES` divides that budget rather
+than trusting the default.

@@ -21,6 +21,10 @@ const lanes = Number(process.env.LANES ?? 8);
 const devices = Number(process.env.DEVICES ?? 512);
 const mergePercent = Number(process.env.MERGE_PERCENT ?? 30);
 const reads = Number(process.env.READS ?? 1000);
+// Device-id namespace. The multi-tenant harness gives each tenant its own, so
+// "tenant A cannot see tenant B's device" is a query that returns null rather
+// than an assertion about row counts that a shared namespace would muddle.
+const devicePrefix = process.env.DEVICE_PREFIX ?? 'dev-';
 
 async function post(endpoint, path, args) {
   const res = await fetch(`${url}/api/${endpoint}`, {
@@ -43,7 +47,7 @@ async function post(endpoint, path, args) {
 function makeEvent(lane, dStart, dPer, k) {
   const device = dStart + (k % dPer);
   return {
-    deviceId: `dev-${device}`,
+    deviceId: `${devicePrefix}${device}`,
     // Successive events for one device step forward in time, so the
     // run-length-encoding neighbour reads see a real time series.
     timestamp: 1_700_000_000_000 + Math.floor(k / dPer) * 1000,
@@ -94,7 +98,7 @@ async function main() {
   await Promise.all(
     Array.from({ length: lanes }, async (_, lane) => {
       for (let i = lane; i < reads; i += lanes) {
-        await post('query', 'read:latestForDevice', { deviceId: `dev-${i % devices}` });
+        await post('query', 'read:latestForDevice', { deviceId: `${devicePrefix}${i % devices}` });
         readCount++;
       }
     })
